@@ -696,6 +696,23 @@ class TestExpandPerLayerQuantKeys:
         # The original key is preserved (other code paths may still use it)
         assert "model.layers.1.mlp.gate" in cfg["quantization"]
 
+    def test_minimax_overrides_follow_the_mlx_lm_adapter_root(self):
+        gate = "language_model.model.layers.50.block_sparse_moe.gate"
+        spec = {"bits": 8, "group_size": 64, "mode": "affine"}
+        cfg = {
+            "model_type": "minimax_m3_vl",
+            "quantization": {
+                "bits": 4,
+                "group_size": 64,
+                "mode": "affine",
+                gate: spec,
+            },
+        }
+
+        model_loading.expand_per_layer_quant_keys(cfg)
+
+        assert cfg["quantization"][f"inner.{gate}"] == spec
+
 
 class TestMaterializeLazyState:
     def test_covers_arrays_in_plain_helper_objects(self):

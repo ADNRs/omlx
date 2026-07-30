@@ -356,6 +356,10 @@ def _reset_boundary_snapshots_for_server() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
+    from .cluster.discovery import BonjourPublisher
+
+    bonjour_publisher = None
+    bonjour_task = None
     # Startup: Auto-populate server aliases for the admin dashboard
     # so users get sensible hostname/IP options for API URL hints
     # without manual configuration. Only runs when the persisted list
@@ -384,6 +388,30 @@ async def lifespan(app: FastAPI):
             logger.warning("Server alias auto-detection failed: %s", exc)
 
     _reset_boundary_snapshots_for_server()
+
+    # Advertise this oMLX instance so another Mac can identify it by hostname
+    # and API port without asking the user to type an SSH target. Publication
+    # is best-effort: inference remains available if Bonjour is disabled.
+    if (
+        _server_state.global_settings is not None
+        and os.environ.get("OMLX_BONJOUR", "1").strip().lower()
+        not in {"0", "false", "no", "off"}
+    ):
+        bonjour_publisher = BonjourPublisher(
+            port=_server_state.global_settings.server.port,
+            version=__version__,
+        )
+        bonjour_publisher.start()
+
+        async def _bonjour_supervisor() -> None:
+            while True:
+                try:
+                    bonjour_publisher.ensure_running()
+                    await asyncio.sleep(5.0)
+                except asyncio.CancelledError:
+                    break
+
+        bonjour_task = asyncio.create_task(_bonjour_supervisor())
 
     # Start process memory enforcer if configured
     if (
@@ -480,6 +508,12 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown: Save all-time stats, stop TTL task, process memory enforcer, etc.
+    if bonjour_task is not None:
+        bonjour_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await bonjour_task
+    if bonjour_publisher is not None:
+        bonjour_publisher.stop()
     if preload_task is not None and not preload_task.done():
         # SIGTERM arrived while pinned models were still loading. Cancel the
         # await; engine_pool.shutdown() below unloads whatever finished.
@@ -541,9 +575,11 @@ except ImportError:
     pass
 
 # Include admin routes
-from .admin.auth import _RedirectToLogin
+from .admin.auth import _RedirectToLogin, require_admin
 from .admin.routes import router as admin_router
 from .admin.routes import set_admin_getters
+from .cluster.routes import router as cluster_router
+from .cluster.routes import set_cluster_getters
 
 set_admin_getters(
     get_server_state,
@@ -551,7 +587,9 @@ set_admin_getters(
     lambda: _server_state.settings_manager,
     lambda: _server_state.global_settings,
 )
+set_cluster_getters(get_engine_pool)
 app.include_router(admin_router)
+app.include_router(cluster_router, dependencies=[Depends(require_admin)])
 
 
 @app.exception_handler(_RedirectToLogin)
@@ -1753,6 +1791,11 @@ def init_server(
     _server_state.engine_pool = EnginePool(
         scheduler_config=scheduler_config,
     )
+    from .cluster.registry import configure_cluster_registry
+    from .cluster.strategy_benchmarks import configure_strategy_benchmark_store
+
+    _server_state.engine_pool._cluster_registry = configure_cluster_registry(base_path)
+    configure_strategy_benchmark_store(base_path)
 
     # Discover models (use pinned models from settings file)
     _server_state.engine_pool._settings_manager = _server_state.settings_manager
@@ -1982,6 +2025,21 @@ async def _with_sse_keepalive(
     ait = generator.__aiter__()
     task = None
     keepalive_elapsed = 0.0
+    next_disconnect_check = (
+        time.monotonic() + disconnect_poll if http_request is not None else None
+    )
+
+    async def client_disconnected() -> bool:
+        try:
+            disconnected = await http_request.is_disconnected()
+        except Exception as e:
+            logger.debug(f"is_disconnected() check failed: {e}")
+            return False  # is_disconnected() can fail if scope is already closed
+        if disconnected:
+            logger.info(
+                "Client disconnected during streaming (is_disconnected), cancelling"
+            )
+        return disconnected
 
     # Send initial keepalive immediately so clients with short read
     # timeouts (e.g. openclaw ~15s) don't disconnect during prefill.
@@ -1990,6 +2048,16 @@ async def _with_sse_keepalive(
 
     try:
         while True:
+            # A continuously-ready token stream never enters the timeout branch
+            # below. Probe on elapsed wall time as well so aborting a fast client
+            # still closes the upstream generator and its inference request.
+            if (
+                next_disconnect_check is not None
+                and time.monotonic() >= next_disconnect_check
+            ):
+                next_disconnect_check = time.monotonic() + disconnect_poll
+                if await client_disconnected():
+                    return
             task = asyncio.ensure_future(_safe_anext(ait))
             keepalive_elapsed = 0.0
             while not task.done():
@@ -2001,21 +2069,14 @@ async def _with_sse_keepalive(
                     break
                 # Check for client disconnect
                 if http_request is not None:
-                    try:
-                        disconnected = await http_request.is_disconnected()
-                        if disconnected:
-                            logger.info(
-                                "Client disconnected during streaming (is_disconnected), cancelling"
-                            )
-                            task.cancel()
-                            try:
-                                await task
-                            except (asyncio.CancelledError, StopAsyncIteration):
-                                pass
-                            return
-                    except Exception as e:
-                        logger.debug(f"is_disconnected() check failed: {e}")
-                        pass  # is_disconnected() can fail if scope is already closed
+                    next_disconnect_check = time.monotonic() + disconnect_poll
+                    if await client_disconnected():
+                        task.cancel()
+                        try:
+                            await task
+                        except (asyncio.CancelledError, StopAsyncIteration):
+                            pass
+                        return
                 # Send keepalive at the configured interval
                 keepalive_elapsed += wait_time
                 if keepalive_elapsed >= interval:

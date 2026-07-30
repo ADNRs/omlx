@@ -1,0 +1,1192 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for authenticated cluster admin route handlers."""
+
+from pathlib import Path
+from types import SimpleNamespace
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from omlx.cluster import routes
+from omlx.cluster.models import (
+    ClusterStatus,
+    RDMACapability,
+    RuntimeCapability,
+    TransportState,
+)
+
+
+def _status() -> ClusterStatus:
+    return ClusterStatus(
+        collected_at="2026-07-26T12:00:00+00:00",
+        hostname="MacBook-Pro",
+        platform="macOS-26.5.2-arm64",
+        chip_name="Apple M5 Max",
+        physical_memory_bytes=128 * 1024**3,
+        recommended_working_set_bytes=115_448_725_504,
+        runtime=RuntimeCapability(
+            omlx_version="0.5.3",
+            mlx_version="0.32.0",
+            mlx_lm_version="0.31.3",
+            python_version="3.11.14",
+            macos_version="26.5.2",
+        ),
+        transport_state=TransportState.ENABLED_NO_PEER,
+        rdma=RDMACapability(
+            control_status="enabled",
+            devices=("rdma_en1",),
+        ),
+        thunderbolt_ports=(),
+        warnings=("No peer",),
+    )
+
+
+def _client() -> TestClient:
+    app = FastAPI()
+    app.include_router(routes.router)
+    return TestClient(app)
+
+
+def _approval_for(payload: dict) -> str:
+    """Placement identity for a direct activation request."""
+
+    plan = routes._create_cluster_plan(
+        routes.ClusterPlanRequest(
+            model_path=payload["model_path"],
+            nodes=payload["nodes"],
+            execution_profile=payload.get("execution_profile", "balanced"),
+            tensor_parallel_size=payload.get("tensor_parallel_size", 1),
+            target_context_tokens=payload.get("target_context_tokens", 8192),
+        )
+    )
+    return routes._placement_signature(plan.to_dict())
+
+
+class _ReadyClusterEngine:
+    def __init__(self, deployment, *, fail_canary: bool = False):
+        self.deployment = deployment
+        self.fail_canary = fail_canary
+
+    async def generate(self, *_args, **_kwargs):
+        if self.fail_canary:
+            raise RuntimeError("synthetic canary failure")
+        return SimpleNamespace(completion_tokens=1)
+
+    def cluster_status(self):
+        return {
+            "phase": "ready",
+            "ranks": [
+                {
+                    "rank": item.rank,
+                    "node_id": item.node_id,
+                    "measured_weight_bytes": item.planned_weight_bytes,
+                }
+                for item in self.deployment.assignments
+            ],
+        }
+
+
+class _ReadyClusterPool:
+    def __init__(
+        self,
+        model_path: str,
+        *,
+        fail_canary: bool = False,
+        remote_only: bool = False,
+    ):
+        self.model_path = model_path
+        self.model_id = "public-model"
+        self.fail_canary = fail_canary
+        self.remote_only = remote_only
+        self.cluster_registered = False
+        self.entry = SimpleNamespace(engine=None)
+        self.reloads = 0
+
+    def resolve_cluster_model_id(self, model_path):
+        assert model_path == self.model_path
+        if self.remote_only and not self.cluster_registered:
+            from omlx.exceptions import ModelNotFoundError
+
+            raise ModelNotFoundError(model_path, [])
+        return self.model_id
+
+    def register_cluster_model(self, model_path, *, estimated_size):
+        assert model_path == self.model_path
+        assert estimated_size > 0
+        self.cluster_registered = True
+        return self.model_id, True
+
+    def unregister_cluster_model(self, model_id):
+        assert model_id == self.model_id
+        self.cluster_registered = False
+        return True
+
+    def get_entry(self, model_id):
+        assert model_id == self.model_id
+        return self.entry
+
+    async def prepare_cluster_reload(self, model_id):
+        assert model_id == self.model_id
+        self.reloads += 1
+        self.entry.engine = None
+
+    async def get_engine(self, model_id):
+        assert model_id == self.model_id
+        deployment = routes.get_cluster_registry().get_for_model(self.model_path)
+        self.entry.engine = _ReadyClusterEngine(
+            deployment,
+            fail_canary=self.fail_canary,
+        )
+        return self.entry.engine
+
+    def get_loaded_model_ids(self):
+        return [self.model_id] if self.entry.engine is not None else []
+
+
+def _install_ready_pool(
+    monkeypatch,
+    model_path,
+    *,
+    fail_canary=False,
+    remote_only=False,
+):
+    pool = _ReadyClusterPool(
+        str(model_path),
+        fail_canary=fail_canary,
+        remote_only=remote_only,
+    )
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+    # These route tests exercise activation after peer reachability has been
+    # established. Do not let their synthetic ``studio.local`` host escape to
+    # the real SSH liveness probe; peer-loss behavior has dedicated coverage.
+    monkeypatch.setattr(routes, "check_peers", lambda *args, **kwargs: ())
+    return pool
+
+
+def test_cluster_status_route(monkeypatch):
+    monkeypatch.setattr(routes, "collect_cluster_status", lambda **_: _status())
+    monkeypatch.setattr(
+        routes,
+        "read_runtime_markers",
+        lambda: {"jobs": [{"rank": 1, "live": True}], "warnings": []},
+    )
+
+    response = _client().get(
+        "/admin/api/cluster/status",
+        params={"route_to": "192.168.100.197"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["node"]["chip_name"] == "Apple M5 Max"
+    assert payload["transport"]["state"] == "enabled_no_peer"
+    assert payload["runtime_jobs"]["jobs"][0]["rank"] == 1
+
+
+def test_cluster_status_route_rejects_invalid_route_target():
+    response = _client().get(
+        "/admin/api/cluster/status",
+        params={"route_to": "studio.local"},
+    )
+    assert response.status_code == 400
+    assert "IPv4 or IPv6" in response.json()["detail"]
+
+
+def test_link_setup_route_exposes_only_the_fixed_gui_operation(monkeypatch):
+    from omlx.cluster.transport import LinkStatus
+
+    seen = []
+    monkeypatch.setattr(
+        routes,
+        "configure_link",
+        lambda hosts: (
+            seen.append(hosts)
+            or LinkStatus(
+                state="rdma_ready",
+                title="ready",
+                detail="ready",
+                backend="jaccl",
+                ready=True,
+            )
+        ),
+    )
+
+    response = _client().post(
+        "/admin/api/cluster/link-setup",
+        json={"hosts": ["127.0.0.1", "Studio.local"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["ready"] is True
+    assert seen == [["127.0.0.1", "Studio.local"]]
+
+    injected = _client().post(
+        "/admin/api/cluster/link-setup",
+        json={
+            "hosts": ["127.0.0.1", "Studio.local"],
+            "command": "arbitrary shell text",
+        },
+    )
+    assert injected.status_code == 422
+
+
+def test_link_setup_route_reports_cancelled_native_authorization(monkeypatch):
+    from omlx.cluster.transport import LinkAuthorizationCancelledError
+
+    def cancelled(hosts):
+        raise LinkAuthorizationCancelledError("Administrator approval was cancelled.")
+
+    monkeypatch.setattr(routes, "configure_link", cancelled)
+
+    response = _client().post(
+        "/admin/api/cluster/link-setup",
+        json={"hosts": ["127.0.0.1", "Studio.local"]},
+    )
+
+    assert response.status_code == 409
+    assert "cancelled" in response.json()["detail"]
+
+
+def test_cluster_runtime_route_is_lightweight(monkeypatch):
+    monkeypatch.setattr(
+        routes,
+        "read_runtime_markers",
+        lambda: {"jobs": [{"rank": 0, "phase": "ready"}], "warnings": []},
+    )
+
+    response = _client().get("/admin/api/cluster/runtime")
+
+    assert response.status_code == 200
+    assert response.json()["jobs"][0]["phase"] == "ready"
+
+
+def test_cluster_diagnostics_bundles_and_redacts_local_evidence(monkeypatch):
+    monkeypatch.setattr(routes, "collect_cluster_status", lambda **_: _status())
+    monkeypatch.setattr(
+        routes,
+        "read_runtime_markers",
+        lambda: {
+            "jobs": [
+                {
+                    "rank": 0,
+                    "phase": "failed",
+                    "model": f"{Path.home()}/.omlx/models/example",
+                    "detail": "user@Studio.local stopped",
+                    "pairing_token": "must-not-leak",
+                }
+            ],
+            "warnings": [],
+        },
+    )
+    monkeypatch.setattr(routes, "_get_engine_pool", None)
+    monkeypatch.setattr(
+        routes,
+        "get_cluster_registry",
+        lambda: SimpleNamespace(
+            list=lambda: (),
+            to_dict=lambda: {"schema_version": 1, "deployments": []},
+        ),
+    )
+
+    response = _client().get("/admin/api/cluster/diagnostics")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["schema_version"] == 1
+    assert payload["scope"] == "local-only cluster support bundle"
+    assert payload["status"]["node"]["chip_name"] == "Apple M5 Max"
+    marker = payload["runtime"]["jobs"][0]
+    assert marker["model"].startswith("~/.omlx/")
+    assert marker["detail"] == "<user>@Studio.local stopped"
+    assert marker["pairing_token"] == "<redacted>"
+
+
+def test_cluster_discovery_never_implies_trust(monkeypatch):
+    monkeypatch.setattr(
+        routes,
+        "discover_all_peers",
+        lambda: {
+            "peers": [
+                {
+                    "name": "Studio",
+                    "ssh": "studio.local",
+                    "service": "oMLX Distributed",
+                    "transport": "unknown",
+                }
+            ],
+            "trusted": False,
+            "warning": None,
+            "pairing_token": "test-token",
+        },
+    )
+
+    response = _client().get("/admin/api/cluster/discover")
+
+    assert response.status_code == 200
+    assert response.json()["peers"][0]["ssh"] == "studio.local"
+    assert response.json()["trusted"] is False
+
+
+def test_cluster_worker_smoke_route(monkeypatch):
+    monkeypatch.setattr(
+        routes,
+        "run_worker_smoke",
+        lambda **_: {
+            "ok": True,
+            "protocol_version": 1,
+            "worker_pid": 42,
+        },
+    )
+
+    response = _client().post(
+        "/admin/api/cluster/worker-smoke",
+        params={"timeout": 1.0},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["worker_pid"] == 42
+
+
+def test_cluster_collective_smoke_route(monkeypatch):
+    monkeypatch.setattr(
+        routes,
+        "run_local_collective_smoke",
+        lambda **_: {
+            "ok": True,
+            "backend": "ring",
+            "rank_count": 2,
+        },
+    )
+
+    response = _client().post(
+        "/admin/api/cluster/collective-smoke",
+        params={"timeout": 2.0},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["rank_count"] == 2
+
+
+def test_cluster_pipeline_smoke_route(monkeypatch):
+    monkeypatch.setattr(
+        routes,
+        "run_local_pipeline_smoke",
+        lambda **_: {
+            "ok": True,
+            "model_type": "nemotron_h",
+            "rank_count": 2,
+        },
+    )
+
+    response = _client().post(
+        "/admin/api/cluster/pipeline-smoke",
+        params={"timeout": 4.0},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["model_type"] == "nemotron_h"
+
+
+def test_cluster_peer_probe_route(monkeypatch):
+    monkeypatch.setattr(
+        routes,
+        "probe_remote_host",
+        lambda ssh, route_to=None: {
+            "ok": True,
+            "ssh": ssh,
+            "route_to": route_to,
+        },
+    )
+
+    response = _client().post(
+        "/admin/api/cluster/peer-probe",
+        json={"ssh": "studio.local", "route_to": "192.168.5.1"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["ssh"] == "studio.local"
+
+
+def test_cluster_node_budgets_use_each_hosts_live_admission_ceiling(monkeypatch):
+    gib = 1024**3
+    monkeypatch.setattr(
+        "omlx.cluster.node_role._enforcer_ceiling_bytes",
+        lambda: 100 * gib,
+    )
+    monkeypatch.setattr(
+        routes,
+        "probe_remote_admission_ceiling",
+        lambda ssh: 213 * gib + 123,
+    )
+
+    response = _client().post(
+        "/admin/api/cluster/node-budgets",
+        json={
+            "hosts": [
+                {
+                    "node_id": "local",
+                    "ssh": "127.0.0.1",
+                    "ips": ["10.0.0.1"],
+                },
+                {
+                    "node_id": "studio",
+                    "ssh": "studio.local",
+                    "ips": ["10.0.0.2"],
+                },
+            ],
+            "roles": {"local": "workstation", "studio": "headless"},
+        },
+    )
+
+    assert response.status_code == 200
+    local, studio = response.json()["nodes"]
+    assert local["capacity_bytes"] == 100 * gib
+    assert studio["capacity_bytes"] == 213 * gib + 123
+    assert studio["capacity_source"] == "admission_ceiling"
+    assert studio["capacity_bytes"] < 223 * gib
+
+
+def test_cluster_plan_route_builds_unequal_pipeline():
+    gib = 1024**3
+
+    response = _client().post(
+        "/admin/api/cluster/plan",
+        json={
+            "model_size_bytes": 300 * gib,
+            "layer_count": 80,
+            "nodes": [
+                {
+                    "node_id": "studio",
+                    "capacity_bytes": 256 * gib,
+                    "reserve_bytes": 8 * gib,
+                    "memory_guard_tier": "aggressive",
+                },
+                {
+                    "node_id": "mobile",
+                    "capacity_bytes": 128 * gib,
+                    "reserve_bytes": 8 * gib,
+                    "memory_guard_tier": "safe",
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["strategy"] == "unequal_contiguous_pipeline"
+    assert payload["assignments"][0]["node_id"] == "studio"
+    assert payload["assignments"][0]["layer_count"] == 54
+    assert payload["assignments"][1]["node_id"] == "mobile"
+    assert payload["assignments"][1]["layer_count"] == 26
+    assert [
+        item["memory_guard_tier"] for item in payload["assignments"]
+    ] == ["aggressive", "safe"]
+
+
+def test_cluster_plan_route_requires_exactly_one_model_source():
+    response = _client().post(
+        "/admin/api/cluster/plan",
+        json={
+            "nodes": [
+                {
+                    "node_id": "local",
+                    "capacity_bytes": 128 * 1024**3,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    assert "exactly one" in response.json()["detail"]
+
+
+def test_cluster_plan_route_uses_downloaded_model_headers(monkeypatch):
+    from omlx.cluster.planner import ModelLayout
+
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=path,
+            fixed_weight_bytes=1 * 1024**3,
+            layer_weight_bytes=(2 * 1024**3,) * 4,
+        ),
+    )
+
+    response = _client().post(
+        "/admin/api/cluster/plan",
+        json={
+            "model_path": "/models/example",
+            "nodes": [
+                {
+                    "node_id": "local",
+                    "capacity_bytes": 16 * 1024**3,
+                    "reserve_bytes": 2 * 1024**3,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["model"]["source"] == "/models/example"
+
+
+def test_cluster_plan_context_changes_kv_memory_and_signed_placement(monkeypatch):
+    from omlx.cluster.planner import ModelLayout
+
+    gib = 1024**3
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=str(path),
+            fixed_weight_bytes=gib,
+            layer_weight_bytes=(gib,) * 8,
+            kv_bytes_per_token_per_layer=64 * 1024,
+            supports_pipeline=True,
+        ),
+    )
+    base = {
+        "model_path": "/models/context",
+        "nodes": [
+            {
+                "node_id": "local",
+                "capacity_bytes": 128 * gib,
+                "reserve_bytes": 2 * gib,
+            }
+        ],
+    }
+
+    short = _client().post(
+        "/admin/api/cluster/plan",
+        json=base | {"target_context_tokens": 8192},
+    )
+    long = _client().post(
+        "/admin/api/cluster/plan",
+        json=base | {"target_context_tokens": 32768},
+    )
+
+    assert short.status_code == long.status_code == 200
+    short_plan, long_plan = short.json(), long.json()
+    assert short_plan["cluster"]["target_context_tokens"] == 8192
+    assert long_plan["cluster"]["target_context_tokens"] == 32768
+    assert long_plan["cluster"]["kv_cache_bytes"] == (
+        4 * short_plan["cluster"]["kv_cache_bytes"]
+    )
+    assert long_plan["placement_signature"] != short_plan["placement_signature"]
+
+
+def test_selected_context_is_the_runtime_kv_ceiling():
+    request = SimpleNamespace(
+        execution_profile="balanced",
+        auto_tune=False,
+        sampling_rank_only=True,
+        async_overlap=True,
+        cache_affinity=True,
+        max_kv_size=None,
+        target_context_tokens=262144,
+        ring_connections_per_ip=None,
+    )
+
+    execution = routes._execution_for_request(request, (), backend="ring")
+
+    assert execution.max_kv_size == 262144
+
+
+def test_cluster_plan_route_refuses_hybrid_tp_the_worker_cannot_run(monkeypatch):
+    gib = 1024**3
+
+    from omlx.cluster.planner import ModelLayout
+
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=path,
+            fixed_weight_bytes=1 * gib,
+            layer_weight_bytes=(2 * gib,) * 80,
+            tensor_parallel_heads=32,
+        ),
+    )
+
+    response = _client().post(
+        "/admin/api/cluster/plan",
+        json={
+            "model_path": "/models/example",
+            "nodes": [
+                {
+                    "node_id": "studio",
+                    "capacity_bytes": 256 * gib,
+                    "reserve_bytes": 8 * gib,
+                },
+                {
+                    "node_id": "mobile",
+                    "capacity_bytes": 256 * gib,
+                    "reserve_bytes": 8 * gib,
+                },
+                {
+                    "node_id": "ultra",
+                    "capacity_bytes": 256 * gib,
+                    "reserve_bytes": 8 * gib,
+                },
+                {
+                    "node_id": "mini",
+                    "capacity_bytes": 256 * gib,
+                    "reserve_bytes": 8 * gib,
+                },
+            ],
+            "tensor_parallel_size": 2,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "must use every detected node" in response.json()["detail"]
+
+
+def test_cluster_deployment_recomputes_plan_and_preflights(tmp_path, monkeypatch):
+    from omlx.cluster.planner import ModelLayout
+    from omlx.cluster.registry import configure_cluster_registry
+
+    configure_cluster_registry(tmp_path)
+    model_path = tmp_path / "models" / "nemotron"
+    model_path.mkdir(parents=True)
+    pool = _install_ready_pool(monkeypatch, model_path, remote_only=True)
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=path,
+            fixed_weight_bytes=1,
+            layer_weight_bytes=(10, 10, 10, 10),
+            supports_pipeline=True,
+        ),
+    )
+    monkeypatch.setattr(
+        routes,
+        "preflight_remote_hosts",
+        lambda deployment: [
+            {"rank": rank, "node_id": host.node_id, "runtime": {"mlx": "0.32.0"}}
+            for rank, host in enumerate(deployment.hosts)
+        ],
+    )
+    monkeypatch.setattr(
+        routes,
+        "run_cluster_performance_probe",
+        lambda deployment: {
+            "ok": True,
+            "profiles": [
+                {
+                    "node_id": host.node_id,
+                    "rank": rank,
+                    "decode_weight_bytes_per_second": 100 + rank,
+                    "prefill_weight_bytes_per_second": 200 + rank,
+                    "collective_latency_seconds": 0.001,
+                    "collective_bandwidth_bytes_per_second": 10_000,
+                    "backend": "jaccl",
+                    "measured_at": "2026-07-26T12:00:00+00:00",
+                    "samples": 5,
+                    "source": "synthetic_mlx_probe",
+                }
+                for rank, host in enumerate(deployment.hosts)
+            ],
+        },
+    )
+
+    body = {
+            "deployment_id": "nemotron-pool",
+            "model_path": str(model_path),
+            "backend": "jaccl",
+            "nodes": [
+                {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
+                {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
+            ],
+            "hosts": [
+                {
+                    "node_id": "large",
+                    "ssh": "127.0.0.1",
+                    "ips": ["192.168.5.1"],
+                    "rdma": [None, "rdma_en5"],
+                },
+                {
+                    "node_id": "small",
+                    "ssh": "studio.local",
+                    "ips": ["192.168.5.2"],
+                    "rdma": ["rdma_en5", None],
+                },
+            ],
+        }
+    body["approved_placement"] = _approval_for(body)
+    response = _client().post("/admin/api/cluster/deployments", json=body)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["deployment"]["plan_hash"] == payload["plan"]["plan_hash"]
+    assert payload["load_behavior"] == "eager"
+    assert payload["readiness"]["state"] == "ready"
+    assert payload["readiness"]["canary_passed"] is True
+    assert len(payload["readiness"]["ranks"]) == 2
+    assert payload["api"] == {
+        "base_url": "/v1",
+        "model": "public-model",
+        "chat_completions": "/v1/chat/completions",
+        "responses": "/v1/responses",
+    }
+    assert pool.cluster_registered is True
+    assert pool.reloads == 1
+    assert len(payload["preflight"]) == 2
+    assert payload["performance_probe"]["status"] in {"applied", "placement_locked"}
+    assert (
+        payload["plan"]["placement_signature"]
+        == body["approved_placement"]
+    )
+    assert payload["deployment"]["execution"]["profile"] == "balanced"
+
+    listed = _client().get("/admin/api/cluster/deployments")
+    assert listed.status_code == 200
+    assert listed.json()["deployments"][0]["deployment_id"] == "nemotron-pool"
+
+    removed = _client().delete("/admin/api/cluster/deployments/nemotron-pool")
+    assert removed.status_code == 200
+
+
+def test_cluster_deployment_keeps_memory_plan_when_benchmark_is_unavailable(
+    tmp_path,
+    monkeypatch,
+):
+    from omlx.cluster.launch import DistributedLaunchError
+    from omlx.cluster.planner import ModelLayout
+    from omlx.cluster.registry import configure_cluster_registry
+
+    configure_cluster_registry(tmp_path)
+    model_path = tmp_path / "models" / "fallback"
+    model_path.mkdir(parents=True)
+    _install_ready_pool(monkeypatch, model_path)
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=path,
+            fixed_weight_bytes=1,
+            layer_weight_bytes=(10, 10, 10, 10),
+            supports_pipeline=True,
+        ),
+    )
+    monkeypatch.setattr(
+        routes,
+        "preflight_remote_hosts",
+        lambda deployment: [{"rank": 0}, {"rank": 1}],
+    )
+    monkeypatch.setattr(
+        routes,
+        "run_cluster_performance_probe",
+        lambda deployment: (_ for _ in ()).throw(
+            DistributedLaunchError("benchmark link unavailable")
+        ),
+    )
+
+    body = {
+            "deployment_id": "fallback-pool",
+            "model_path": str(model_path),
+            "backend": "ring",
+            "nodes": [
+                {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
+                {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
+            ],
+            "hosts": [
+                {
+                    "node_id": "large",
+                    "ssh": "127.0.0.1",
+                    "ips": ["10.0.0.1"],
+                },
+                {
+                    "node_id": "small",
+                    "ssh": "studio.local",
+                    "ips": ["10.0.0.2"],
+                },
+            ],
+        }
+    body["approved_placement"] = _approval_for(body)
+    response = _client().post("/admin/api/cluster/deployments", json=body)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["performance_probe"]["status"] == "memory_fallback"
+    assert payload["plan"]["optimization"] == "memory"
+    assert payload["deployment"]["performance_profiles"] == []
+
+
+def test_cluster_activation_rolls_back_when_canary_fails(tmp_path, monkeypatch):
+    from omlx.cluster.planner import ModelLayout
+    from omlx.cluster.registry import configure_cluster_registry
+
+    registry = configure_cluster_registry(tmp_path)
+    model_path = tmp_path / "models" / "canary-failure"
+    model_path.mkdir(parents=True)
+    pool = _install_ready_pool(
+        monkeypatch,
+        model_path,
+        fail_canary=True,
+    )
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=path,
+            fixed_weight_bytes=1,
+            layer_weight_bytes=(10, 10, 10, 10),
+            supports_pipeline=True,
+        ),
+    )
+    monkeypatch.setattr(
+        routes,
+        "preflight_remote_hosts",
+        lambda deployment: [{"rank": 0}, {"rank": 1}],
+    )
+
+    body = {
+            "deployment_id": "canary-failure",
+            "model_path": str(model_path),
+            "backend": "ring",
+            "auto_tune": False,
+            "nodes": [
+                {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
+                {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
+            ],
+            "hosts": [
+                {
+                    "node_id": "large",
+                    "ssh": "127.0.0.1",
+                    "ips": ["10.0.0.1"],
+                },
+                {
+                    "node_id": "small",
+                    "ssh": "studio.local",
+                    "ips": ["10.0.0.2"],
+                },
+            ],
+        }
+    body["approved_placement"] = _approval_for(body)
+    response = _client().post("/admin/api/cluster/deployments", json=body)
+
+    assert response.status_code == 503
+    assert "canary failure" in response.json()["detail"]
+    assert registry.list() == ()
+    assert pool.entry.engine is None
+    assert pool.reloads == 2
+
+
+def test_cluster_deployment_rejects_unsafe_ssh_target(tmp_path, monkeypatch):
+    from omlx.cluster.planner import ModelLayout
+    from omlx.cluster.registry import configure_cluster_registry
+
+    configure_cluster_registry(tmp_path)
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=path,
+            fixed_weight_bytes=0,
+            layer_weight_bytes=(1, 1),
+            supports_pipeline=True,
+        ),
+    )
+
+    body = {
+            "model_path": str(tmp_path / "model"),
+            "backend": "ring",
+            "nodes": [
+                {"node_id": "local", "capacity_bytes": 10},
+                {"node_id": "peer", "capacity_bytes": 10},
+            ],
+            "hosts": [
+                {
+                    "node_id": "local",
+                    "ssh": "127.0.0.1",
+                    "ips": ["10.0.0.1"],
+                },
+                {
+                    "node_id": "peer",
+                    "ssh": "peer.local; bad",
+                    "ips": ["10.0.0.2"],
+                },
+            ],
+        }
+    body["approved_placement"] = _approval_for(body)
+    response = _client().post("/admin/api/cluster/deployments", json=body)
+
+    assert response.status_code == 400
+    assert "invalid SSH target" in response.json()["detail"]
+
+
+def test_cluster_deployment_cannot_disable_preflight():
+    response = _client().post(
+        "/admin/api/cluster/deployments",
+        json={
+            "model_path": "/models/nemotron",
+            "backend": "ring",
+            "preflight": False,
+            "nodes": [
+                {"node_id": "local", "capacity_bytes": 10},
+                {"node_id": "peer", "capacity_bytes": 10},
+            ],
+            "hosts": [
+                {
+                    "node_id": "local",
+                    "ssh": "127.0.0.1",
+                    "ips": ["10.0.0.1"],
+                },
+                {
+                    "node_id": "peer",
+                    "ssh": "peer.local",
+                    "ips": ["10.0.0.2"],
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# The fabric: addresses and backend, read rather than typed.
+#
+# A rank was told to bind an address that had been right the week before, and
+# the launch died with EADDRNOTAVAIL. Nothing on the page had asked either Mac
+# where it actually answered.
+# ---------------------------------------------------------------------------
+
+
+def _interfaces(name, addresses, *, rdma=(), thunderbolt=None):
+    from omlx.cluster.transport import HostInterfaces, InterfaceAddress
+
+    return HostInterfaces(
+        host=name,
+        addresses=tuple(InterfaceAddress(*entry) for entry in addresses),
+        rdma_interfaces=frozenset(rdma),
+        thunderbolt_interfaces=frozenset(rdma if thunderbolt is None else thunderbolt),
+    )
+
+
+def _readings(monkeypatch, hosts):
+    monkeypatch.setattr(routes, "probe_host_interfaces", lambda host: hosts[host])
+
+
+def _no_links():
+    from omlx.cluster.transport import TransportMatrix
+
+    return TransportMatrix(transports=(), backend="ring")
+
+
+def test_the_fabric_reports_the_address_each_mac_answers_on(monkeypatch):
+    _readings(
+        monkeypatch,
+        {
+            "127.0.0.1": _interfaces(
+                "127.0.0.1", [("en4", "10.0.1.1", 30)], rdma={"en4"}
+            ),
+            "studio.local": _interfaces(
+                "studio.local", [("en5", "10.0.1.2", 30)], rdma={"en5"}
+            ),
+        },
+    )
+
+    body = (
+        _client()
+        .get("/admin/api/cluster/fabric", params={"hosts": "127.0.0.1,studio.local"})
+        .json()
+    )
+
+    assert body["ok"]
+    assert [host["ips"] for host in body["hosts"]] == [["10.0.1.1"], ["10.0.1.2"]]
+    assert body["backend"] == "jaccl"
+    assert body["fell_back"] is False
+    # Entry [i][j] is the device rank i uses to reach rank j: what a jaccl
+    # deployment demands and what a pair of device names cannot express.
+    assert [host["rdma"] for host in body["hosts"]] == [
+        [None, "rdma_en4"],
+        ["rdma_en5", None],
+    ]
+
+
+def test_a_thunderbolt_pair_without_rdma_falls_back_to_the_ring_out_loud(monkeypatch):
+    """A Thunderbolt link makes choose_backend say jaccl-ring, which needs a matrix.
+
+    Posting that backend with no matrix dies inside ClusterDeployment's
+    constructor, where there is nothing the user can act on.
+    """
+
+    _readings(
+        monkeypatch,
+        {
+            "127.0.0.1": _interfaces(
+                "127.0.0.1", [("en4", "10.0.1.1", 30)], rdma={"en4"}
+            ),
+            "studio.local": _interfaces(
+                "studio.local", [("en5", "10.0.1.2", 30)], thunderbolt={"en5"}
+            ),
+        },
+    )
+
+    body = (
+        _client()
+        .get("/admin/api/cluster/fabric", params={"hosts": "127.0.0.1,studio.local"})
+        .json()
+    )
+
+    assert body["backend"] == "ring"
+    assert body["fell_back"] is True
+    assert "studio.local" in body["backend_reason"]
+    assert "ring" in body["backend_reason"]
+    assert all(host["rdma"] == [] for host in body["hosts"])
+
+
+def test_macs_that_share_no_subnet_get_no_address_and_a_reason(monkeypatch):
+    _readings(
+        monkeypatch,
+        {
+            "127.0.0.1": _interfaces("127.0.0.1", [("en0", "192.168.4.21", 24)]),
+            "studio.local": _interfaces("studio.local", [("en0", "10.9.9.9", 24)]),
+        },
+    )
+
+    body = (
+        _client()
+        .get("/admin/api/cluster/fabric", params={"hosts": "127.0.0.1,studio.local"})
+        .json()
+    )
+
+    assert not body["ok"]
+    assert all(host["ips"] == [] for host in body["hosts"])
+    assert "share no subnet" in body["backend_reason"]
+
+
+def test_one_host_is_not_a_fabric():
+    response = _client().get("/admin/api/cluster/fabric", params={"hosts": "127.0.0.1"})
+
+    assert response.status_code == 400
+
+
+def test_autoconfigure_activates_on_discovered_addresses_not_supplied_ones(
+    monkeypatch,
+):
+    """The proposal must carry what was read, not what the page happened to send."""
+
+    _readings(
+        monkeypatch,
+        {
+            "127.0.0.1": _interfaces(
+                "127.0.0.1", [("en4", "10.0.1.1", 30)], rdma={"en4"}
+            ),
+            "studio.local": _interfaces(
+                "studio.local", [("en5", "10.0.1.2", 30)], rdma={"en5"}
+            ),
+        },
+    )
+    monkeypatch.setattr(routes, "detect_cluster_transports", lambda hosts: _no_links())
+    monkeypatch.setattr(routes, "probe_remote_host", lambda ssh, **_: None)
+
+    body = (
+        _client()
+        .post(
+            "/admin/api/cluster/autoconfigure",
+            json={
+                "model_size_bytes": 40 * 1024**3,
+                "layer_count": 32,
+                "nodes": [
+                    {"node_id": f"node-{index}", "capacity_bytes": 64 * 1024**3}
+                    for index in range(2)
+                ],
+                "hosts": [
+                    {"node_id": "node-0", "ssh": "127.0.0.1", "ips": ["192.168.4.21"]},
+                    {
+                        "node_id": "node-1",
+                        "ssh": "studio.local",
+                        "ips": ["192.168.4.22"],
+                    },
+                ],
+            },
+        )
+        .json()
+    )
+
+    assert [host["ips"] for host in body["activation"]["hosts"]] == [
+        ["10.0.1.1"],
+        ["10.0.1.2"],
+    ]
+    assert body["activation"]["backend"] == body["backend"] == "jaccl"
+    assert [host["rdma"] for host in body["activation"]["hosts"]] == [
+        [None, "rdma_en4"],
+        ["rdma_en5", None],
+    ]
+
+
+def test_a_peer_that_cannot_import_blocks_activation_with_its_fix(
+    monkeypatch, tmp_path
+):
+    """Rank 1 died on "No module named 'mlx_vlm'" after every rank paid for weights."""
+
+    from omlx.cluster.autoconfigure import PreflightIssue
+    from omlx.cluster.planner import ModelLayout
+
+    model = tmp_path / "model"
+    model.mkdir()
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=str(path),
+            fixed_weight_bytes=1024**3,
+            layer_weight_bytes=(1024**3,) * 8,
+            supports_pipeline=True,
+        ),
+    )
+    monkeypatch.setattr(routes, "detect_cluster_transports", lambda hosts: _no_links())
+    monkeypatch.setattr(routes, "probe_remote_host", lambda ssh, **_: None)
+    monkeypatch.setattr(
+        routes,
+        "peer_import_issues",
+        lambda hosts, **_: (
+            PreflightIssue(
+                node_id="node-1",
+                kind="import_missing",
+                detail="/opt/venv/bin/python cannot import mlx_vlm",
+                remediation='ssh studio.local "uv pip install mlx-vlm"',
+            ),
+        ),
+    )
+    _readings(
+        monkeypatch,
+        {
+            "127.0.0.1": _interfaces("127.0.0.1", [("en4", "10.0.1.1", 30)]),
+            "studio.local": _interfaces("studio.local", [("en5", "10.0.1.2", 30)]),
+        },
+    )
+
+    body = (
+        _client()
+        .post(
+            "/admin/api/cluster/autoconfigure",
+            json={
+                "model_path": str(model),
+                "model_size_bytes": None,
+                "layer_count": 32,
+                "nodes": [
+                    {"node_id": f"node-{index}", "capacity_bytes": 64 * 1024**3}
+                    for index in range(2)
+                ],
+                "hosts": [
+                    {"node_id": "node-0", "ssh": "127.0.0.1", "ips": ["10.0.1.1"]},
+                    {"node_id": "node-1", "ssh": "studio.local", "ips": ["10.0.1.2"]},
+                ],
+            },
+        )
+        .json()
+    )
+
+    assert body["ready_to_activate"] is False
+    issue = next(
+        item for item in body["preflight_issues"] if item["kind"] == "import_missing"
+    )
+    # The command has to survive to the page verbatim: a summary that names the
+    # problem and hides the one-line fix sends the user back to the logs.
+    assert issue["remediation"] == 'ssh studio.local "uv pip install mlx-vlm"'

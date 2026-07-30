@@ -1,0 +1,1045 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Behavioral contracts for the dashboard's one-click cluster path."""
+
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+DASHBOARD_JS = ROOT / "omlx" / "admin" / "static" / "js" / "dashboard.js"
+
+
+def _method_source(name: str) -> str:
+    """Lift one complete Alpine method out of the shipped dashboard source."""
+
+    source = DASHBOARD_JS.read_text()
+    match = re.search(rf"^[ \t]*(?:async\s+)?{re.escape(name)}\(", source, re.M)
+    assert match is not None, f"dashboard.js has no {name}() method"
+    start = match.start()
+    cursor = source.index("(", start)
+    depth = 0
+    for index in range(cursor, len(source)):
+        if source[index] == "(":
+            depth += 1
+        elif source[index] == ")":
+            depth -= 1
+            if depth == 0:
+                cursor = index
+                break
+    body_start = source.index("{", cursor)
+    depth = 0
+    for index in range(body_start, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start : index + 1]
+    raise AssertionError(f"{name} has unbalanced braces in dashboard.js")
+
+
+def _run_one_click(proposal: dict, *, link_status: dict | None = None) -> dict:
+    """Execute the shipped orchestration with deterministic browser seams."""
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required to execute the dashboard orchestration")
+    methods = ",\n".join(
+        _method_source(name)
+        for name in (
+            "loadClusterRuntime",
+            "clusterActivationProgressFromRuntime",
+            "startClusterActivationProgress",
+            "stopClusterActivationProgress",
+            "clusterWorkerPeers",
+            "clusterClusterHostsPayload",
+            "autoconfigureCluster",
+            "prepareClusterLink",
+            "startCluster",
+            "activateClusterProposal",
+        )
+    )
+    script = f"""
+const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const calls = [];
+let deploymentLoads = 0;
+global.window = {{
+  location: {{ href: '' }},
+  localStorage: {{ setItem: () => {{}} }},
+}};
+global.setTimeout = () => 0;
+global.clearTimeout = () => {{}};
+global.setInterval = () => 1;
+global.clearInterval = () => {{}};
+global.fetch = async (url, options = {{}}) => {{
+  calls.push({{ url, body: options.body ? JSON.parse(options.body) : null }});
+  if (url.endsWith('/runtime')) {{
+    return {{
+      status: 200,
+      ok: true,
+      json: async () => ({{ jobs: [], warnings: [], launchers: [] }}),
+    }};
+  }}
+  if (url.endsWith('/autoconfigure')) {{
+    return {{ status: 200, ok: true, json: async () => input.proposal }};
+  }}
+  if (url.endsWith('/link-setup')) {{
+    return {{
+      status: 200,
+      ok: true,
+      json: async () => ({{
+        state: 'rdma_ready',
+        ready: true,
+        setup_available: false,
+      }}),
+    }};
+  }}
+  if (url.endsWith('/deployments')) {{
+    return {{
+      status: 200,
+      ok: true,
+      json: async () => ({{
+        ok: true,
+        plan: {{ placement_signature: 'launched' }},
+        plan_changes: {{ changed: false }},
+      }}),
+    }};
+  }}
+  throw new Error(`unexpected fetch ${{url}}`);
+}};
+const component = {{
+  {methods},
+  clusterNodePayloads() {{ return input.nodes; }},
+  adoptClusterFabric(fabric) {{ this.adoptedFabric = fabric; }},
+  invalidateClusterPlan() {{ this.clusterPlan = null; }},
+  async loadClusterDeployments() {{ deploymentLoads += 1; }},
+  async clusterResponseError(_response, fallback) {{ return fallback; }},
+  clusterAutoconfigureLoading: false,
+  clusterAutoconfigureError: '',
+  clusterAutoconfigure: null,
+  clusterActivationLoading: false,
+  clusterLinkSetupLoading: false,
+  clusterActivationProgress: '',
+  _clusterActivationProgressTimer: null,
+  clusterStatus: {{ runtime_jobs: {{ jobs: [] }} }},
+  clusterActivationResult: null,
+  clusterPlanChanges: null,
+  clusterError: '',
+  clusterPeerSsh: 'studio.local',
+  clusterSelectedPeers: [{{ ssh: 'studio.local', name: 'Mac Studio' }}],
+  clusterPlanNodes: input.nodes,
+  clusterLocalIp: '10.0.0.1',
+  clusterPeerIp: '10.0.0.2',
+  clusterFabric: {{ hosts: [
+    {{ host: '127.0.0.1', ips: ['10.0.0.1'], rdma: [null, 'rdma0'] }},
+    {{ host: 'studio.local', ips: ['10.0.0.2'], rdma: ['rdma0', null] }},
+  ] }},
+  clusterFabricError: '',
+  async loadClusterFabric() {{}},
+  async loadClusterLinkStatus() {{
+    return this.clusterLinkStatus || input.linkStatus;
+  }},
+  clusterPlanMode: 'model',
+  clusterPlanModelPath: '/models/qwen',
+  clusterPlanTensorParallelSize: 1,
+  clusterExecutionProfile: 'balanced',
+  clusterAutoconfigurePrefer: 'speed',
+  clusterStrategy: 'auto',
+  clusterAutoTune: true,
+  clusterSamplingRankOnly: false,
+  clusterAsyncOverlap: true,
+  clusterCacheAffinity: true,
+  clusterMaxKvSize: '',
+  clusterRingConnectionsPerIp: 2,
+  clusterLastGoodConfig: null,
+}};
+(async () => {{
+  await component.startCluster();
+  process.stdout.write(JSON.stringify({{
+    calls,
+    deploymentLoads,
+    autoconfigureError: component.clusterAutoconfigureError,
+    activationResult: component.clusterActivationResult,
+    clusterError: component.clusterError,
+  }}));
+}})().catch(error => {{
+  console.error(error);
+  process.exit(1);
+}});
+"""
+    result = subprocess.run(
+        [node, "-e", script],
+        input=json.dumps(
+            {
+                "proposal": proposal,
+                "linkStatus": link_status
+                or {
+                    "state": "rdma_ready",
+                    "ready": True,
+                    "setup_available": False,
+                },
+                "nodes": [
+                    {"node_id": "local", "capacity_bytes": 64 * 1024**3},
+                    {"node_id": "studio", "capacity_bytes": 128 * 1024**3},
+                ],
+            }
+        ),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def _run_dashboard_helpers(method_names: tuple[str, ...], body: str) -> dict:
+    """Execute pure dashboard helpers against a small Alpine-shaped object."""
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required to execute dashboard helpers")
+    methods = ",\n".join(_method_source(name) for name in method_names)
+    script = f"""
+const component = {{
+  {methods},
+  models: [],
+  clusterCatalogue: null,
+  clusterModelSearch: '',
+  clusterPlanModelPath: '',
+  clusterDeployments: [],
+  clusterPeerSsh: '',
+}};
+{body}
+"""
+    result = subprocess.run(
+        [node, "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def test_manual_memory_allowance_survives_automatic_budget_refresh():
+    result = _run_dashboard_helpers(
+        (
+            "saveClusterMemoryAllowances",
+            "clusterManualMemoryAllowanceGiB",
+            "clusterSetMemoryAllowance",
+            "measureClusterBudgets",
+        ),
+        """
+const writes = [];
+global.window = {
+  localStorage: {
+    setItem: (key, value) => writes.push([key, JSON.parse(value)]),
+    removeItem: key => writes.push([key, null]),
+  },
+};
+global.fetch = async () => ({
+  ok: true,
+  json: async () => ({ nodes: [{
+    node_id: 'MacBook-Pro',
+    capacity_bytes: 108 * (1024 ** 3),
+    reserve_bytes: 66 * (1024 ** 3),
+    summary: '42 GiB automatic',
+  }] }),
+});
+component.clusterMemoryAllowancesGiB = {};
+component.clusterMemoryLimitsManual = false;
+component.clusterWeightTargetsGiB = {};
+component.clusterPlanNodes = [{
+  node_id: 'MacBook-Pro',
+  capacity_gib: 108,
+  reserve_gib: 66,
+  role: 'workstation',
+}];
+component.clusterBudgetsLoading = false;
+component.clusterBudgetsError = '';
+component.clusterClusterHostsPayload = () => [{ ssh: '127.0.0.1' }];
+component.invalidateClusterPlan = () => {};
+component.clusterSetMemoryAllowance({
+  nodeId: 'MacBook-Pro',
+  budget: component.clusterPlanNodes[0],
+  capacityGiB: 108,
+  minGiB: 4,
+}, 80);
+(async () => {
+  await component.measureClusterBudgets();
+  process.stdout.write(JSON.stringify({
+    reserve: component.clusterPlanNodes[0].reserve_gib,
+    automaticReserve: component.clusterPlanNodes[0].automatic_reserve_gib,
+    allowed: component.clusterMemoryAllowancesGiB['MacBook-Pro'],
+    persisted: writes.at(-1),
+  }));
+})().catch(error => {
+  console.error(error);
+  process.exit(1);
+});
+""",
+    )
+
+    assert result == {
+        "reserve": 28,
+        "automaticReserve": 66,
+        "allowed": 80,
+        "persisted": [
+            "omlx.cluster.memoryAllowances",
+            {"version": 1, "allowances_gib": {"MacBook-Pro": 80}},
+        ],
+    }
+
+
+def test_manual_memory_allowance_is_marked_in_every_planner_payload():
+    result = _run_dashboard_helpers(
+        ("clusterManualMemoryAllowanceGiB", "clusterNodePayloads"),
+        """
+component.clusterMemoryAllowancesGiB = { 'MacBook-Pro': 90 };
+component.clusterPlanNodes = [
+  { node_id: 'MacBook-Pro', capacity_gib: 108, reserve_gib: 18, role: 'workstation' },
+  { node_id: 'Studio', capacity_gib: 256, reserve_gib: 16, role: 'headless' },
+];
+component.clusterWeightTargetsGiB = {};
+component.clusterSplitGiB = null;
+process.stdout.write(JSON.stringify(component.clusterNodePayloads()));
+""",
+    )
+
+    assert result[0]["manual_memory_limit"] is True
+    assert result[1]["manual_memory_limit"] is False
+    assert result[0]["reserve_bytes"] == 18 * 1024**3
+
+
+def test_model_context_is_clamped_to_what_the_cluster_can_serve():
+    result = _run_dashboard_helpers(
+        (
+            "clusterCatalogueFit",
+            "clusterTokens",
+            "clusterModelContextLabel",
+            "clusterModelTargetContext",
+        ),
+        """
+component.clusterCatalogue = { models: [{
+  model_path: '/glm',
+  fits: true,
+  max_context_tokens: 131072,
+}] };
+const model = { model_path: '/glm', model_context_length: 1048576 };
+process.stdout.write(JSON.stringify({
+  target: component.clusterModelTargetContext(model, 1048576),
+  label: component.clusterModelContextLabel(model),
+}));
+""",
+    )
+
+    assert result == {"target": 131072, "label": "Up to 128k context"}
+
+
+def test_context_picker_offers_256k_and_shows_its_real_binary_label():
+    result = _run_dashboard_helpers(
+        (
+            "clusterContextMaximumTokens",
+            "clusterContextOptions",
+            "clusterTokens",
+        ),
+        """
+component.clusterSelectedModel = () => ({
+  model_path: '/minimax',
+  model_context_length: 1048576,
+});
+component.clusterCatalogueFit = () => ({
+  fits: true,
+  declared_context_tokens: 1048576,
+  max_context_tokens: 524288,
+});
+component.clusterTargetContextTokens = 262144;
+process.stdout.write(JSON.stringify({
+  options: component.clusterContextOptions(),
+  label: component.clusterTokens(262144),
+}));
+""",
+    )
+
+    assert 262144 in result["options"]
+    assert result["label"] == "256k"
+
+
+def test_automatic_context_tracks_the_highest_safe_model_and_memory_limit():
+    result = _run_dashboard_helpers(
+        ("clusterContextMaximumTokens", "clusterSetAutomaticContext"),
+        """
+let saved = null;
+global.window = {
+  localStorage: {
+    setItem: (_key, value) => { saved = JSON.parse(value); },
+  },
+};
+component.clusterTargetContextTokens = 131072;
+component.clusterContextMode = 'manual';
+component.clusterMaxKvSize = '4096';
+component.clusterPlanModelSource = 'studio';
+component.clusterSelectedModel = () => ({
+  model_path: '/minimax',
+  model_source: 'studio',
+  model_context_length: 524288,
+});
+component.clusterCatalogueFit = () => ({
+  fits: true,
+  declared_context_tokens: 524288,
+  max_context_tokens: 262144,
+});
+component.invalidateClusterPlan = () => {};
+component.previewClusterWeightBalance = async () => {};
+(async () => {
+  await component.clusterSetAutomaticContext();
+  process.stdout.write(JSON.stringify({
+    target: component.clusterTargetContextTokens,
+    mode: component.clusterContextMode,
+    saved,
+  }));
+})().catch(error => {
+  console.error(error);
+  process.exit(1);
+});
+""",
+    )
+
+    assert result["target"] == 262144
+    assert result["mode"] == "auto"
+    assert result["saved"]["context_mode"] == "auto"
+
+
+def test_automatic_context_does_not_flash_an_unverified_native_ceiling():
+    result = _run_dashboard_helpers(
+        ("clusterContextMaximumTokens",),
+        """
+component.clusterTargetContextTokens = 262144;
+component.clusterSelectedModel = () => ({
+  model_path: '/large',
+  model_context_length: 1048576,
+});
+component.clusterCatalogueFit = () => null;
+process.stdout.write(JSON.stringify({
+  pending: component.clusterContextMaximumTokens(),
+}));
+""",
+    )
+
+    assert result["pending"] == 262144
+
+
+def test_context_choice_replans_and_is_remembered_with_the_model():
+    result = _run_dashboard_helpers(
+        ("clusterSetTargetContext", "invalidateClusterPlan"),
+        """
+let saved = null;
+global.window = {
+  localStorage: {
+    setItem: (_key, value) => { saved = JSON.parse(value); },
+  },
+};
+component.clusterTargetContextTokens = 8192;
+component.clusterMaxKvSize = '4096';
+component.clusterPlanModelSource = 'studio';
+component.clusterAutoconfigureError =
+  'model weights and KV cache for 131072 tokens do not fit';
+component.clusterError = 'old activation failed';
+component.clusterSelectedModel = () => ({
+  model_path: '/minimax',
+  model_source: 'studio',
+});
+component.clusterModelTargetContext = (_model, requested) => requested;
+component.previewClusterWeightBalance = async () => {};
+(async () => {
+  await component.clusterSetTargetContext(262144);
+  process.stdout.write(JSON.stringify({
+    target: component.clusterTargetContextTokens,
+    legacyOverride: component.clusterMaxKvSize,
+    autoconfigureError: component.clusterAutoconfigureError,
+    clusterError: component.clusterError,
+    saved,
+  }));
+})().catch(error => {
+  console.error(error);
+  process.exit(1);
+});
+""",
+    )
+
+    assert result["target"] == 262144
+    assert result["legacyOverride"] == ""
+    assert result["autoconfigureError"] == ""
+    assert result["clusterError"] == ""
+    assert result["saved"]["target_context_tokens"] == 262144
+    assert result["saved"]["model_path"] == "/minimax"
+    assert result["saved"]["context_mode"] == "manual"
+
+
+def test_late_autoconfigure_failure_cannot_restore_an_invalidated_error():
+    result = _run_dashboard_helpers(
+        ("autoconfigureCluster",),
+        """
+let completeRequest = null;
+global.window = {
+  location: { href: '' },
+  localStorage: { setItem: () => {} },
+};
+global.fetch = async () => new Promise(resolve => {
+  completeRequest = resolve;
+});
+Object.assign(component, {
+  _clusterPlanRevision: 7,
+  clusterAutoconfigure: null,
+  clusterAutoconfigureLoading: false,
+  clusterAutoconfigureError: '',
+  clusterExecutionProfile: 'balanced',
+  clusterAutoconfigurePrefer: 'speed',
+  clusterStrategy: 'auto',
+  clusterAutoTune: false,
+  clusterSamplingRankOnly: true,
+  clusterAsyncOverlap: true,
+  clusterCacheAffinity: true,
+  clusterMaxKvSize: '',
+  clusterTargetContextTokens: 131072,
+  clusterRingConnectionsPerIp: 1,
+  clusterPlanMode: 'model',
+  clusterPlanModelPath: '/glm',
+  clusterPlanModelSource: 'studio',
+  clusterNodePayloads: () => [{ node_id: 'local' }, { node_id: 'studio' }],
+  clusterClusterHostsPayload: () => [],
+  clusterResponseError: async () =>
+    'model weights and KV cache for 131072 tokens do not fit',
+});
+(async () => {
+  const pending = component.autoconfigureCluster();
+  while (!completeRequest) await Promise.resolve();
+  component._clusterPlanRevision += 1;
+  component.clusterTargetContextTokens = 8192;
+  completeRequest({ status: 400, ok: false });
+  const proposal = await pending;
+  process.stdout.write(JSON.stringify({
+    proposal,
+    error: component.clusterAutoconfigureError,
+    target: component.clusterTargetContextTokens,
+  }));
+})().catch(error => {
+  console.error(error);
+  process.exit(1);
+});
+""",
+    )
+
+    assert result == {"proposal": None, "error": "", "target": 8192}
+
+
+def test_settling_a_memory_slider_rechecks_fit_before_replanning():
+    result = _run_dashboard_helpers(
+        ("clusterMemoryAllowanceChanged",),
+        """
+const calls = [];
+component.clusterCatalogue = { models: [{ model_path: '/old' }] };
+component.loadClusterCatalogue = async () => calls.push('catalogue');
+component.previewClusterWeightBalance = async () => calls.push('plan');
+(async () => {
+  await component.clusterMemoryAllowanceChanged();
+  process.stdout.write(JSON.stringify({
+    calls,
+    catalogue: component.clusterCatalogue,
+  }));
+})().catch(error => {
+  console.error(error);
+  process.exit(1);
+});
+""",
+    )
+
+    assert result == {"calls": ["catalogue", "plan"], "catalogue": None}
+
+
+def test_reset_memory_allowance_restores_measured_automatic_default():
+    result = _run_dashboard_helpers(
+        (
+            "saveClusterMemoryAllowances",
+            "clusterResetMemoryAllowances",
+        ),
+        """
+const removals = [];
+global.window = {
+  localStorage: {
+    setItem: () => {},
+    removeItem: key => removals.push(key),
+  },
+};
+const budget = { node_id: 'MacBook-Pro', capacity_gib: 108, reserve_gib: 28 };
+component.clusterMemoryAllowancesGiB = { 'MacBook-Pro': 80 };
+component.clusterMemoryLimitsManual = true;
+component.clusterWeightTargetsGiB = {};
+component.clusterMemoryAllowanceNodes = () => [{
+  nodeId: 'MacBook-Pro',
+  budget,
+  automaticReserveGiB: 66,
+}];
+component.invalidateClusterPlan = () => {};
+component.clusterMemoryAllowanceChanged = () => {};
+component.clusterResetMemoryAllowances();
+process.stdout.write(JSON.stringify({
+  reserve: budget.reserve_gib,
+  allowances: component.clusterMemoryAllowancesGiB,
+  manual: component.clusterMemoryLimitsManual,
+  removals,
+}));
+""",
+    )
+
+    assert result == {
+        "reserve": 66,
+        "allowances": {},
+        "manual": False,
+        "removals": ["omlx.cluster.memoryAllowances"],
+    }
+
+
+def test_known_nodes_render_immediately_without_caching_launch_approval():
+    result = _run_dashboard_helpers(
+        ("loadClusterKnownNodes",),
+        """
+global.window = {
+  localStorage: {
+    getItem: key => key === 'omlx.cluster.knownNodes'
+      ? JSON.stringify({
+          version: 1,
+          peers: [{
+            ssh: 'studio',
+            name: 'Mac Studio',
+            service: 'oMLX Distributed',
+            transport: 'rdma',
+            rdma_available: true,
+          }],
+          selected_ssh: ['studio'],
+          hardware: {
+            studio: {
+              hostname: 'Studio',
+              chip_name: 'Apple M3 Ultra',
+              physical_memory_bytes: 256 * (1024 ** 3),
+              recommended_working_set_bytes: 223 * (1024 ** 3),
+            },
+          },
+        })
+      : null,
+  },
+};
+component._clusterKnownNodesHydrated = false;
+component._clusterKnownNodesNeedsSync = false;
+component.clusterDiscoveredPeers = null;
+component.clusterSelectedPeers = [];
+component.clusterPeerProbes = {};
+component.loadClusterKnownNodes();
+process.stdout.write(JSON.stringify({
+  peer: component.clusterDiscoveredPeers[0],
+  selected: component.clusterSelectedPeers.map(peer => peer.ssh),
+  peerSsh: component.clusterPeerSsh,
+  hardware: component.clusterPeerProbes.studio.status.node,
+  runtimeCompatible: component.clusterPeerProbes.studio.runtime_compatible ?? null,
+  needsSync: component._clusterKnownNodesNeedsSync,
+}));
+""",
+    )
+
+    assert result == {
+        "peer": {
+            "ssh": "studio",
+            "name": "Mac Studio",
+            "service": "oMLX Distributed",
+            "transport": "rdma",
+            "rdma_available": True,
+            "cached": True,
+        },
+        "selected": ["studio"],
+        "peerSsh": "studio",
+        "hardware": {
+            "hostname": "Studio",
+            "chip_name": "Apple M3 Ultra",
+            "physical_memory_bytes": 256 * 1024**3,
+            "recommended_working_set_bytes": 223 * 1024**3,
+        },
+        "runtimeCompatible": None,
+        "needsSync": True,
+    }
+
+
+def test_model_picker_ranks_real_fit_and_uses_friendly_names():
+    result = _run_dashboard_helpers(
+        (
+            "clusterAllModels",
+            "clusterModelCandidates",
+            "clusterModelHostsLabel",
+            "clusterModelOptions",
+            "clusterRecommendedModels",
+            "clusterModelGroupLabel",
+            "clusterModelDisplayName",
+            "clusterModelOwner",
+            "clusterModelFailureLabel",
+            "clusterModelBadge",
+            "clusterCatalogueFit",
+        ),
+        """
+component.models = [
+  { id: 'owner/small', model_path: '/small', model_type: 'llm',
+    estimated_size: 10, is_default: true },
+  { id: 'lab/big', model_path: '/big', model_type: 'llm',
+    estimated_size: 90 },
+  { id: 'huge', model_path: '/huge', model_type: 'llm',
+    estimated_size: 400, is_favorite: true },
+];
+component.clusterCatalogue = { models: [
+  { model_path: '/big', fits: true, nodes_required: 2 },
+  { model_path: '/small', fits: true, nodes_required: 1 },
+  { model_path: '/huge', fits: false, nodes_required: 0 },
+] };
+const options = component.clusterModelOptions();
+process.stdout.write(JSON.stringify({
+  order: options.map(model => model.model_path),
+  recommended: component.clusterRecommendedModels().map(model => model.model_path),
+  firstGroup: component.clusterModelGroupLabel(0),
+  allGroup: component.clusterModelGroupLabel(2),
+  bestBadge: component.clusterModelBadge(options[0]),
+  tooLargeBadge: component.clusterModelBadge(options[2]),
+  displayName: component.clusterModelDisplayName(options[0]),
+  owner: component.clusterModelOwner(options[0]),
+}));
+""",
+    )
+
+    assert result == {
+        "order": ["/big", "/small", "/huge"],
+        "recommended": ["/big", "/small"],
+        "firstGroup": "Recommended for these Macs",
+        "allGroup": "All other models",
+        "bestBadge": "Best for these Macs",
+        "tooLargeBadge": "Does not fit",
+        "displayName": "big",
+        "owner": "lab",
+    }
+
+
+def test_primary_action_speaks_in_user_actions_not_cluster_roles():
+    result = _run_dashboard_helpers(
+        (
+            "clusterAllModels",
+            "clusterPrimaryActionLabel",
+            "clusterPrimaryActionDisabled",
+            "clusterPrimaryDeployment",
+            "clusterSelectedModel",
+            "clusterCatalogueFit",
+            "clusterModelDisplayName",
+            "clusterLiveJobs",
+            "clusterWorkerPeers",
+            "clusterQuickNodes",
+            "clusterFriendlyMacName",
+            "clusterPeerDisplayName",
+        ),
+        """
+component.models = [
+  { id: 'lab/Qwen3.6-27B-q3', model_path: '/qwen', model_type: 'llm' },
+];
+component.clusterPlanModelPath = '/qwen';
+component.clusterPeerSsh = 'studio.local';
+component.clusterSelectedPeers = [{ ssh: 'studio.local', name: 'Mac Studio' }];
+component.clusterDiscoveredPeers = component.clusterSelectedPeers;
+component.clusterStatus = { node: { hostname: 'MacBook Pro' }, runtime_jobs: { jobs: [] } };
+component.clusterDeactivatingId = '';
+component.clusterActivationLoading = false;
+component.clusterLinkSetupLoading = false;
+component.clusterAutoconfigureLoading = false;
+const start = component.clusterPrimaryActionLabel();
+component.clusterCatalogue = {
+  models: [{ model_path: '/qwen', fits: false, failure_kind: 'single_node_only' }],
+};
+const rejected = component.clusterPrimaryActionLabel();
+const rejectedDisabled = component.clusterPrimaryActionDisabled();
+component.clusterCatalogue = null;
+component.clusterError = 'The approved plan changed';
+const retry = component.clusterPrimaryActionLabel();
+component.clusterError = '';
+component.clusterDeployments = [
+  { deployment_id: 'qwen-pair', model: '/qwen' },
+];
+component.clusterStatus.runtime_jobs.jobs = [{ live: true }];
+const stop = component.clusterPrimaryActionLabel();
+component.clusterDeployments = [];
+component.clusterStatus.runtime_jobs.jobs = [];
+component.clusterPeerSsh = '';
+component.clusterSelectedPeers = [];
+const find = component.clusterPrimaryActionLabel();
+process.stdout.write(JSON.stringify({ start, rejected, rejectedDisabled, retry, stop, find }));
+""",
+    )
+
+    assert result == {
+        "start": "Start Qwen3.6-27B-q3 on 2 Macs",
+        "rejected": "Choose a cluster-compatible model",
+        "rejectedDisabled": True,
+        "retry": "Retry Qwen3.6-27B-q3 setup",
+        "stop": "Stop",
+        "find": "Find my Macs",
+    }
+
+
+def test_three_mac_cluster_builds_three_rank_hosts_and_valid_tp_choices():
+    result = _run_dashboard_helpers(
+        (
+            "clusterWorkerPeers",
+            "clusterClusterHostsPayload",
+            "clusterTensorParallelOptions",
+        ),
+        """
+component.clusterSelectedPeers = [
+  { ssh: 'studio.local', name: 'Mac Studio' },
+  { ssh: 'mini.local', name: 'Mac mini' },
+];
+component.clusterPlanNodes = [
+  { node_id: 'MacBook Pro' },
+  { node_id: 'Mac Studio' },
+  { node_id: 'Mac mini' },
+];
+component.clusterLocalIp = '10.0.0.1';
+component.clusterPeerIp = '10.0.0.2';
+component.clusterFabric = { hosts: [
+  { host: '127.0.0.1', ips: ['10.0.0.1'], rdma: [null, 'rdma0', 'rdma1'] },
+  { host: 'studio.local', ips: ['10.0.0.2'], rdma: ['rdma0', null, 'rdma2'] },
+  { host: 'mini.local', ips: ['10.0.0.3'], rdma: ['rdma1', 'rdma2', null] },
+] };
+process.stdout.write(JSON.stringify({
+  hosts: component.clusterClusterHostsPayload(),
+  tp: component.clusterTensorParallelOptions(),
+}));
+""",
+    )
+
+    assert [host["ssh"] for host in result["hosts"]] == [
+        "127.0.0.1",
+        "studio.local",
+        "mini.local",
+    ]
+    assert [host["node_id"] for host in result["hosts"]] == [
+        "MacBook Pro",
+        "Mac Studio",
+        "Mac mini",
+    ]
+    assert result["tp"] == [1, 3]
+
+
+def test_three_mac_weight_slider_rebalances_every_other_rank():
+    result = _run_dashboard_helpers(
+        (
+            "clusterWeightPlan",
+            "clusterWeightNodes",
+            "clusterWeightTargetGiB",
+            "clusterWeightMinimumGiB",
+            "clusterWeightTotalGiB",
+            "clusterWeightBounds",
+            "clusterSetWeightTarget",
+            "clusterNodePayloads",
+        ),
+        """
+component.clusterPlanNodes = [
+  { node_id: 'MacBook Pro', capacity_gib: 80, reserve_gib: 0, role: 'workstation' },
+  { node_id: 'Mac Studio', capacity_gib: 100, reserve_gib: 0, role: 'headless' },
+  { node_id: 'Mac mini', capacity_gib: 60, reserve_gib: 0, role: 'headless' },
+];
+component.clusterPlan = {
+  tensor_parallel_size: 1,
+  model: {
+    fixed_weight_bytes: 0,
+    layer_weight_bytes: Array(12).fill(10 * 1024 ** 3),
+  },
+  assignments: [
+    { node_id: 'MacBook Pro', rank: 0, layer_weight_bytes: 20 * 1024 ** 3,
+      fixed_weight_bytes: 0 },
+    { node_id: 'Mac Studio', rank: 1, layer_weight_bytes: 70 * 1024 ** 3,
+      fixed_weight_bytes: 0 },
+    { node_id: 'Mac mini', rank: 2, layer_weight_bytes: 30 * 1024 ** 3,
+      fixed_weight_bytes: 0 },
+  ],
+};
+component.clusterAutoconfigure = null;
+component.clusterWeightTargetsGiB = {};
+component.clusterSplitGiB = null;
+component.clusterSetWeightTarget(component.clusterWeightNodes()[0], 30);
+process.stdout.write(JSON.stringify({
+  targets: component.clusterWeightTargetsGiB,
+  payloads: component.clusterNodePayloads(),
+}));
+""",
+    )
+
+    assert result["targets"] == {
+        "MacBook Pro": 30,
+        "Mac Studio": 62.5,
+        "Mac mini": 27.5,
+    }
+    assert [
+        round(node["target_weight_bytes"] / 1024**3, 1)
+        for node in result["payloads"]
+    ] == [30, 62.5, 27.5]
+
+
+def test_weight_slider_is_hidden_for_an_unsplittable_architecture():
+    result = _run_dashboard_helpers(
+        ("clusterWeightPlan", "clusterSplitAvailable"),
+        """
+component.clusterPlan = {
+  tensor_parallel_size: 1,
+  assignments: [{ rank: 0 }, { rank: 1 }],
+};
+component.clusterAutoconfigure = null;
+component.clusterSelectedModel = () => ({ model_path: '/qwen' });
+component.clusterCatalogueFit = () => ({ fits: false, splittable: false,
+  failure_kind: 'single_node_only' });
+process.stdout.write(JSON.stringify({ available: component.clusterSplitAvailable() }));
+""",
+    )
+
+    assert result == {"available": False}
+
+
+def test_first_run_adopts_omlx_peers_before_transport_has_been_measured():
+    source = _method_source("initializeClusterSetup")
+
+    assert "peer.service === 'oMLX Distributed'" in source
+    assert "omlxPeers.length" in source
+    assert "automaticPeers" in source
+    assert "if (this.clusterWorkerPeers().length)" in source
+    assert source.count("await this.measureClusterBudgets()") == 1
+    assert "await this.previewClusterWeightBalance()" in source
+
+
+def test_automatic_weight_preview_cannot_start_rank_processes():
+    source = _method_source("previewClusterWeightBalance")
+
+    assert "await this.runClusterPlan()" in source
+    assert "startCluster" not in source
+    assert "activateCluster" not in source
+
+
+def test_measured_budgets_invalidate_optimistic_catalogue_results():
+    source = _method_source("measureClusterBudgets")
+
+    assert "this.clusterCatalogue = null" in source
+    assert "this.invalidateClusterPlan()" in source
+
+
+def test_activation_progress_is_runtime_driven_not_timer_simulated():
+    source = _method_source("activateClusterProposal")
+
+    assert "startClusterActivationProgress" in source
+    assert "stopClusterActivationProgress" in source
+    assert "progressSteps" not in source
+    assert "setTimeout" not in source
+
+
+def test_one_click_posts_the_server_activation_payload_unchanged():
+    activation = {
+        "model_path": "/models/qwen",
+        "backend": "jaccl",
+        "nodes": [{"node_id": "local"}, {"node_id": "studio"}],
+        "hosts": [{"ssh": "127.0.0.1"}, {"ssh": "studio.local"}],
+        "preflight": True,
+        "tensor_parallel_size": 2,
+        "auto_tune": True,
+        "marker": "server-owned-payload",
+    }
+    result = _run_one_click(
+        {
+            "ready_to_activate": True,
+            "activation": activation,
+            "fabric": None,
+            "tensor_parallel_size": 2,
+            "summary": "2-way tensor parallel",
+        }
+    )
+
+    operational = [
+        call for call in result["calls"]
+        if not call["url"].endswith("/runtime")
+    ]
+    assert [call["url"] for call in operational] == [
+        "/admin/api/cluster/autoconfigure",
+        "/admin/api/cluster/deployments",
+    ]
+    assert operational[1]["body"] == activation
+    assert any(call["url"].endswith("/runtime") for call in result["calls"])
+    assert result["deploymentLoads"] == 1
+    assert result["activationResult"]["ok"] is True
+    assert result["clusterError"] == ""
+
+
+def test_one_click_never_posts_a_blocked_proposal():
+    result = _run_one_click(
+        {
+            "ready_to_activate": False,
+            "activation": {"must_not": "launch"},
+            "fabric": None,
+            "tensor_parallel_size": 1,
+            "summary": "blocked",
+            "preflight": "Studio is missing mlx_vlm.",
+            "preflight_issues": [
+                {
+                    "node_id": "studio",
+                    "kind": "import_missing",
+                    "detail": "No module named mlx_vlm",
+                    "commands": ["pip install mlx-vlm"],
+                }
+            ],
+        }
+    )
+
+    assert [call["url"] for call in result["calls"]] == [
+        "/admin/api/cluster/autoconfigure"
+    ]
+    assert result["deploymentLoads"] == 0
+    assert result["activationResult"] is None
+    assert result["autoconfigureError"] == "Studio is missing mlx_vlm."
+
+
+def test_one_click_prepares_thunderbolt_then_continues_to_activation():
+    result = _run_one_click(
+        {
+            "ready_to_activate": True,
+            "activation": {
+                "model_path": "/models/qwen",
+                "backend": "jaccl",
+                "nodes": [{"node_id": "local"}, {"node_id": "studio"}],
+                "hosts": [{"ssh": "127.0.0.1"}, {"ssh": "studio.local"}],
+            },
+            "fabric": None,
+            "tensor_parallel_size": 2,
+            "summary": "ready",
+        },
+        link_status={
+            "state": "rdma_needs_setup",
+            "ready": False,
+            "setup_available": True,
+        },
+    )
+
+    operational = [
+        call for call in result["calls"]
+        if not call["url"].endswith("/runtime")
+    ]
+    assert [call["url"] for call in operational] == [
+        "/admin/api/cluster/link-setup",
+        "/admin/api/cluster/autoconfigure",
+        "/admin/api/cluster/deployments",
+    ]
+    assert operational[0]["body"] == {
+        "hosts": ["127.0.0.1", "studio.local"]
+    }
+    assert result["activationResult"]["ok"] is True

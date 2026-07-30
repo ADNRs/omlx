@@ -422,4 +422,3 @@ def test_the_cli_refuses_to_plan_from_one_stage_and_says_who_to_ask(tmp_path):
     assert result.returncode == 2
     assert "4 of 8 layers" in result.stderr
     assert "--peer" in _plan_cli(root, "--help").stdout
-
