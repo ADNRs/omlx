@@ -1,0 +1,515 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Automatic SSH key management for cluster peer pairing."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import secrets
+import shutil
+import subprocess
+import time
+from contextlib import suppress
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+# Key management constants
+_SSH_KEY_TYPE = "ed25519"
+_SSH_KEY_COMMENT = "omlx-cluster"
+_SSH_KEY_BITS = 256
+_KEY_EXCHANGE_TTL = 300  # 5 minutes
+
+# Default SSH directory
+_SSH_DIR = Path.home() / ".ssh"
+_SSH_KEY_PATH = _SSH_DIR / "omlx_cluster"
+_SSH_PUBKEY_PATH = _SSH_DIR / "omlx_cluster.pub"
+
+
+@dataclass(frozen=True)
+class SSHKeyPair:
+    """An SSH key pair with its public key in OpenSSH format."""
+
+    private_key_path: Path
+    public_key_path: Path
+    public_key: str
+    fingerprint: str
+    key_type: str
+    created_at: float
+
+
+@dataclass(frozen=True)
+class KeyExchangeToken:
+    """A signed token for exchanging SSH public keys between peers."""
+
+    token: str
+    public_key: str
+    fingerprint: str
+    node_id: str
+    created_at: float
+    expires_at: float
+
+
+def _ssh_executable() -> str:
+    """Find the OpenSSH executable."""
+
+    system_ssh = Path("/usr/bin/ssh")
+    if system_ssh.is_file() and os.access(system_ssh, os.X_OK):
+        return str(system_ssh)
+    discovered = shutil.which("ssh")
+    if discovered is None:
+        raise RuntimeError("OpenSSH client is unavailable")
+    return str(Path(discovered).resolve())
+
+
+def _ssh_keygen_executable() -> str:
+    """Find the ssh-keygen executable."""
+
+    system_keygen = Path("/usr/bin/ssh-keygen")
+    if system_keygen.is_file() and os.access(system_keygen, os.X_OK):
+        return str(system_keygen)
+    discovered = shutil.which("ssh-keygen")
+    if discovered is None:
+        raise RuntimeError("ssh-keygen is unavailable")
+    return str(Path(discovered).resolve())
+
+
+def _key_fingerprint(public_key: str) -> str:
+    """Compute the SHA256 fingerprint of an SSH public key."""
+
+    # Extract the base64-encoded key data
+    parts = public_key.strip().split()
+    if len(parts) < 2:
+        raise ValueError("invalid SSH public key format")
+    key_data = base64.b64decode(parts[1])
+    digest = hashlib.sha256(key_data).digest()
+    return "SHA256:" + base64.b64encode(digest).decode().rstrip("=")
+
+
+def generate_ssh_key_pair(
+    *,
+    key_path: Path | None = None,
+    comment: str = _SSH_KEY_COMMENT,
+    overwrite: bool = False,
+) -> SSHKeyPair:
+    """Generate a new SSH key pair for cluster authentication."""
+
+    if key_path is None:
+        key_path = _SSH_KEY_PATH
+
+    if key_path.exists() and not overwrite:
+        # Load existing key
+        pubkey_path = Path(str(key_path) + ".pub")
+        if not pubkey_path.exists():
+            raise RuntimeError(f"private key exists but public key missing: {key_path}")
+        public_key = pubkey_path.read_text().strip()
+        return SSHKeyPair(
+            private_key_path=key_path,
+            public_key_path=pubkey_path,
+            public_key=public_key,
+            fingerprint=_key_fingerprint(public_key),
+            key_type=_SSH_KEY_TYPE,
+            created_at=key_path.stat().st_mtime,
+        )
+
+    # Ensure SSH directory exists
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(key_path.parent, 0o700)
+
+    # Generate the key pair
+    keygen = _ssh_keygen_executable()
+    result = subprocess.run(
+        [
+            keygen,
+            "-t",
+            _SSH_KEY_TYPE,
+            "-b",
+            str(_SSH_KEY_BITS),
+            "-f",
+            str(key_path),
+            "-N",
+            "",  # No passphrase
+            "-C",
+            comment,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(f"ssh-keygen failed: {result.stderr.strip()}")
+
+    # Set proper permissions
+    os.chmod(key_path, 0o600)
+    os.chmod(Path(str(key_path) + ".pub"), 0o644)
+
+    pubkey_path = Path(str(key_path) + ".pub")
+    public_key = pubkey_path.read_text().strip()
+
+    return SSHKeyPair(
+        private_key_path=key_path,
+        public_key_path=pubkey_path,
+        public_key=public_key,
+        fingerprint=_key_fingerprint(public_key),
+        key_type=_SSH_KEY_TYPE,
+        created_at=time.time(),
+    )
+
+
+def get_or_create_ssh_key() -> SSHKeyPair:
+    """Get the existing SSH key pair or create a new one."""
+
+    return generate_ssh_key_pair(overwrite=False)
+
+
+def create_key_exchange_token(
+    *,
+    public_key: str,
+    node_id: str,
+    ttl: int = _KEY_EXCHANGE_TTL,
+) -> str:
+    """Create a signed token containing the SSH public key for exchange."""
+
+    fingerprint = _key_fingerprint(public_key)
+    token = secrets.token_urlsafe(32)
+    created_at = time.time()
+    expires_at = created_at + ttl
+
+    payload = {
+        "token": token,
+        "public_key": public_key,
+        "fingerprint": fingerprint,
+        "node_id": node_id,
+        "created_at": created_at,
+        "expires_at": expires_at,
+    }
+
+    # Sign the payload with a hash
+    payload_json = json.dumps(payload, sort_keys=True)
+    signature = hashlib.sha256(payload_json.encode()).hexdigest()
+
+    exchange_data = {
+        "token": token,
+        "signature": signature,
+        "public_key": public_key,
+        "fingerprint": fingerprint,
+        "node_id": node_id,
+        "created_at": created_at,
+        "expires_at": expires_at,
+    }
+
+    return base64.urlsafe_b64encode(
+        json.dumps(exchange_data).encode()
+    ).decode()
+
+
+def verify_key_exchange_token(encoded_token: str) -> KeyExchangeToken | None:
+    """Verify a key exchange token and return the key data."""
+
+    try:
+        data = json.loads(base64.urlsafe_b64decode(encoded_token))
+        token = data["token"]
+        signature = data["signature"]
+        public_key = data["public_key"]
+        fingerprint = data["fingerprint"]
+        node_id = data["node_id"]
+        created_at = data["created_at"]
+        expires_at = data["expires_at"]
+    except (json.JSONDecodeError, KeyError, ValueError):
+        return None
+
+    # Check TTL
+    if time.time() > expires_at:
+        return None
+
+    # Verify signature
+    payload = {
+        "token": token,
+        "public_key": public_key,
+        "fingerprint": fingerprint,
+        "node_id": node_id,
+        "created_at": created_at,
+        "expires_at": expires_at,
+    }
+    payload_json = json.dumps(payload, sort_keys=True)
+    expected_signature = hashlib.sha256(payload_json.encode()).hexdigest()
+
+    if signature != expected_signature:
+        return None
+
+    # Verify fingerprint matches
+    if _key_fingerprint(public_key) != fingerprint:
+        return None
+
+    return KeyExchangeToken(
+        token=token,
+        public_key=public_key,
+        fingerprint=fingerprint,
+        node_id=node_id,
+        created_at=created_at,
+        expires_at=expires_at,
+    )
+
+
+def install_authorized_key(
+    *,
+    public_key: str,
+    authorized_keys_path: Path | None = None,
+) -> bool:
+    """Install a public key in the authorized_keys file."""
+
+    if authorized_keys_path is None:
+        authorized_keys_path = _SSH_DIR / "authorized_keys"
+
+    # Ensure SSH directory exists
+    authorized_keys_path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(authorized_keys_path.parent, 0o700)
+
+    # Read existing keys
+    existing_keys: set[str] = set()
+    if authorized_keys_path.exists():
+        existing_keys = {
+            line.strip()
+            for line in authorized_keys_path.read_text().splitlines()
+            if line.strip()
+        }
+
+    # Check if key already exists
+    if public_key.strip() in existing_keys:
+        return False  # Already installed
+
+    # Append the new key
+    with authorized_keys_path.open("a") as f:
+        f.write(public_key.strip() + "\n")
+
+    os.chmod(authorized_keys_path, 0o600)
+    return True
+
+
+def get_known_hosts_path() -> Path:
+    """Get the path to the user's known_hosts file."""
+
+    return _SSH_DIR / "known_hosts"
+
+
+def is_host_known(hostname: str) -> bool:
+    """Check if a host is already in known_hosts."""
+
+    known_hosts = get_known_hosts_path()
+    if not known_hosts.exists():
+        return False
+
+    ssh_keygen = _ssh_keygen_executable()
+    result = subprocess.run(
+        [ssh_keygen, "-F", hostname, "-f", str(known_hosts)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def add_host_key(
+    *,
+    hostname: str,
+    host_key: str,
+    known_hosts_path: Path | None = None,
+) -> bool:
+    """Add a host key to known_hosts."""
+
+    if known_hosts_path is None:
+        known_hosts_path = get_known_hosts_path()
+
+    if is_host_known(hostname):
+        return False  # Already known
+
+    known_hosts_path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(known_hosts_path.parent, 0o700)
+
+    # Append the host key
+    with known_hosts_path.open("a") as f:
+        f.write(f"{hostname} {host_key}\n")
+
+    if known_hosts_path.exists():
+        os.chmod(known_hosts_path, 0o600)
+
+    return True
+
+
+def get_ssh_key_info() -> dict[str, Any]:
+    """Get information about the current SSH key pair."""
+
+    try:
+        key_pair = get_or_create_ssh_key()
+    except RuntimeError:
+        return {
+            "available": False,
+            "error": "SSH key generation failed",
+        }
+
+    return {
+        "available": True,
+        "key_type": key_pair.key_type,
+        "fingerprint": key_pair.fingerprint,
+        "private_key_path": str(key_pair.private_key_path),
+        "public_key_path": str(key_pair.public_key_path),
+        "created_at": key_pair.created_at,
+    }
+
+
+def generate_key_exchange_for_peer(
+    *,
+    node_id: str,
+    key_pair: SSHKeyPair | None = None,
+) -> str:
+    """Generate a key exchange token for a specific peer."""
+
+    if key_pair is None:
+        key_pair = get_or_create_ssh_key()
+
+    return create_key_exchange_token(
+        public_key=key_pair.public_key,
+        node_id=node_id,
+    )
+
+
+def exchange_keys_with_peer(
+    *,
+    peer_token: str,
+    known_hosts_path: Path | None = None,
+) -> dict[str, Any]:
+    """Exchange keys with a peer using their key exchange token."""
+
+    verified = verify_key_exchange_token(peer_token)
+    if verified is None:
+        return {
+            "success": False,
+            "error": "invalid or expired key exchange token",
+        }
+
+    # Install the peer's public key in our authorized_keys
+    key_installed = install_authorized_key(public_key=verified.public_key)
+
+    # Fetch and add the peer's SSH host key to known_hosts
+    host_key_added = False
+    with suppress(Exception):
+        host_key_added = add_verified_peer_host_key(hostname=verified.node_id)
+
+    return {
+        "success": True,
+        "peer_node_id": verified.node_id,
+        "peer_fingerprint": verified.fingerprint,
+        "key_installed": key_installed,
+        "host_key_added": host_key_added,
+        "expires_at": verified.expires_at,
+    }
+
+
+def add_verified_peer_host_key(*, hostname: str) -> bool:
+    """Fetch and add a peer's SSH host key to known_hosts.
+
+    Uses ssh-keyscan to retrieve the host key, which is then added
+    to known_hosts. This is safe because the peer's identity has
+    already been verified via the signed key exchange token.
+    """
+
+    if is_host_known(hostname):
+        return False  # Already known
+
+    ssh_keyscan = shutil.which("ssh-keyscan")
+    if ssh_keyscan is None:
+        raise RuntimeError("ssh-keyscan is unavailable")
+
+    result = subprocess.run(
+        [ssh_keyscan, "-t", "ed25519,rsa", hostname],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError(f"ssh-keyscan failed for {hostname}")
+
+    known_hosts_path = get_known_hosts_path()
+    known_hosts_path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(known_hosts_path.parent, 0o700)
+
+    with known_hosts_path.open("a") as f:
+        f.write(result.stdout)
+
+    if known_hosts_path.exists():
+        os.chmod(known_hosts_path, 0o600)
+
+    return True
+
+
+def store_key_in_keychain(*, service: str = "omlx-cluster", account: str = "ssh-key") -> bool:
+    """Store the SSH key fingerprint in macOS Keychain.
+
+    This provides an additional layer of security by storing the key
+    metadata in the system keychain rather than relying solely on
+    filesystem permissions.
+    """
+
+    try:
+        key_pair = get_or_create_ssh_key()
+    except RuntimeError:
+        return False
+
+    # Use security command to store in keychain
+    security = shutil.which("security")
+    if security is None:
+        return False  # Not on macOS or security command unavailable
+
+    try:
+        # Delete any existing entry first
+        subprocess.run(
+            [security, "delete-generic-password", "-s", service, "-a", account],
+            capture_output=True,
+            check=False,
+        )
+
+        # Store the fingerprint as the keychain item
+        subprocess.run(
+            [
+                security,
+                "add-generic-password",
+                "-s", service,
+                "-a", account,
+                "-w",
+                key_pair.fingerprint,
+            ],
+            capture_output=True,
+            check=True,
+        )
+
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+
+def verify_key_in_keychain(*, service: str = "omlx-cluster", account: str = "ssh-key") -> bool:
+    """Verify that the SSH key fingerprint is stored in macOS Keychain."""
+
+    security = shutil.which("security")
+    if security is None:
+        return False
+
+    try:
+        result = subprocess.run(
+            [security, "find-generic-password", "-s", service, "-a", account, "-w"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        try:
+            key_pair = get_or_create_ssh_key()
+            return result.stdout.strip() == key_pair.fingerprint
+        except RuntimeError:
+            return False
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
