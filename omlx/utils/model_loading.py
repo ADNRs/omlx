@@ -93,6 +93,21 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
                     extras[proj_variant] = val
         if extras:
             quant.update(extras)
+        if str(cfg.get("model_type", "")).startswith("minimax_m3"):
+            # The mlx-lm adapter stores the vendored mlx-vlm tree under
+            # ``Model.inner`` and sanitize() re-roots checkpoint weights to
+            # the same path. MiniMax's MoE gates are 8-bit while the rest is
+            # 4-bit, so the per-layer override must follow that adapter root.
+            # Without it, an 8-bit packed gate is constructed as 4-bit and
+            # fails on the first token with weight (..., 1536), scales
+            # (..., 96), bits=4.
+            inner_extras = {
+                f"inner.{key}": val
+                for key, val in list(quant.items())
+                if isinstance(val, dict) and not key.startswith("inner.")
+            }
+            for key, val in inner_extras.items():
+                quant.setdefault(key, val)
     return cfg
 
 
@@ -424,6 +439,17 @@ def maybe_apply_pre_load_patches(
             logger.info("GLM MoE DSA pre-load patch applied for %s", model_name)
 
     minimax_m3_types = {"minimax_m3", "minimax_m3_vl"}
+    if not for_vlm and (
+        model_type in minimax_m3_types or text_model_type in minimax_m3_types
+    ):
+        # The mlx-lm side of the same model. A cluster rank is an
+        # ``mlx_lm.server``, so without this it cannot resolve the model type at
+        # all and MiniMax-M3 is unservable across Macs — see the patch docstring.
+        from ..patches.minimax_m3_mlx_lm import apply_minimax_m3_mlx_lm_patch
+
+        if apply_minimax_m3_mlx_lm_patch():
+            logger.info("MiniMax-M3 mlx-lm registration applied for %s", model_name)
+
     if for_vlm and (
         model_type in minimax_m3_types or text_model_type in minimax_m3_types
     ):
