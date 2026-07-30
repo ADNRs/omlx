@@ -30,6 +30,7 @@
   "navbar.brand": "oMLX",
   "navbar.admin": "Admin",
   "navbar.tab.status": "Panel",
+  "navbar.tab.cluster": "Clúster",
   "navbar.tab.models": "Modelos",
   "navbar.tab.settings": "Configuración",
   "navbar.tab.logs": "Registros",

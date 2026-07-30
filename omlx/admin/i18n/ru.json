@@ -30,6 +30,7 @@
   "navbar.brand": "oMLX",
   "navbar.admin": "Админ",
   "navbar.tab.status": "Панель",
+  "navbar.tab.cluster": "Кластер",
   "navbar.tab.models": "Модели",
   "navbar.tab.settings": "Настройки",
   "navbar.tab.logs": "Журналы",
