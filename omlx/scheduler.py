@@ -2653,8 +2653,17 @@ class Scheduler:
             return None
 
         if request_id not in self._output_parser_sessions:
-            parser_session = self._output_parser_factory.create_session(self.tokenizer)
             request = self.requests.get(request_id)
+            create_with_tools = self._output_parser_factory.create_session_with_tools
+            if create_with_tools is not None:
+                parser_session = create_with_tools(
+                    self.tokenizer,
+                    request.tools if request is not None else None,
+                )
+            else:
+                parser_session = self._output_parser_factory.create_session(
+                    self.tokenizer
+                )
             if request is not None and getattr(request, "needs_think_prefix", False):
                 notify = getattr(parser_session, "notify_prefilled_thought", None)
                 if callable(notify):
