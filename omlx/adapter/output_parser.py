@@ -917,11 +917,38 @@ class InklingOutputParserSession:
             try:
                 parsed = json.loads(payload)
             except (json.JSONDecodeError, ValueError):
-                logger.debug("Inkling tool-call payload not valid JSON")
-                continue
+                # Quantized checkpoints occasionally emit the payload with the
+                # final closing brace(s) missing (observed: a complete nested
+                # args object short exactly one "}" before <|end_message|>).
+                # Brace-balance repair only runs after strict parsing failed,
+                # so well-formed payloads are never touched.
+                balance = payload.count("{") - payload.count("}")
+                if balance > 0:
+                    try:
+                        parsed = json.loads(payload + "}" * balance)
+                    except (json.JSONDecodeError, ValueError):
+                        logger.debug("Inkling tool-call payload not valid JSON")
+                        continue
+                else:
+                    logger.debug("Inkling tool-call payload not valid JSON")
+                    continue
             if not isinstance(parsed, dict) or not parsed.get("name"):
                 continue
-            args = parsed.get("args", {})
+            # Accept both payload conventions: Inkling-native {"name", "args":
+            # {...}} and the OpenAI wire format {"name", "arguments": "<json>"}
+            # that quantized checkpoints sometimes emit (both are abundant in
+            # tool-call training data). A JSON-encoded string is decoded; only
+            # a non-object result falls back to {}.
+            args = parsed.get("args")
+            if args is None:
+                args = parsed.get("arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except (json.JSONDecodeError, ValueError):
+                    args = None
+            if not isinstance(args, dict):
+                args = {}
             tool_calls.append(
                 {
                     "name": str(parsed["name"]),
