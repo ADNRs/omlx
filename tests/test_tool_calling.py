@@ -8,6 +8,7 @@ Tests JSON schema validation, JSON extraction, and tool conversion functions.
 import json
 import logging
 import re
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -1137,6 +1138,15 @@ def _make_tokenizer_with_end(tool_call_start="", tool_call_end=""):
     return tok
 
 
+def _feed_chunked(f, text, chunk_size):
+    """Feed text whole (chunk_size 0) or in fixed-size chunks."""
+    if chunk_size == 0:
+        return f.feed(text)
+    return "".join(
+        f.feed(text[i : i + chunk_size]) for i in range(0, len(text), chunk_size)
+    )
+
+
 def _paired_envelope_cases():
     return [
         ("<tool_call>", "</tool_call>", _make_tokenizer()),
@@ -1287,6 +1297,128 @@ def test_only_last_unclosed_envelope_becomes_recovery_candidate():
 
     assert visible == "Before  middle "
     assert f.take_recovery_candidate() == "<tool_call>second</tool_"
+
+
+@pytest.mark.parametrize("chunk_size", [0, 1, 3, 7, 16])
+def test_prose_between_two_malformed_envelopes_is_preserved(chunk_size):
+    """The EOF unwind must split each envelope at its own close marker.
+
+    Splitting at the LAST close marker in the withheld text deletes the
+    prose sitting between two malformed envelopes of the same pair.
+    """
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        'A <tool_call>{"name":"f"</tool_call> B '
+        '<tool_call>{"name":"g"</tool_call> C'
+    )
+
+    visible = _feed_chunked(f, text, chunk_size) + f.finish()
+
+    assert visible == "A  B  C"
+    assert f.take_recovery_candidate() == ""
+
+
+@pytest.mark.parametrize("chunk_size", [0, 1, 7])
+def test_literal_close_marker_in_trailing_prose_is_preserved(chunk_size):
+    """A literal XML close marker in prose is not a malformed envelope's end.
+
+    XML-style closers may appear as ordinary prose, so the unwind must not
+    treat a later literal occurrence as the envelope boundary and delete
+    everything before it.
+    """
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = 'A <tool_call>{"name":"f"</tool_call> B literal </tool_call> C'
+
+    visible = _feed_chunked(f, text, chunk_size) + f.finish()
+
+    assert visible == "A  B literal </tool_call> C"
+    assert f.take_recovery_candidate() == ""
+
+
+@pytest.mark.parametrize("chunk_size", [0, 1, 7])
+def test_valid_call_with_embedded_marker_after_malformed_envelope(chunk_size):
+    """A valid call after a malformed one keeps its #2507 protection at EOF.
+
+    The unwind uses the same span primitive as the non-streaming parser, so
+    the valid payload ends at its structural boundary and its embedded close
+    marker neither splits it nor leaks its tail as content.
+    """
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        'A <tool_call>{"x"</tool_call> B <tool_call>'
+        '{"name":"g","arguments":{"x":"</tool_call>"}}</tool_call> C'
+    )
+
+    visible = _feed_chunked(f, text, chunk_size) + f.finish()
+
+    assert visible == "A  B  C"
+    assert f.take_recovery_candidate() == ""
+
+
+def test_unwind_preserves_prose_between_malformed_namespaced_envelopes():
+    """The unwind resolves dynamic namespaced close markers per envelope."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        'A <foo:tool_call>{"x"</foo:tool_call> B '
+        '<foo:tool_call>{"y"</foo:tool_call> C'
+    )
+
+    visible = "".join(f.feed(ch) for ch in text) + f.finish()
+
+    assert visible == "A  B  C"
+    assert f.take_recovery_candidate() == ""
+
+
+def test_unwind_swallows_bracket_call_in_recovered_tail():
+    """A self-contained bracket call inside the unwound tail stays hidden."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = 'A <tool_call>{"x"</tool_call> B [Calling tool: foo] C'
+
+    visible = "".join(f.feed(ch) for ch in text) + f.finish()
+
+    assert visible == "A  B  C"
+    assert f.take_recovery_candidate() == ""
+
+
+def test_unwind_reopened_envelope_becomes_recovery_candidate():
+    """A second unterminated envelope in the unwound tail is withheld whole."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = 'A <tool_call>{"x"</tool_call> B <tool_call>{"y"'
+
+    visible = "".join(f.feed(ch) for ch in text) + f.finish()
+
+    assert visible == "A  B "
+    assert f.take_recovery_candidate() == '<tool_call>{"y"'
+
+
+def test_unwind_drops_partial_open_marker_in_trailing_prose():
+    """Strict-mode tail rules still apply to prose recovered by the unwind."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = 'A <tool_call>{"x"</tool_call> B <tool_ca'
+
+    visible = "".join(f.feed(ch) for ch in text) + f.finish()
+
+    assert visible == "A  B "
+    assert f.take_recovery_candidate() == ""
+
+
+def test_unwind_stays_linear_on_repeated_malformed_envelopes():
+    """The EOF unwind must not do quadratic work on marker-repeating output.
+
+    A re-feed loop that copies the remaining text once per malformed envelope
+    took ~9 s on this input; the single-pass unwind takes well under a
+    second, so the generous bound only trips on a complexity regression.
+    """
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = "PRE " + '<tool_call>{"x"</tool_call> ' * 4000 + "POST"
+
+    start = time.perf_counter()
+    visible = f.feed(text) + f.finish()
+    elapsed = time.perf_counter() - start
+
+    assert visible.startswith("PRE ")
+    assert visible.endswith("POST")
+    assert elapsed < 5.0
 
 
 class TestToolCallStreamFilterSuppressAfterMarker:

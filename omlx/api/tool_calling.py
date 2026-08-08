@@ -2060,48 +2060,109 @@ class ToolCallStreamFilter:
         return buffer.find(marker, self._json_complete_off)
 
     def _find_start_envelope(
-        self, text: str
+        self,
+        text: str,
+        start: int = 0,
+        cache: Optional[Dict[Any, Any]] = None,
     ) -> Optional[Tuple[int, int, Optional[str]]]:
-        """Find earliest complete opening envelope.
+        """Find earliest complete opening envelope at or after ``start``.
 
         Returns:
             tuple(index, consume_len, close_marker_or_none)
             - close_marker_or_none is a close marker to wait for, or ``None``
               when the whole envelope is already contained in consume_len.
+
+        ``cache`` is used by the EOF unwind, whose ``start`` only moves
+        forward over one fixed string: a cached hit at or after ``start`` is
+        reused, a cached miss is permanent, and a hit that ``start`` has
+        passed is recomputed from ``start``. That keeps repeated calls linear
+        overall instead of rescanning the tail once per envelope.
         """
+        miss = object()
+
+        def lookup(key: Any, compute: Any) -> Optional[Tuple[int, int, Optional[str]]]:
+            if cache is None:
+                return compute()
+            hit = cache.get(key, miss)
+            if hit is miss or (hit is not None and hit[0] < start):
+                hit = compute()
+                cache[key] = hit
+            return hit
+
         starts: List[Tuple[int, int, Optional[str]]] = []
 
         for marker, close in self._marker_pairs:
-            idx = text.find(marker)
-            if idx >= 0:
-                starts.append((idx, len(marker), close))
+
+            def compute_pair(
+                marker: str = marker, close: str = close
+            ) -> Optional[Tuple[int, int, Optional[str]]]:
+                idx = text.find(marker, start)
+                return None if idx < 0 else (idx, len(marker), close)
+
+            hit = lookup(("pair", marker), compute_pair)
+            if hit is not None:
+                starts.append(hit)
 
         for close in self._orphan_close_markers:
-            close_idx = text.find(close)
-            if close_idx >= 0:
-                starts.append((close_idx, len(close), None))
 
-        ns_match = self._namespaced_open_re.search(text)
-        if ns_match:
+            def compute_orphan(
+                close: str = close,
+            ) -> Optional[Tuple[int, int, Optional[str]]]:
+                close_idx = text.find(close, start)
+                return None if close_idx < 0 else (close_idx, len(close), None)
+
+            hit = lookup(("orphan", close), compute_orphan)
+            if hit is not None:
+                starts.append(hit)
+
+        def compute_ns() -> Optional[Tuple[int, int, Optional[str]]]:
+            ns_match = self._namespaced_open_re.search(text, start)
+            if not ns_match:
+                return None
             ns = ns_match.group(1)
-            starts.append(
-                (ns_match.start(), len(ns_match.group(0)), f"</{ns}:tool_call>")
+            return (
+                ns_match.start(),
+                len(ns_match.group(0)),
+                f"</{ns}:tool_call>",
             )
 
-        for bp in self._bracket_prefixes:
-            bracket_idx = text.find(bp)
-            while bracket_idx >= 0:
-                bracket_candidate = text[bracket_idx:]
-                bracket_match = self._bracket_call_re.match(bracket_candidate)
-                if bracket_match:
-                    starts.append((bracket_idx, bracket_match.end(), None))
-                bracket_idx = text.find(bp, bracket_idx + 1)
+        hit = lookup("ns", compute_ns)
+        if hit is not None:
+            starts.append(hit)
+
+        def compute_bracket() -> Optional[Tuple[int, int, Optional[str]]]:
+            best: Optional[Tuple[int, int, Optional[str]]] = None
+            for bp in self._bracket_prefixes:
+                bracket_idx = text.find(bp, start)
+                while bracket_idx >= 0:
+                    if best is not None and bracket_idx >= best[0]:
+                        break
+                    bracket_candidate = text[bracket_idx:]
+                    bracket_match = self._bracket_call_re.match(bracket_candidate)
+                    if bracket_match:
+                        best = (bracket_idx, bracket_match.end(), None)
+                        break
+                    bracket_idx = text.find(bp, bracket_idx + 1)
+            return best
+
+        hit = lookup("bracket", compute_bracket)
+        if hit is not None:
+            starts.append(hit)
 
         # One-sided markers: suppress from start marker to end of buffer.
         for sa_marker in self._suppress_after_markers:
-            idx = text.find(sa_marker)
-            if idx >= 0:
-                starts.append((idx, len(text) - idx, "__suppress_permanently__"))
+
+            def compute_sa(
+                sa_marker: str = sa_marker,
+            ) -> Optional[Tuple[int, int, Optional[str]]]:
+                idx = text.find(sa_marker, start)
+                if idx < 0:
+                    return None
+                return (idx, len(text) - idx, "__suppress_permanently__")
+
+            hit = lookup(("sa", sa_marker), compute_sa)
+            if hit is not None:
+                starts.append(hit)
 
         if not starts:
             return None
@@ -2261,6 +2322,87 @@ class ToolCallStreamFilter:
 
         return "".join(out)
 
+    def _unwind_withheld_at_eof(
+        self, candidate: str, marker: str, start_marker: str
+    ) -> str:
+        """Single pass over text withheld at end of stream, first-marker split.
+
+        ``candidate`` starts with the opening marker of an envelope whose
+        payload scan never confirmed a structural end.  For such malformed
+        payloads there is no reliable way to tell an embedded close marker
+        from the real one, so match the historical (pre-#2507) behaviour:
+        the FIRST close marker ends the envelope, which preserves prose the
+        model resumed afterwards, including any later literal marker text.
+
+        Runs as one forward scan with monotone offsets rather than re-feeding
+        tails through ``feed``: a re-feed loop re-copies the remaining text
+        once per malformed envelope, which is quadratic when output repeats
+        the marker (the superlinear-work-on-model-output trap from
+        #1854/#1905).
+
+        Trailing prose after the last envelope is staged in ``self._buffer``
+        so the caller's end-of-stream tail rules still apply to it.
+        """
+        out: List[str] = []
+        cache: Dict[Any, Any] = {}
+        # The close search must not match inside the opening marker itself.
+        pos = min(len(start_marker), len(candidate))
+        env_start = 0
+        while True:
+            if marker == "__suppress_permanently__":
+                self._suppressing = True
+                break
+            # Same span primitive as the non-streaming parser: a valid JSON or
+            # XML payload ends at its structural boundary (so an embedded
+            # close marker cannot cut it, #2507), and a malformed payload
+            # falls back to the historical first close marker.  Keeping the
+            # two paths identical means the content shown at EOF always
+            # matches what the final parse extracts.
+            found = _find_marker_span_end(candidate, pos, marker)
+            if found is None:
+                withheld = candidate[env_start:]
+                if withheld:
+                    self._recovery_candidate = withheld
+                    logger.warning(
+                        "Unclosed tool-call envelope at end of stream; "
+                        "withheld %d characters are available for content "
+                        "recovery (start_marker=%.80r)",
+                        len(withheld),
+                        candidate[env_start : env_start + 80],
+                    )
+                break
+            pos = found[1]
+            # Between envelopes now: emit prose until the next opening
+            # envelope, swallowing self-contained ones (bracket calls,
+            # orphan closes) along the way.
+            entered_envelope = False
+            while True:
+                nxt = self._find_start_envelope(candidate, pos, cache)
+                if nxt is None:
+                    self._buffer = candidate[pos:]
+                    break
+                idx, consume_len, close = nxt
+                if idx > pos:
+                    out.append(
+                        self._sanitize_prefix_before_suppression(
+                            candidate[pos:idx]
+                        )
+                    )
+                env_start = idx
+                pos = idx + consume_len
+                if close is not None:
+                    marker = close
+                    entered_envelope = True
+                    break
+            if not entered_envelope:
+                break
+
+        result = "".join(out)
+        for close in self._stray_close_markers:
+            if close in result:
+                result = result.replace(close, "")
+        return result
+
     def feed(self, text: str) -> str:
         """Feed a content delta, return the portion safe to emit."""
         if self._suppressing or not text:
@@ -2354,41 +2496,17 @@ class ToolCallStreamFilter:
         # confirmed where the value ends.  A literal close marker is then the
         # best evidence available, so trust it rather than withholding to EOF:
         # prose the model resumed after the envelope survives, as it did before
-        # the #2507 span scanning.  The LAST occurrence is the split point,
-        # since earlier ones can sit inside the truncated payload.
-        #
-        # Re-feeding the tail can re-enter suppression under a *different*
-        # marker pair, hence the loop.  It terminates because each pass cuts
-        # the text down to a strict suffix, and repeats at most once per
-        # distinct marker pair.
+        # the #2507 span scanning.
         recovered = ""
-        while self._suppressing_until is not None:
+        if self._suppressing_until is not None:
             marker = self._suppressing_until
             self._pending_envelope_parts.append(self._buffer)
             candidate = "".join(self._pending_envelope_parts)
-            start_marker = self._pending_start_marker or "<unknown>"
+            start_marker = self._pending_start_marker or ""
             self._buffer = ""
             self._suppressing_until = None
             self._clear_pending_envelope()
-
-            close_idx = (
-                -1
-                if marker == "__suppress_permanently__"
-                else candidate.rfind(marker)
-            )
-            if close_idx < 0:
-                if candidate:
-                    self._recovery_candidate = candidate
-                    logger.warning(
-                        "Unclosed tool-call envelope at end of stream; "
-                        "withheld %d characters are available for content "
-                        "recovery (start_marker=%.80r)",
-                        len(candidate),
-                        start_marker,
-                    )
-                return recovered
-
-            recovered += self.feed(candidate[close_idx + len(marker) :])
+            recovered = self._unwind_withheld_at_eof(candidate, marker, start_marker)
             if self._suppressing:
                 return recovered
 
