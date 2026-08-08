@@ -1237,12 +1237,24 @@ GEMMA4_ASSISTANT_MTP_SHARD = "model-mtp.safetensors"
 MTPLX_SIDECAR_SHARD = "mtp.safetensors"
 MTPLX_RUNTIME_FILE = "mtplx_runtime.json"
 
-_MTPLX_CONTRACT_ALLOWLIST = {
-    "arch_id": "qwen3-next-mtp",
+# MTPLX forge calibrates the contract per model; oMLX's Lightning MTP
+# runtime implements exactly one execution convention, so anything else is
+# rejected fail-closed at import time. Missing fields mean the MTPLX
+# documented defaults (mtplx.mtp_patch.MTPContract), which is how
+# pre-calibration exports (mtplx 0.1.0-preview) ship.
+_MTPLX_CONTRACT_DEFAULTS = {
     "base_hidden_variant": "post_norm",
     "hidden_variant": "post_norm",
     "concat_order": "embedding_hidden",
-    "mtp_position_mode": "local",
+    "mtp_position_mode": "cache",
+}
+
+_MTPLX_CONTRACT_ALLOWLIST = {
+    "arch_id": ("qwen3-next-mtp",),
+    "base_hidden_variant": ("post_norm",),
+    "hidden_variant": ("post_norm",),
+    "concat_order": ("embedding_hidden",),
+    "mtp_position_mode": ("local", "cache"),
 }
 
 
@@ -1343,19 +1355,8 @@ def combine_gemma4_assistant_mtp(
 # ── Native MTP head donor combine (Qwen3.5/3.6) ─────────────────────────
 
 
-def _timestamped_backup(path: Path) -> Path:
-    """Write ``<path>.<timestamp>.bak`` once; never overwrite old backups."""
-    stamp = _time.strftime("%Y%m%d-%H%M%S")
-    backup = path.with_name(f"{path.name}.{stamp}.bak")
-    if backup.exists():
-        raise FileExistsError(f"Refusing to overwrite existing backup: {backup}")
-    shutil.copy2(path, backup)
-    return backup
-
-
 def _atomic_write_json(path: Path, payload: dict) -> None:
-    """Atomically replace a JSON file while preserving a timestamped backup."""
-    _timestamped_backup(path)
+    """Atomically replace a JSON file (tmp write + rename)."""
     with tempfile.NamedTemporaryFile(
         "w", dir=path.parent, prefix=f"{path.name}.tmp.", delete=False
     ) as tmp:
@@ -1369,27 +1370,22 @@ def _write_mtp_shard_and_merge_index(
     output: Path,
     mtp_weights: dict,
     *,
-    shard_name: str = GEMMA4_ASSISTANT_MTP_SHARD,
     write_shard: bool = True,
-    shard_size_bytes: int | None = None,
 ) -> int:
     """Write mtp weights as one extra shard and merge the safetensors index.
 
-    Shared by the gemma4 assistant combine and native MTP imports. The index
+    Shared by the gemma4 assistant combine and native MTP imports (the shard
+    was renamed into place already when ``write_shard`` is False). The index
     merge is a no-op when the output has no ``model.safetensors.index.json``.
-    Returns the shard byte size.
+    Returns the tensor byte size.
     """
     if write_shard:
         mx.save_safetensors(
-            str(output / shard_name),
+            str(output / GEMMA4_ASSISTANT_MTP_SHARD),
             mtp_weights,
             metadata={"format": "mlx"},
         )
-    mtp_size = (
-        int(shard_size_bytes)
-        if shard_size_bytes is not None
-        else sum(v.nbytes for v in mtp_weights.values())
-    )
+    mtp_size = sum(v.nbytes for v in mtp_weights.values())
 
     out_index_path = output / "model.safetensors.index.json"
     if out_index_path.exists():
@@ -1397,7 +1393,7 @@ def _write_mtp_shard_and_merge_index(
             index = json.load(f)
         weight_map = index.setdefault("weight_map", {})
         for key in mtp_weights:
-            weight_map[key] = shard_name
+            weight_map[key] = GEMMA4_ASSISTANT_MTP_SHARD
         metadata = index.get("metadata") or {}
         metadata["total_size"] = int(metadata.get("total_size", 0) or 0) + mtp_size
         index["metadata"] = metadata
@@ -1449,75 +1445,80 @@ def _synthesize_mtp_quant_entries(
     return quant_entries
 
 
-def _validate_mtplx_runtime_contract(model_path: Path) -> dict:
-    """Validate the MTPLX runtime contract and return the parsed payload."""
+def _resolve_mtplx_sidecar(model_path: Path, config: dict) -> Optional[Path]:
+    """Resolve the MTPLX side-car weights file, or None.
+
+    Follows MTPLX's own resolution order: the config-declared
+    ``mlx_lm_extra_tensors.mtp_file`` first, then the conventional
+    locations (``mtplx.artifacts.expected_mtp_file``).
+    """
+    candidates: list[str] = []
+    extra = config.get("mlx_lm_extra_tensors")
+    if isinstance(extra, dict) and extra.get("mtp_file"):
+        candidates.append(str(extra["mtp_file"]))
+    candidates += [
+        MTPLX_SIDECAR_SHARD,
+        "mtp/weights.safetensors",
+        GEMMA4_ASSISTANT_MTP_SHARD,
+    ]
+    for rel in candidates:
+        path = model_path / rel
+        if path.is_file():
+            return path
+    return None
+
+
+def _validate_mtplx_runtime_contract(model_path: Path, config: dict) -> None:
+    """Fail-closed check that the export's contract matches oMLX's runtime.
+
+    The contract comes from ``mtplx_runtime.json`` (Forge always writes it),
+    with ``config.json -> mtplx_mtp_contract`` as the base layer and the
+    MTPLX documented defaults filling anything omitted.
+    """
     runtime_path = model_path / MTPLX_RUNTIME_FILE
     if not runtime_path.exists():
         raise ValueError(f"Missing required runtime contract: {runtime_path}")
     with open(runtime_path) as f:
         runtime = json.load(f)
 
-    contract = runtime.get("mtp_contract") or {}
-    checks = {
-        "arch_id": runtime.get("arch_id"),
-        "base_hidden_variant": contract.get("base_hidden_variant"),
-        "hidden_variant": contract.get("hidden_variant"),
-        "concat_order": contract.get("concat_order"),
-        "mtp_position_mode": contract.get("mtp_position_mode"),
-    }
-    for field, expected in _MTPLX_CONTRACT_ALLOWLIST.items():
-        actual = checks.get(field)
-        if actual != expected:
+    checks: dict = dict(_MTPLX_CONTRACT_DEFAULTS)
+    for layer in (config.get("mtplx_mtp_contract"), runtime.get("mtp_contract")):
+        if isinstance(layer, dict):
+            checks.update({k: layer[k] for k in _MTPLX_CONTRACT_DEFAULTS if k in layer})
+    checks["arch_id"] = runtime.get("arch_id")
+
+    for field, allowed in _MTPLX_CONTRACT_ALLOWLIST.items():
+        if checks.get(field) not in allowed:
             raise ValueError(
-                "Unsupported MTPLX contract "
-                f"{field}={actual!r}; expected {expected!r}"
+                f"Unsupported MTPLX contract {field}={checks.get(field)!r}; "
+                f"oMLX's MTP runtime supports {' / '.join(allowed)}"
             )
-    return runtime
 
 
-def _validate_mtplx_payload_audit(
-    config: dict,
-    mtp_weights: dict,
-) -> tuple[int, int | None]:
-    """Validate payload audit schema and report (raw_count, audited_count)."""
-    raw_count = len(mtp_weights)
-    audit = config.get("mtplx_mtp_payload_audit")
-    if not isinstance(audit, dict):
-        return raw_count, None
-    if "passed" not in audit:
-        raise ValueError("mtplx_mtp_payload_audit is missing required 'passed' flag")
-    if not bool(audit.get("passed")):
-        raise ValueError("mtplx_mtp_payload_audit.passed is false")
-    audited = audit.get("payload_tensor_count")
-    if audited is None:
-        return raw_count, None
-    if not isinstance(audited, int):
-        raise ValueError(
-            "mtplx_mtp_payload_audit.payload_tensor_count must be an integer"
-        )
-    return raw_count, audited
+def import_mtplx_sidecar(model_path: Union[str, Path]) -> dict:
+    """Import an MTPLX side-car head into the model's checkpoint index.
 
-
-def import_mtplx_sidecar(
-    model_path: Union[str, Path],
-    *,
-    prefer_no_dup: bool = True,
-) -> dict:
-    """Import an MTPLX side-car head into a model index.
-
-    The importer is fail-closed on unsupported runtime contracts. It prefers a
-    no-dup merge (indexing the existing ``mtp.safetensors`` shard) when logical
-    weight names already match physical tensor keys; otherwise it writes a
-    remapped shard ``model-mtp.safetensors`` and points the index there.
+    Fail-closed on unsupported runtime contracts. Normalizes the side-car
+    onto a ``model-mtp.safetensors`` shard (zero-copy rename when the tensor
+    keys already match the checkpoint's naming, remapped copy otherwise) so
+    the stock mlx-lm/mlx-vlm weight globs and the index-based MTP detection
+    see the head with no load-time special casing. mlx_lm only ever opens
+    ``model*.safetensors``, which is why pointing the index at the original
+    side-car name is not enough. Idempotent: re-running is a no-op.
     """
     output = Path(model_path)
-    sidecar = output / MTPLX_SIDECAR_SHARD
-    if not sidecar.exists():
-        raise ValueError(f"Missing required side-car weights: {sidecar}")
-    _validate_mtplx_runtime_contract(output)
-
     with open(output / "config.json") as f:
         config = json.load(f)
+
+    sidecar = _resolve_mtplx_sidecar(output, config)
+    if sidecar is None:
+        raise ValueError(f"No MTPLX side-car weights found in {output}")
+    _validate_mtplx_runtime_contract(output, config)
+
+    audit = config.get("mtplx_mtp_payload_audit")
+    if isinstance(audit, dict) and not bool(audit.get("passed", True)):
+        raise ValueError("mtplx_mtp_payload_audit.passed is false")
+
     output_keys = _shard_key_map(output)
     recipient_prefix = (
         "language_model."
@@ -1534,37 +1535,43 @@ def import_mtplx_sidecar(
     if not mtp_weights:
         raise ValueError(f"No mtp.* tensors found in side-car: {sidecar}")
 
-    raw_count, audited_count = _validate_mtplx_payload_audit(config, mtp_weights)
+    # Idempotency: the index (not the header fallback of _shard_key_map,
+    # which would see the not-yet-imported side-car itself) is what the MTP
+    # weight detection reads, so it is the import-completed marker.
+    index_path = output / "model.safetensors.index.json"
+    if index_path.exists():
+        with open(index_path) as f:
+            indexed = json.load(f).get("weight_map") or {}
+        if all(key in indexed for key in mtp_weights):
+            logger.info("MTPLX side-car already imported into %s", output.name)
+            return {"merge_mode": "noop", "mtp_tensors": len(mtp_weights)}
 
-    desired_keys = set(mtp_weights.keys())
-    source_keys = set(sidecar_weights.keys())
-    no_dup_feasible = desired_keys.issubset(source_keys)
-    if prefer_no_dup and no_dup_feasible:
-        merge_mode = "no-dup"
-        target_shard = MTPLX_SIDECAR_SHARD
-        write_shard = False
+    shard_path = output / GEMMA4_ASSISTANT_MTP_SHARD
+    if set(mtp_weights) == set(sidecar_weights):
+        merge_mode = "rename"
+        if sidecar != shard_path:
+            sidecar.replace(shard_path)
+        mtp_size = _write_mtp_shard_and_merge_index(
+            output, mtp_weights, write_shard=False
+        )
     else:
-        merge_mode = "dup"
-        target_shard = GEMMA4_ASSISTANT_MTP_SHARD
-        write_shard = True
+        # VLM-shaped checkpoints need the language_model. prefix on disk.
+        # Materialize before touching files: the loaded arrays lazily
+        # reference the side-car file.
+        merge_mode = "remap"
+        mx.eval(*mtp_weights.values())
+        mtp_size = _write_mtp_shard_and_merge_index(output, mtp_weights)
+        if sidecar.parent == output:
+            # Keep the consumed side-car out of mlx-vlm's *.safetensors
+            # glob; sub-directory side-cars are invisible to it already.
+            sidecar.replace(sidecar.with_name(sidecar.name + ".orig"))
 
-    mtp_size = _write_mtp_shard_and_merge_index(
-        output,
-        mtp_weights,
-        shard_name=target_shard,
-        write_shard=write_shard,
-        shard_size_bytes=sum(v.nbytes for v in mtp_weights.values()),
+    donor_quant = (
+        config.get("mtplx_mtp_quantization") or config.get("quantization") or {}
     )
-
-    donor_quant = config.get("mtplx_mtp_quantization") or config.get("quantization") or {}
-    mtp_key_shards = {
-        key: MTPLX_SIDECAR_SHARD
-        for key in sidecar_weights
-        if _strip_mtp_key_prefix(key)
-    }
     quant_entries = _synthesize_mtp_quant_entries(
         donor_quant,
-        mtp_key_shards,
+        {k: GEMMA4_ASSISTANT_MTP_SHARD for k in sidecar_weights},
         recipient_prefix=recipient_prefix,
     )
     if quant_entries:
@@ -1578,26 +1585,13 @@ def import_mtplx_sidecar(
     _atomic_write_json(output / "config.json", config)
 
     logger.info(
-        "Imported MTPLX side-car into %s (%s merge, %d tensors, %.2f GB)",
+        "Imported MTPLX side-car into %s (%s, %d tensors, %.2f GB)",
         output.name,
         merge_mode,
         len(mtp_weights),
         mtp_size / 1e9,
     )
-    if audited_count is not None:
-        logger.info(
-            "MTPLX payload audit: raw_tensors=%d, payload_tensor_count=%d",
-            raw_count,
-            audited_count,
-        )
-
-    return {
-        "merge_mode": merge_mode,
-        "target_shard": target_shard,
-        "mtp_tensors": len(mtp_weights),
-        "raw_tensor_count": raw_count,
-        "payload_tensor_count": audited_count,
-    }
+    return {"merge_mode": merge_mode, "mtp_tensors": len(mtp_weights)}
 
 
 def _file_sha256(path: Path) -> str:

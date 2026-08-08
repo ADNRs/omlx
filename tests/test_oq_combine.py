@@ -444,29 +444,36 @@ def test_combine_dispatch_routes_qwen_donor(tmp_path):
 # ── MTPLX side-car import ───────────────────────────────────────────────
 
 
-def _write_qwen_mtplx_sidecar_model(tmp_path, *, vlm=False, bad_contract=False):
+def _write_qwen_mtplx_sidecar_model(
+    tmp_path,
+    *,
+    vlm=False,
+    bad_contract=False,
+    with_contract=True,
+    sidecar_rel=MTPLX_SIDECAR_SHARD,
+):
     out = _write_qwen_output(tmp_path, vlm=vlm)
     config = json.loads((out / "config.json").read_text())
     config["mtplx_mtp_payload_audit"] = {"passed": True, "payload_tensor_count": 8}
-    config["mtplx_mtp_contract"] = {
-        "base_hidden_variant": "post_norm",
-        "hidden_variant": "post_norm",
-        "concat_order": "embedding_hidden",
-        "mtp_position_mode": "local",
-    }
-    (out / "config.json").write_text(json.dumps(config))
-
-    runtime = {
-        "arch_id": "qwen3-next-mtp",
-        "mtp_sidecar": "bf16",
-        "mtp_depth_max": 3,
-        "mtp_contract": {
+    if with_contract:
+        config["mtplx_mtp_contract"] = {
             "base_hidden_variant": "post_norm",
             "hidden_variant": "post_norm",
             "concat_order": "embedding_hidden",
             "mtp_position_mode": "local",
-        },
-    }
+        }
+    if sidecar_rel != MTPLX_SIDECAR_SHARD:
+        config["mlx_lm_extra_tensors"] = {"mtp_file": sidecar_rel}
+    (out / "config.json").write_text(json.dumps(config))
+
+    runtime = {"arch_id": "qwen3-next-mtp", "mtp_depth_max": 3}
+    if with_contract:
+        runtime["mtp_contract"] = {
+            "base_hidden_variant": "post_norm",
+            "hidden_variant": "post_norm",
+            "concat_order": "embedding_hidden",
+            "mtp_position_mode": "local",
+        }
     if bad_contract:
         runtime["mtp_contract"]["hidden_variant"] = "pre_norm"
     (out / MTPLX_RUNTIME_FILE).write_text(json.dumps(runtime))
@@ -481,21 +488,18 @@ def _write_qwen_mtplx_sidecar_model(tmp_path, *, vlm=False, bad_contract=False):
         "mtp.layers.0.self_attn.q_proj.weight": mx.ones((8, 8), dtype=bf16),
         "mtp.layers.0.mlp.gate_proj.weight": mx.ones((16, 8), dtype=bf16),
     }
-    mx.save_safetensors(
-        str(out / MTPLX_SIDECAR_SHARD),
-        sidecar_weights,
-        metadata={"format": "mlx"},
-    )
+    sidecar_path = out / sidecar_rel
+    sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+    mx.save_safetensors(str(sidecar_path), sidecar_weights, metadata={"format": "mlx"})
     return out
 
 
-def test_import_mtplx_sidecar_falls_back_to_dup_for_vlm_prefix(tmp_path):
+def test_import_mtplx_sidecar_remaps_vlm_prefix(tmp_path):
     out = _write_qwen_mtplx_sidecar_model(tmp_path, vlm=True)
 
-    result = import_mtplx_sidecar(out, prefer_no_dup=True)
+    result = import_mtplx_sidecar(out)
 
-    assert result["merge_mode"] == "dup"
-    assert result["target_shard"] == GEMMA4_ASSISTANT_MTP_SHARD
+    assert result["merge_mode"] == "remap"
     shard = out / GEMMA4_ASSISTANT_MTP_SHARD
     assert shard.exists()
     merged = mx.load(str(shard))
@@ -509,24 +513,57 @@ def test_import_mtplx_sidecar_falls_back_to_dup_for_vlm_prefix(tmp_path):
 
     config = json.loads((out / "config.json").read_text())
     assert config["text_config"]["mtp_num_hidden_layers"] == 1
-    assert result["raw_tensor_count"] == 7
-    assert result["payload_tensor_count"] == 8
 
-    assert list(out.glob("model.safetensors.index.json.*.bak"))
-    assert list(out.glob("config.json.*.bak"))
+    # The consumed root side-car moves out of the *.safetensors glob so
+    # loaders stop reading the bare-key duplicate on every load.
+    assert not (out / MTPLX_SIDECAR_SHARD).exists()
+    assert (out / (MTPLX_SIDECAR_SHARD + ".orig")).exists()
 
 
-def test_import_mtplx_sidecar_uses_no_dup_when_keys_align(tmp_path):
+def test_import_mtplx_sidecar_renames_when_keys_align(tmp_path):
     out = _write_qwen_mtplx_sidecar_model(tmp_path, vlm=False)
 
-    result = import_mtplx_sidecar(out, prefer_no_dup=True)
+    result = import_mtplx_sidecar(out)
 
-    assert result["merge_mode"] == "no-dup"
-    assert result["target_shard"] == MTPLX_SIDECAR_SHARD
-    assert not (out / GEMMA4_ASSISTANT_MTP_SHARD).exists()
+    # Bare keys already match: the side-car is renamed onto the shard name
+    # mlx_lm's model*.safetensors glob actually opens. No duplicate bytes.
+    assert result["merge_mode"] == "rename"
+    assert (out / GEMMA4_ASSISTANT_MTP_SHARD).exists()
+    assert not (out / MTPLX_SIDECAR_SHARD).exists()
 
     index = json.loads((out / "model.safetensors.index.json").read_text())
-    assert index["weight_map"]["mtp.fc.weight"] == MTPLX_SIDECAR_SHARD
+    assert index["weight_map"]["mtp.fc.weight"] == GEMMA4_ASSISTANT_MTP_SHARD
+
+
+def test_import_mtplx_sidecar_resolves_mtp_file_override(tmp_path):
+    # Official MTPLX exports keep the side-car at mtp/weights.safetensors,
+    # declared via mlx_lm_extra_tensors.mtp_file, and pre-calibration
+    # exports omit mtp_contract entirely (documented defaults apply).
+    out = _write_qwen_mtplx_sidecar_model(
+        tmp_path,
+        vlm=True,
+        with_contract=False,
+        sidecar_rel="mtp/weights.safetensors",
+    )
+
+    result = import_mtplx_sidecar(out)
+
+    assert result["merge_mode"] == "remap"
+    assert (out / GEMMA4_ASSISTANT_MTP_SHARD).exists()
+    # Sub-directory side-cars are invisible to the loader globs and stay put.
+    assert (out / "mtp" / "weights.safetensors").exists()
+
+
+def test_import_mtplx_sidecar_is_idempotent(tmp_path):
+    out = _write_qwen_mtplx_sidecar_model(tmp_path, vlm=True)
+
+    import_mtplx_sidecar(out)
+    index_before = (out / "model.safetensors.index.json").read_text()
+
+    result = import_mtplx_sidecar(out)
+
+    assert result["merge_mode"] == "noop"
+    assert (out / "model.safetensors.index.json").read_text() == index_before
 
 
 def test_import_mtplx_sidecar_rejects_contract_mismatch(tmp_path):
@@ -536,10 +573,26 @@ def test_import_mtplx_sidecar_rejects_contract_mismatch(tmp_path):
     before_config = (out / "config.json").read_text()
 
     with pytest.raises(ValueError, match="Unsupported MTPLX contract"):
-        import_mtplx_sidecar(out, prefer_no_dup=True)
+        import_mtplx_sidecar(out)
 
     assert (out / "model.safetensors.index.json").read_text() == before_index
     assert (out / "config.json").read_text() == before_config
-    assert not list(out.glob("model.safetensors.index.json.*.bak"))
-    assert not list(out.glob("config.json.*.bak"))
+
+
+def test_import_mtplx_sidecar_requires_runtime_file(tmp_path):
+    out = _write_qwen_mtplx_sidecar_model(tmp_path, vlm=True)
+    (out / MTPLX_RUNTIME_FILE).unlink()
+
+    with pytest.raises(ValueError, match="Missing required runtime contract"):
+        import_mtplx_sidecar(out)
+
+
+def test_import_mtplx_sidecar_rejects_failed_audit(tmp_path):
+    out = _write_qwen_mtplx_sidecar_model(tmp_path, vlm=True)
+    config = json.loads((out / "config.json").read_text())
+    config["mtplx_mtp_payload_audit"] = {"passed": False}
+    (out / "config.json").write_text(json.dumps(config))
+
+    with pytest.raises(ValueError, match="payload_audit"):
+        import_mtplx_sidecar(out)
 

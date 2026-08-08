@@ -183,6 +183,7 @@
                 trust_remote_code: false,
             },
             savingModelSettings: false,
+            importingMtplx: false,
             loadingGenDefaults: false,
             reasoningParsers: [],
 
@@ -1962,6 +1963,30 @@
                     this.computeDrift();
                 }
                 this.showModelSettingsModal = true;
+            },
+
+            async importMtplxSidecar() {
+                if (!this.selectedModel || this.importingMtplx) return;
+                this.importingMtplx = true;
+                try {
+                    const response = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/import-mtplx`, {
+                        method: 'POST',
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        alert(data.detail || window.t('js.error.mtplx_import_failed'));
+                        return;
+                    }
+                    if (data.message) alert(data.message);
+                    // Refresh so mtp_compatible flips and the toggle unlocks.
+                    await this.loadModels();
+                    const model = this.models.find(m => m.id === this.selectedModel.id);
+                    if (model) await this.openModelSettings(model);
+                } catch (e) {
+                    alert(window.t('js.error.mtplx_import_failed'));
+                } finally {
+                    this.importingMtplx = false;
+                }
             },
 
             async saveModelSettings() {
