@@ -977,6 +977,132 @@ def _no_links():
     return TransportMatrix(transports=(), backend="ring")
 
 
+def test_transport_diagnostics_reject_ssh_options_before_running_probes(
+    monkeypatch,
+):
+    called = []
+
+    monkeypatch.setattr(
+        routes,
+        "detect_cluster_transports",
+        lambda hosts: called.append(("transports", hosts)),
+    )
+    monkeypatch.setattr(
+        routes,
+        "check_peers",
+        lambda hosts, **kwargs: called.append(("health", hosts)),
+    )
+    monkeypatch.setattr(
+        routes,
+        "assess_link",
+        lambda hosts: called.append(("link", hosts)),
+    )
+
+    malicious = "-oProxyCommand=touch /tmp/pwned"
+    endpoints = (
+        "/admin/api/cluster/transports",
+        "/admin/api/cluster/peer-health",
+        "/admin/api/cluster/link-status",
+    )
+    for endpoint in endpoints:
+        response = _client().get(endpoint, params={"hosts": malicious})
+        assert response.status_code == 400
+        assert "invalid SSH target" in response.json()["detail"]
+
+    assert called == []
+
+
+def test_transport_diagnostics_accept_user_at_host(monkeypatch):
+    seen = {}
+
+    def detect(hosts):
+        seen["transports"] = hosts
+        return _no_links()
+
+    monkeypatch.setattr(
+        routes,
+        "detect_cluster_transports",
+        detect,
+    )
+    monkeypatch.setattr(routes, "record_peer_transports", lambda transports: None)
+
+    response = _client().get(
+        "/admin/api/cluster/transports",
+        params={"hosts": "user@studio.local"},
+    )
+
+    assert response.status_code == 200
+    assert seen["transports"] == ["user@studio.local"]
+
+
+def test_pairing_token_route_authenticates_with_the_shared_secret():
+    secret = "correct-horse-battery-staple"
+    generated = _client().post(
+        "/admin/api/cluster/pairing-token",
+        json={"shared_secret": secret},
+    )
+
+    assert generated.status_code == 200
+    token = generated.json()["pairing_token"]
+    accepted = _client().post(
+        "/admin/api/cluster/verify-pairing-token",
+        json={"token": token, "shared_secret": secret},
+    )
+    rejected = _client().post(
+        "/admin/api/cluster/verify-pairing-token",
+        json={"token": token, "shared_secret": "a-different-shared-secret"},
+    )
+
+    assert accepted.json() == {"valid": True}
+    assert rejected.json() == {"valid": False}
+
+
+def test_key_exchange_routes_keep_the_shared_secret_out_of_the_url(monkeypatch):
+    from omlx.cluster import ssh_keys
+
+    calls = []
+
+    def generate(**kwargs):
+        calls.append(("generate", kwargs))
+        return "authenticated-exchange-token"
+
+    def exchange(**kwargs):
+        calls.append(("exchange", kwargs))
+        return {"success": True}
+
+    monkeypatch.setattr(ssh_keys, "generate_key_exchange_for_peer", generate)
+    monkeypatch.setattr(ssh_keys, "exchange_keys_with_peer", exchange)
+    secret = "correct-horse-battery-staple"
+
+    generated = _client().post(
+        "/admin/api/cluster/ssh-key/exchange-token",
+        json={"node_id": "studio.local", "shared_secret": secret},
+    )
+    exchanged = _client().post(
+        "/admin/api/cluster/ssh-key/exchange",
+        json={
+            "exchange_token": "authenticated-exchange-token",
+            "shared_secret": secret,
+        },
+    )
+
+    assert generated.json() == {"exchange_token": "authenticated-exchange-token"}
+    assert exchanged.json() == {"success": True}
+    assert calls == [
+        (
+            "generate",
+            {"node_id": "studio.local", "shared_secret": secret},
+        ),
+        (
+            "exchange",
+            {
+                "peer_token": "authenticated-exchange-token",
+                "shared_secret": secret,
+            },
+        ),
+    ]
+
+
 def test_the_fabric_reports_the_address_each_mac_answers_on(monkeypatch):
     _readings(
         monkeypatch,

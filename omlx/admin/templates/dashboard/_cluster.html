@@ -1343,6 +1343,33 @@
                                 <i data-lucide="key" class="w-4 h-4 text-neutral-500"></i>
                                 <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">SSH Key Setup</span>
                             </div>
+                            <div class="rounded-xl border border-amber-200 bg-amber-50 p-4 mb-3">
+                                <label class="text-xs font-medium text-amber-900">{{ t('cluster.pairing.shared_secret') }}</label>
+                                <p class="text-[10px] text-amber-700 mt-1">
+                                    {{ t('cluster.pairing.shared_secret_hint') }}
+                                </p>
+                                <div class="flex items-center gap-2 mt-3">
+                                    <input type="password"
+                                           x-model.trim="clusterPairingSecret"
+                                           minlength="16"
+                                           maxlength="256"
+                                           autocomplete="new-password"
+                                           spellcheck="false"
+                                           placeholder="{{ t('cluster.pairing.shared_secret_placeholder') }}"
+                                           class="flex-1 text-xs font-mono text-neutral-700 bg-white border border-amber-200 rounded-lg px-3 py-2">
+                                    <button type="button"
+                                            @click="generateClusterPairingSecret()"
+                                            class="px-3 py-2 text-xs font-medium text-amber-900 bg-white border border-amber-200 rounded-lg hover:bg-amber-100">
+                                        {{ t('cluster.pairing.generate') }}
+                                    </button>
+                                    <button type="button"
+                                            @click="copyToClipboard(clusterPairingSecret)"
+                                            :disabled="clusterPairingSecret.length < 16"
+                                            class="px-3 py-2 text-xs font-medium text-amber-900 bg-white border border-amber-200 rounded-lg hover:bg-amber-100 disabled:opacity-50">
+                                        {{ t('cluster.pairing.copy') }}
+                                    </button>
+                                </div>
+                            </div>
                             <template x-if="clusterSshKey && clusterSshKey.available">
                                 <div class="rounded-xl border border-neutral-200 bg-neutral-50 p-4">
                                     <div class="flex items-start justify-between gap-3">
@@ -1365,7 +1392,7 @@
                                         <div class="text-xs text-neutral-500 mb-2">Key exchange token for pairing:</div>
                                         <div class="flex items-center gap-2">
                                             <button @click="generateKeyExchangeToken(clusterStatus.node.hostname)"
-                                                    :disabled="clusterExchangeTokenLoading"
+                                                    :disabled="clusterExchangeTokenLoading || clusterPairingSecret.length < 16"
                                                     class="px-3 py-1.5 text-xs font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100 disabled:opacity-50">
                                                 <i data-lucide="key" class="w-3.5 h-3.5"></i>
                                                 <span x-text="clusterExchangeTokenLoading ? 'Generating…' : 'Generate exchange token'"></span>
@@ -1398,7 +1425,7 @@
                                                       @keydown.enter.prevent="exchangeKeysWithPeer(clusterPeerExchangeToken)"
                                                       class="flex-1 text-[10px] font-mono text-neutral-700 bg-white border border-neutral-200 rounded-lg px-2 py-1 resize-none break-all"></textarea>
                                             <button @click="exchangeKeysWithPeer(clusterPeerExchangeToken)"
-                                                    :disabled="clusterKeyExchangeLoading || !clusterPeerExchangeToken"
+                                                    :disabled="clusterKeyExchangeLoading || !clusterPeerExchangeToken || clusterPairingSecret.length < 16"
                                                     class="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-50 whitespace-nowrap">
                                                 <i data-lucide="link" class="w-3.5 h-3.5"></i>
                                                 <span x-text="clusterKeyExchangeLoading ? 'Pairing…' : 'Pair'"></span>

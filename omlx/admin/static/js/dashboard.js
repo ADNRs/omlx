@@ -91,7 +91,7 @@
             // Global settings
             globalSettings: {
                 base_path: '',
-                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true },
+                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, distributed_inference_enabled: false, distributed_inference_active: false },
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
                 scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context' },
@@ -392,6 +392,7 @@
             _clusterKnownNodesNeedsSync: false,
             clusterPairingToken: null,
             clusterPairingTokenLoading: false,
+            clusterPairingSecret: '',
             clusterSshKey: null,
             clusterSshKeyLoading: false,
             clusterSshKeyGenerating: false,
@@ -899,6 +900,7 @@
 
             setMainTab(tab) {
                 if (!DASHBOARD_MAIN_TABS.has(tab)) return;
+                if (tab === 'cluster' && !this.globalSettings.server.distributed_inference_active) return;
                 this.mainTab = tab;
                 this.syncTabStateToUrl();
             },
@@ -1538,12 +1540,26 @@
                 setTimeout(() => { this.clusterExchangeTokenCopied = false; }, 2000);
             },
 
+            generateClusterPairingSecret() {
+                const bytes = new Uint8Array(18);
+                window.crypto.getRandomValues(bytes);
+                this.clusterPairingSecret = Array.from(
+                    bytes,
+                    value => value.toString(16).padStart(2, '0'),
+                ).join('');
+                // Tokens are bound to the secret that authenticated them.
+                this.clusterPairingToken = null;
+                this.clusterExchangeToken = null;
+            },
+
             async generatePairingToken() {
-                if (this.clusterPairingTokenLoading) return;
+                if (this.clusterPairingTokenLoading || this.clusterPairingSecret.length < 16) return;
                 this.clusterPairingTokenLoading = true;
                 try {
                     const response = await fetch('/admin/api/cluster/pairing-token', {
                         method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ shared_secret: this.clusterPairingSecret }),
                     });
                     if (response.ok) {
                         const result = await response.json();
@@ -1558,9 +1574,13 @@
 
             async verifyPairingToken(token) {
                 try {
-                    const query = new URLSearchParams({ token: token });
-                    const response = await fetch(`/admin/api/cluster/verify-pairing-token?${query}`, {
+                    const response = await fetch('/admin/api/cluster/verify-pairing-token', {
                         method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            token: token,
+                            shared_secret: this.clusterPairingSecret,
+                        }),
                     });
                     if (response.ok) {
                         const result = await response.json();
@@ -1610,12 +1630,16 @@
             },
 
             async generateKeyExchangeToken(nodeId) {
-                if (this.clusterExchangeTokenLoading) return;
+                if (this.clusterExchangeTokenLoading || this.clusterPairingSecret.length < 16) return;
                 this.clusterExchangeTokenLoading = true;
                 try {
-                    const query = new URLSearchParams({ node_id: nodeId || '' });
-                    const response = await fetch(`/admin/api/cluster/ssh-key/exchange-token?${query}`, {
+                    const response = await fetch('/admin/api/cluster/ssh-key/exchange-token', {
                         method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            node_id: nodeId || '',
+                            shared_secret: this.clusterPairingSecret,
+                        }),
                     });
                     if (response.ok) {
                         const result = await response.json();
@@ -1632,12 +1656,16 @@
 
             async exchangeKeysWithPeer(exchangeToken) {
                 const token = (exchangeToken || '').trim();
-                if (!token || this.clusterKeyExchangeLoading) return;
+                if (!token || this.clusterKeyExchangeLoading || this.clusterPairingSecret.length < 16) return;
                 this.clusterKeyExchangeLoading = true;
                 try {
-                    const query = new URLSearchParams({ exchange_token: token });
-                    const response = await fetch(`/admin/api/cluster/ssh-key/exchange?${query}`, {
+                    const response = await fetch('/admin/api/cluster/ssh-key/exchange', {
                         method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            exchange_token: token,
+                            shared_secret: this.clusterPairingSecret,
+                        }),
                     });
                     if (response.ok) {
                         this.clusterKeyExchangeResult = await response.json();
@@ -5211,6 +5239,13 @@
                             system: { ...this.globalSettings.system, ...data.system },
                         };
                         this.globalSettings.ui = data.ui || { language: 'en' };
+                        if (
+                            !this.globalSettings.server.distributed_inference_active
+                            && this.mainTab === 'cluster'
+                        ) {
+                            this.mainTab = 'status';
+                            this.syncTabStateToUrl();
+                        }
 
                         // Sync idle timeout select value
                         this.idleTimeoutValue = this.globalSettings.idle_timeout?.idle_timeout_seconds != null
@@ -5295,6 +5330,7 @@
                             sse_keepalive_mode: this.globalSettings.server.sse_keepalive_mode,
                             burst_decode_mode: this.globalSettings.server.burst_decode_mode,
                             preserve_mid_system_cache: this.globalSettings.server.preserve_mid_system_cache,
+                            distributed_inference_enabled: this.globalSettings.server.distributed_inference_enabled,
                             model_dirs: this.globalSettings.model.model_dirs.filter(d => d.trim()),
                             model_fallback: this.globalSettings.model.model_fallback,
                             hide_helper_models: this.globalSettings.model.hide_helper_models,

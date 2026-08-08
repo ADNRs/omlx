@@ -13,6 +13,8 @@ from omlx.cluster.discovery import (
     verify_pairing_token,
 )
 
+_PAIRING_SECRET = "correct-horse-battery-staple"
+
 
 class _PublisherProcess:
     def __init__(self):
@@ -136,15 +138,26 @@ def test_discovery_returns_untrusted_suggestions():
 
 
 def test_pairing_token_generation_and_verification():
-    token = generate_pairing_token()
+    token = generate_pairing_token(shared_secret=_PAIRING_SECRET)
     assert token is not None
     assert len(token) > 0
-    assert verify_pairing_token(token) is True
+    assert verify_pairing_token(token, shared_secret=_PAIRING_SECRET) is True
+
+
+def test_pairing_token_rejects_a_different_shared_secret():
+    token = generate_pairing_token(shared_secret=_PAIRING_SECRET)
+    assert (
+        verify_pairing_token(
+            token,
+            shared_secret="a-different-shared-secret",
+        )
+        is False
+    )
 
 
 def test_pairing_token_rejects_invalid():
-    assert verify_pairing_token("invalid-token") is False
-    assert verify_pairing_token("") is False
+    assert verify_pairing_token("invalid-token", shared_secret=_PAIRING_SECRET) is False
+    assert verify_pairing_token("", shared_secret=_PAIRING_SECRET) is False
 
 
 def test_discover_all_peers_merges_ssh_and_omlx():
@@ -172,10 +185,9 @@ def test_discover_all_peers_merges_ssh_and_omlx():
 
     assert result["trusted"] is False
     assert len(result["peers"]) == 2
-    assert "pairing_token" in result
-    assert result["pairing_token"] is not None
-    # Verify the pairing token works
-    assert verify_pairing_token(result["pairing_token"]) is True
+    # Unauthenticated Bonjour discovery must not mint a credential. Pairing
+    # tokens are created explicitly after both Macs share a secret.
+    assert result["pairing_token"] is None
 
     # Check that peers have the right structure
     peer_names = {p["ssh"] for p in result["peers"]}

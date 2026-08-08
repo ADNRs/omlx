@@ -39,6 +39,20 @@ def test_cluster_navigation_exists_for_desktop_and_mobile():
     assert navbar.count("setMainTab('cluster')") == 2
     assert navbar.count("mainTab === 'cluster'") == 2
     assert navbar.count("navbar.tab.cluster") == 2
+    assert navbar.count(
+        'x-show="globalSettings.server.distributed_inference_active"'
+    ) == 2
+
+
+def test_distributed_inference_is_an_advanced_restart_scoped_opt_in():
+    settings = _read("omlx/admin/templates/dashboard/_settings.html")
+    javascript = _read("omlx/admin/static/js/dashboard.js")
+
+    assert "settings.advanced.distributed_inference" in settings
+    assert "settings.advanced.distributed_inference_hint" in settings
+    assert "distributed_inference_enabled: false" in javascript
+    assert "distributed_inference_active: false" in javascript
+    assert "if (tab === 'cluster' && !this.globalSettings.server.distributed_inference_active) return" in javascript
 
 
 def test_cluster_dashboard_uses_authenticated_cluster_apis():
@@ -367,7 +381,18 @@ def test_tensor_parallel_controls_are_derived_from_detected_node_count():
 
 def test_every_dashboard_locale_names_cluster_tab():
     locale_dir = ROOT / "omlx/admin/i18n"
+    required = {
+        "navbar.tab.cluster",
+        "settings.advanced.distributed_inference",
+        "settings.advanced.distributed_inference_hint",
+        "cluster.pairing.shared_secret",
+        "cluster.pairing.shared_secret_hint",
+        "cluster.pairing.shared_secret_placeholder",
+        "cluster.pairing.generate",
+        "cluster.pairing.copy",
+    }
 
     for locale_path in locale_dir.glob("*.json"):
         locale = json.loads(locale_path.read_text())
-        assert locale["navbar.tab.cluster"], locale_path.name
+        missing = {key for key in required if not locale.get(key)}
+        assert not missing, f"{locale_path.name}: missing {sorted(missing)}"

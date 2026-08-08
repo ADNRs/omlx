@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import json
 import os
@@ -15,6 +16,9 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from .deployment import validate_ssh_target
+from .token_auth import sign_pairing_payload, verify_pairing_signature
 
 # Key management constants
 _SSH_KEY_TYPE = "ed25519"
@@ -169,9 +173,14 @@ def create_key_exchange_token(
     *,
     public_key: str,
     node_id: str,
+    shared_secret: str,
     ttl: int = _KEY_EXCHANGE_TTL,
 ) -> str:
-    """Create a signed token containing the SSH public key for exchange."""
+    """Create an authenticated token containing an SSH public key."""
+
+    if not 1 <= ttl <= _KEY_EXCHANGE_TTL:
+        raise ValueError(f"key exchange TTL must be between 1 and {_KEY_EXCHANGE_TTL}")
+    node_id = validate_ssh_target(node_id)
 
     fingerprint = _key_fingerprint(public_key)
     token = secrets.token_urlsafe(32)
@@ -187,9 +196,8 @@ def create_key_exchange_token(
         "expires_at": expires_at,
     }
 
-    # Sign the payload with a hash
     payload_json = json.dumps(payload, sort_keys=True)
-    signature = hashlib.sha256(payload_json.encode()).hexdigest()
+    signature = sign_pairing_payload(payload_json, shared_secret=shared_secret)
 
     exchange_data = {
         "token": token,
@@ -206,7 +214,11 @@ def create_key_exchange_token(
     ).decode()
 
 
-def verify_key_exchange_token(encoded_token: str) -> KeyExchangeToken | None:
+def verify_key_exchange_token(
+    encoded_token: str,
+    *,
+    shared_secret: str,
+) -> KeyExchangeToken | None:
     """Verify a key exchange token and return the key data."""
 
     try:
@@ -218,7 +230,21 @@ def verify_key_exchange_token(encoded_token: str) -> KeyExchangeToken | None:
         node_id = data["node_id"]
         created_at = data["created_at"]
         expires_at = data["expires_at"]
-    except (json.JSONDecodeError, KeyError, ValueError):
+    except (binascii.Error, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+
+    if (
+        not isinstance(created_at, (int, float))
+        or isinstance(created_at, bool)
+        or not isinstance(expires_at, (int, float))
+        or isinstance(expires_at, bool)
+        or expires_at <= created_at
+        or expires_at - created_at > _KEY_EXCHANGE_TTL
+    ):
+        return None
+    try:
+        node_id = validate_ssh_target(node_id)
+    except ValueError:
         return None
 
     # Check TTL
@@ -235,9 +261,11 @@ def verify_key_exchange_token(encoded_token: str) -> KeyExchangeToken | None:
         "expires_at": expires_at,
     }
     payload_json = json.dumps(payload, sort_keys=True)
-    expected_signature = hashlib.sha256(payload_json.encode()).hexdigest()
-
-    if signature != expected_signature:
+    if not verify_pairing_signature(
+        payload_json,
+        signature,
+        shared_secret=shared_secret,
+    ):
         return None
 
     # Verify fingerprint matches
@@ -363,6 +391,7 @@ def get_ssh_key_info() -> dict[str, Any]:
 def generate_key_exchange_for_peer(
     *,
     node_id: str,
+    shared_secret: str,
     key_pair: SSHKeyPair | None = None,
 ) -> str:
     """Generate a key exchange token for a specific peer."""
@@ -373,17 +402,22 @@ def generate_key_exchange_for_peer(
     return create_key_exchange_token(
         public_key=key_pair.public_key,
         node_id=node_id,
+        shared_secret=shared_secret,
     )
 
 
 def exchange_keys_with_peer(
     *,
     peer_token: str,
+    shared_secret: str,
     known_hosts_path: Path | None = None,
 ) -> dict[str, Any]:
     """Exchange keys with a peer using their key exchange token."""
 
-    verified = verify_key_exchange_token(peer_token)
+    verified = verify_key_exchange_token(
+        peer_token,
+        shared_secret=shared_secret,
+    )
     if verified is None:
         return {
             "success": False,

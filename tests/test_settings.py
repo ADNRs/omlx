@@ -51,6 +51,7 @@ class TestServerSettings:
         assert settings.auto_start_on_launch is True
         assert settings.burst_decode_mode == "balanced"
         assert settings.preserve_mid_system_cache is True
+        assert settings.distributed_inference_enabled is False
 
     def test_custom_values(self):
         """Test custom values."""
@@ -79,7 +80,17 @@ class TestServerSettings:
             "auto_start_on_launch": True,
             "burst_decode_mode": "balanced",
             "preserve_mid_system_cache": True,
+            "distributed_inference_enabled": False,
         }
+
+    def test_from_dict_distributed_inference_is_opt_in(self):
+        assert ServerSettings.from_dict({}).distributed_inference_enabled is False
+        assert (
+            ServerSettings.from_dict(
+                {"distributed_inference_enabled": True}
+            ).distributed_inference_enabled
+            is True
+        )
 
     def test_from_dict_sse_keepalive_mode(self):
         """sse_keepalive_mode round-trips through from_dict / to_dict."""

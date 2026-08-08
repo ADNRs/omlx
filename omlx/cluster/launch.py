@@ -461,6 +461,9 @@ def _install_strict_ssh_wrapper(directory: Path) -> Path:
         "-o BatchMode=yes "
         "-o ConnectTimeout=5 "
         "-o StrictHostKeyChecking=yes "
+        "-o ServerAliveInterval=15 "
+        "-o ServerAliveCountMax=4 "
+        "-o TCPKeepAlive=yes "
         '"$@"\n',
         encoding="utf-8",
     )

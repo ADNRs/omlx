@@ -110,6 +110,35 @@ router = APIRouter(prefix="/admin/api/cluster", tags=["cluster"])
 _get_engine_pool: Any | None = None
 
 
+class ClusterPairingTokenRequest(BaseModel):
+    shared_secret: str = Field(min_length=16, max_length=256)
+
+
+class ClusterPairingTokenVerificationRequest(ClusterPairingTokenRequest):
+    token: str = Field(min_length=1, max_length=16 * 1024)
+
+
+class ClusterKeyExchangeTokenRequest(ClusterPairingTokenRequest):
+    node_id: str = Field(min_length=1, max_length=255)
+
+
+class ClusterKeyExchangeRequest(ClusterPairingTokenRequest):
+    exchange_token: str = Field(min_length=1, max_length=64 * 1024)
+
+
+def _validated_ssh_targets(hosts: str) -> list[str]:
+    """Parse and validate comma-separated SSH destinations from a query."""
+
+    try:
+        return [
+            validate_ssh_target(item.strip())
+            for item in hosts.split(",")
+            if item.strip()
+        ]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 def inspect_safetensors_layout(model_path: str | Path):
     """Compatibility seam for route tests, backed by the complete-model check.
 
@@ -1509,19 +1538,30 @@ async def cluster_discover():
 
 
 @router.post("/pairing-token")
-async def cluster_pairing_token():
+async def cluster_pairing_token(request: ClusterPairingTokenRequest):
     """Generate a pairing token for QR code exchange."""
 
     from .discovery import generate_pairing_token
 
-    return {"pairing_token": generate_pairing_token()}
+    try:
+        token = generate_pairing_token(shared_secret=request.shared_secret)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"pairing_token": token}
 
 
 @router.post("/verify-pairing-token")
-async def cluster_verify_pairing_token(token: str = Query(...)):
+async def cluster_verify_pairing_token(
+    request: ClusterPairingTokenVerificationRequest,
+):
     """Verify a pairing token received via QR code scan."""
 
-    return {"valid": verify_pairing_token(token)}
+    return {
+        "valid": verify_pairing_token(
+            request.token,
+            shared_secret=request.shared_secret,
+        )
+    }
 
 
 @router.get("/ssh-key")
@@ -1554,25 +1594,38 @@ async def cluster_generate_ssh_key():
 
 
 @router.post("/ssh-key/exchange-token")
-async def cluster_generate_key_exchange_token(node_id: str = Query(...)):
+async def cluster_generate_key_exchange_token(
+    request: ClusterKeyExchangeTokenRequest,
+):
     """Generate a key exchange token for pairing with a peer."""
 
     from .ssh_keys import generate_key_exchange_for_peer
 
     try:
-        token = await asyncio.to_thread(generate_key_exchange_for_peer, node_id=node_id)
+        node_id = validate_ssh_target(request.node_id)
+        token = await asyncio.to_thread(
+            generate_key_exchange_for_peer,
+            node_id=node_id,
+            shared_secret=request.shared_secret,
+        )
         return {"exchange_token": token}
-    except Exception as exc:
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.post("/ssh-key/exchange")
-async def cluster_exchange_keys(exchange_token: str = Query(...)):
+async def cluster_exchange_keys(request: ClusterKeyExchangeRequest):
     """Exchange SSH keys with a peer using their exchange token."""
 
     from .ssh_keys import exchange_keys_with_peer
 
-    result = await asyncio.to_thread(exchange_keys_with_peer, peer_token=exchange_token)
+    result = await asyncio.to_thread(
+        exchange_keys_with_peer,
+        peer_token=request.exchange_token,
+        shared_secret=request.shared_secret,
+    )
     if not result["success"]:
         raise HTTPException(status_code=400, detail=result["error"])
     return result
@@ -1605,7 +1658,7 @@ async def cluster_transports(hosts: str = Query(...)):
     Returns transport info (TB4, TB5, Ethernet, RDMA) and the recommended backend.
     """
 
-    host_list = [h.strip() for h in hosts.split(",") if h.strip()]
+    host_list = _validated_ssh_targets(hosts)
     if not host_list:
         raise HTTPException(status_code=400, detail="at least one host is required")
     try:
@@ -1630,7 +1683,10 @@ async def cluster_peer_health(hosts: str = Query(...), deployment_id: str = ""):
     away should be visible as a stated failure rather than a hung request.
     """
 
-    entries = [item.strip() for item in hosts.split(",") if item.strip()]
+    # Validate the complete optional ``user@host`` item before extracting the
+    # hostname used in the human-readable health result. Passing an unchecked
+    # leading-dash item to OpenSSH would let it be parsed as a client option.
+    entries = _validated_ssh_targets(hosts)
     hosts_by_rank = {
         index: (item.split("@")[-1], item) for index, item in enumerate(entries)
     }
@@ -1657,7 +1713,7 @@ async def cluster_link_status(hosts: str = Query(...)):
     rather than silently falling back to TCP.
     """
 
-    host_list = [item.strip() for item in hosts.split(",") if item.strip()]
+    host_list = _validated_ssh_targets(hosts)
     status = await asyncio.to_thread(assess_link, host_list)
     return status.to_dict()
 

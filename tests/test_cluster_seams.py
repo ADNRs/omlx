@@ -107,7 +107,11 @@ def test_fetch_calls_never_use_a_params_option():
 def test_pairing_token_round_trips():
     from omlx.cluster.discovery import generate_pairing_token, verify_pairing_token
 
-    assert verify_pairing_token(generate_pairing_token()) is True
+    secret = "correct-horse-battery-staple"
+    assert verify_pairing_token(
+        generate_pairing_token(shared_secret=secret),
+        shared_secret=secret,
+    ) is True
 
 
 def test_pairing_token_rejects_a_tampered_payload():
@@ -116,10 +120,13 @@ def test_pairing_token_rejects_a_tampered_payload():
 
     from omlx.cluster.discovery import generate_pairing_token, verify_pairing_token
 
-    payload = json.loads(base64.urlsafe_b64decode(generate_pairing_token()))
+    secret = "correct-horse-battery-staple"
+    payload = json.loads(
+        base64.urlsafe_b64decode(generate_pairing_token(shared_secret=secret))
+    )
     payload["token"] = "substituted"
     forged = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
-    assert verify_pairing_token(forged) is False
+    assert verify_pairing_token(forged, shared_secret=secret) is False
 
 
 def test_worker_contract_round_trips_with_tensor_parallelism():
@@ -369,11 +376,16 @@ def test_key_exchange_token_round_trips():
     blob = base64.b64encode(b"\x00" * 32).decode()
     public_key = f"ssh-ed25519 {blob} omlx"
     token = ssh_keys.create_key_exchange_token(
-        public_key=public_key, node_id="peer-mac"
+        public_key=public_key,
+        node_id="peer-mac",
+        shared_secret="correct-horse-battery-staple",
     )
     assert isinstance(token, str) and token
 
-    decoded = ssh_keys.verify_key_exchange_token(token)
+    decoded = ssh_keys.verify_key_exchange_token(
+        token,
+        shared_secret="correct-horse-battery-staple",
+    )
     assert decoded is not None, "a freshly generated token must verify"
     assert decoded.node_id == "peer-mac"
     assert decoded.public_key == public_key
@@ -387,10 +399,74 @@ def test_key_exchange_rejects_a_tampered_token():
 
     blob = base64.b64encode(b"\x00" * 32).decode()
     token = ssh_keys.create_key_exchange_token(
-        public_key=f"ssh-ed25519 {blob} omlx", node_id="peer-mac"
+        public_key=f"ssh-ed25519 {blob} omlx",
+        node_id="peer-mac",
+        shared_secret="correct-horse-battery-staple",
     )
     payload = json.loads(base64.urlsafe_b64decode(token))
     payload["node_id"] = "attacker-mac"
     forged = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
 
-    assert ssh_keys.verify_key_exchange_token(forged) is None
+    assert ssh_keys.verify_key_exchange_token(
+        forged,
+        shared_secret="correct-horse-battery-staple",
+    ) is None
+
+
+def test_key_exchange_rejects_the_wrong_shared_secret():
+    import base64
+
+    from omlx.cluster import ssh_keys
+
+    blob = base64.b64encode(b"\x00" * 32).decode()
+    token = ssh_keys.create_key_exchange_token(
+        public_key=f"ssh-ed25519 {blob} omlx",
+        node_id="peer-mac",
+        shared_secret="correct-horse-battery-staple",
+    )
+
+    assert ssh_keys.verify_key_exchange_token(
+        token,
+        shared_secret="a-different-shared-secret",
+    ) is None
+
+
+def test_key_exchange_rejects_an_authenticated_ssh_option_target():
+    import base64
+    import hashlib
+    import hmac
+    import json
+
+    from omlx.cluster import ssh_keys
+
+    secret = "correct-horse-battery-staple"
+    blob = base64.b64encode(b"\x00" * 32).decode()
+    token = ssh_keys.create_key_exchange_token(
+        public_key=f"ssh-ed25519 {blob} omlx",
+        node_id="peer-mac",
+        shared_secret=secret,
+    )
+    payload = json.loads(base64.urlsafe_b64decode(token))
+    payload["node_id"] = "-oProxyCommand"
+    signed = {
+        key: payload[key]
+        for key in (
+            "token",
+            "public_key",
+            "fingerprint",
+            "node_id",
+            "created_at",
+            "expires_at",
+        )
+    }
+    payload["signature"] = hmac.new(
+        secret.encode(),
+        json.dumps(signed, sort_keys=True).encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    forged = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+
+    assert ssh_keys.verify_key_exchange_token(
+        forged,
+        shared_secret=secret,
+    ) is None

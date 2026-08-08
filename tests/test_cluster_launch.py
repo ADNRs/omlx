@@ -346,6 +346,9 @@ def test_launcher_wraps_every_upstream_ssh_call_with_strict_policy(tmp_path):
     assert "BatchMode=yes" in content
     assert "ConnectTimeout=5" in content
     assert "StrictHostKeyChecking=yes" in content
+    assert "ServerAliveInterval=15" in content
+    assert "ServerAliveCountMax=4" in content
+    assert "TCPKeepAlive=yes" in content
     assert Path(argv[0]).is_absolute()
     assert "BatchMode=yes" in argv
     assert "StrictHostKeyChecking=yes" in argv

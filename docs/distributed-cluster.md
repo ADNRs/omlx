@@ -81,7 +81,10 @@ paired with a 128 GiB Mac, rank zero should normally be the larger machine.
 
 ## Use the GUI
 
-Start this source build on both Macs and open **Cluster** in each oMLX dashboard.
+Start this source build on both Macs. In **Settings > Advanced**, enable
+**Distributed Inference**, save, and restart oMLX. The **Cluster** tab, cluster
+API routes, and Bonjour advertisement remain off until this explicit opt-in is
+enabled.
 
 ### Automatic Peer Discovery
 
@@ -91,9 +94,10 @@ specific `_omlx._tcp` service. The discovery is read-only and never implies
 trust. Discovered peers appear under **Detected nearby** with their hostname
 and service type.
 
-For manual pairing, click **Generate QR code** to create a short-lived
-(5-minute) pairing token. Scan the QR code on the other Mac to establish a
-connection without manually entering hostnames.
+For manual pairing, generate a shared pairing secret on one Mac and copy it to
+the other. Enter the same secret on both dashboards before generating and
+exchanging the short-lived SSH key tokens. The secret authenticates the token
+with HMAC-SHA256; an unkeyed or altered token is rejected.
 
 ### Setup Flow
 

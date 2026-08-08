@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import base64
-import hashlib
+import binascii
 import json
 import re
 import secrets
@@ -16,6 +16,8 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Protocol
+
+from .token_auth import sign_pairing_payload, verify_pairing_signature
 
 _DNS_SD = "/usr/bin/dns-sd"
 _MAX_OUTPUT_BYTES = 64 * 1024
@@ -263,7 +265,7 @@ def discover_ssh_peers(
     }
 
 
-def generate_pairing_token() -> str:
+def generate_pairing_token(*, shared_secret: str) -> str:
     """Generate a short-lived pairing token for copy/paste pairing."""
 
     token = secrets.token_urlsafe(32)
@@ -277,7 +279,7 @@ def generate_pairing_token() -> str:
         "expires_at": now + _PAIRING_TOKEN_TTL,
     }
     token_json = json.dumps(token_data, sort_keys=True)
-    signature = hashlib.sha256(token_json.encode()).hexdigest()
+    signature = sign_pairing_payload(token_json, shared_secret=shared_secret)
     payload = {
         "token": token,
         "signature": signature,
@@ -286,7 +288,7 @@ def generate_pairing_token() -> str:
     return base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
 
 
-def verify_pairing_token(encoded_token: str) -> bool:
+def verify_pairing_token(encoded_token: str, *, shared_secret: str) -> bool:
     """Verify a pairing token's signature and TTL."""
 
     try:
@@ -294,7 +296,13 @@ def verify_pairing_token(encoded_token: str) -> bool:
         token = payload["token"]
         signature = payload["signature"]
         expires_at = payload["expires_at"]
-    except (json.JSONDecodeError, KeyError, ValueError):
+    except (binascii.Error, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return False
+
+    if (
+        not isinstance(expires_at, (int, float))
+        or isinstance(expires_at, bool)
+    ):
         return False
 
     if time.time() > expires_at:
@@ -305,10 +313,11 @@ def verify_pairing_token(encoded_token: str) -> bool:
         "created_at": expires_at - _PAIRING_TOKEN_TTL,
         "expires_at": expires_at,
     }
-    expected_signature = hashlib.sha256(
-        json.dumps(token_data, sort_keys=True).encode()
-    ).hexdigest()
-    return signature == expected_signature
+    return verify_pairing_signature(
+        json.dumps(token_data, sort_keys=True),
+        signature,
+        shared_secret=shared_secret,
+    )
 
 
 def discover_omlx_peers(
@@ -363,7 +372,10 @@ def discover_omlx_peers(
         "peers": peers,
         "warning": None,
         "trusted": False,
-        "pairing_token": generate_pairing_token(),
+        # Discovery is deliberately unauthenticated. A pairing token is only
+        # created by the explicit endpoint after the user supplies the same
+        # out-of-band secret on both Macs.
+        "pairing_token": None,
     }
 
 

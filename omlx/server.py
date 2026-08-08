@@ -267,6 +267,9 @@ class ServerState:
     # /health returns 503 with status "loading" until it flips to True so
     # port watchdogs see liveness instead of a closed port (#2184).
     pinned_preload_complete: bool = True
+    # Snapshot at init_server(). Settings may be edited while this process is
+    # running, but routes, navigation, and Bonjour switch together on restart.
+    distributed_inference_enabled: bool = False
 
 
 # Global server state instance
@@ -334,6 +337,20 @@ async def verify_api_key(
     return True
 
 
+def distributed_inference_enabled() -> bool:
+    """Whether the experimental distributed surface is exposed this run."""
+
+    return _server_state.distributed_inference_enabled
+
+
+async def require_distributed_inference_enabled() -> bool:
+    """Hide the experimental cluster surface until explicitly enabled."""
+
+    if not distributed_inference_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+    return True
+
+
 def _reset_boundary_snapshots_for_server() -> None:
     """Reset ephemeral boundary snapshots at server lifecycle boundaries."""
     engine_pool = _server_state.engine_pool
@@ -393,7 +410,7 @@ async def lifespan(app: FastAPI):
     # and API port without asking the user to type an SSH target. Publication
     # is best-effort: inference remains available if Bonjour is disabled.
     if (
-        _server_state.global_settings is not None
+        distributed_inference_enabled()
         and os.environ.get("OMLX_BONJOUR", "1").strip().lower()
         not in {"0", "false", "no", "off"}
     ):
@@ -578,8 +595,6 @@ except ImportError:
 from .admin.auth import _RedirectToLogin, require_admin
 from .admin.routes import router as admin_router
 from .admin.routes import set_admin_getters
-from .cluster.routes import router as cluster_router
-from .cluster.routes import set_cluster_getters
 
 set_admin_getters(
     get_server_state,
@@ -587,9 +602,29 @@ set_admin_getters(
     lambda: _server_state.settings_manager,
     lambda: _server_state.global_settings,
 )
-set_cluster_getters(get_engine_pool)
 app.include_router(admin_router)
-app.include_router(cluster_router, dependencies=[Depends(require_admin)])
+
+_cluster_routes_registered = False
+
+
+def _register_cluster_routes() -> None:
+    """Register experimental routes only for an opted-in server process."""
+
+    global _cluster_routes_registered
+    if _cluster_routes_registered:
+        return
+    from .cluster.routes import router as cluster_router
+    from .cluster.routes import set_cluster_getters
+
+    set_cluster_getters(get_engine_pool)
+    app.include_router(
+        cluster_router,
+        dependencies=[
+            Depends(require_admin),
+            Depends(require_distributed_inference_enabled),
+        ],
+    )
+    _cluster_routes_registered = True
 
 
 @app.exception_handler(_RedirectToLogin)
@@ -1701,6 +1736,11 @@ def init_server(
     # Store API key
     _server_state.api_key = api_key
     _server_state.global_settings = global_settings
+    from .cluster.exposure import distributed_inference_enabled as is_enabled
+
+    _server_state.distributed_inference_enabled = is_enabled(global_settings)
+    if _server_state.distributed_inference_enabled:
+        _register_cluster_routes()
     response_state_dir = None
     if global_settings:
         response_state_dir = (
