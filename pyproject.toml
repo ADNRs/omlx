@@ -121,7 +121,7 @@ dependencies = [
     # per cycle instead of four syncs plus a hard eval). Also supports current
     # Gemma 4 unified target exports.
     "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@474f8e1ba95864f5bb0759cd1b9a13c80abc5ce3",
-    "markitdown[pdf,docx,pptx]==0.1.6",
+    "markitdown[pdf,docx,pptx]==0.1.7",
 ]
 
 [project.optional-dependencies]
