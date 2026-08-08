@@ -960,6 +960,17 @@
                 this.clusterGuidance = null;
             },
 
+            async openClusterPairingSetup() {
+                this.clusterShowSetupDetails = true;
+                this.clusterShowPeerAdvanced = true;
+                if (!this.clusterSshKey) await this.loadClusterSshKey();
+                await this.$nextTick();
+                document.querySelector('[data-cluster-ssh-setup]')?.scrollIntoView({
+                    behavior: 'smooth',
+                    block: 'center',
+                });
+            },
+
             async loadClusterStatus() {
                 if (this.clusterLoading) return;
                 this.clusterLoading = true;

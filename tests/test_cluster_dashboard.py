@@ -379,6 +379,17 @@ def test_tensor_parallel_controls_are_derived_from_detected_node_count():
     assert '<option value="4">' not in cluster
 
 
+def test_pairing_failure_exposes_omlx_and_terminal_recovery_paths():
+    cluster = _read("omlx/admin/templates/dashboard/_cluster.html")
+    javascript = _read("omlx/admin/static/js/dashboard.js")
+
+    assert "Open SSH setup in oMLX" in cluster
+    assert "Or run this in Terminal on this Mac" in cluster
+    assert "Don't have the oMLX SSH key yet?" in cluster
+    assert "data-cluster-ssh-setup" in cluster
+    assert "openClusterPairingSetup()" in javascript
+
+
 def test_every_dashboard_locale_names_cluster_tab():
     locale_dir = ROOT / "omlx/admin/i18n"
     required = {

@@ -18,6 +18,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
+_MANAGED_IDENTITY = "~/.ssh/omlx_cluster"
+
 
 def cluster_ssh_options(
     *,
@@ -32,6 +34,10 @@ def cluster_ssh_options(
         "KbdInteractiveAuthentication=no",
         "StrictHostKeyChecking=accept-new",
         "CheckHostIP=no",
+        # The pairing UI creates this dedicated identity. Naming it explicitly
+        # makes the exchanged key usable without ssh-agent or ~/.ssh/config,
+        # while OpenSSH can still fall back to an operator's existing keys.
+        f"IdentityFile={_MANAGED_IDENTITY}",
         # Suppress the benign "permanently added" / "known by other names"
         # chatter. Changed-key failures are errors and remain visible.
         "LogLevel=ERROR",

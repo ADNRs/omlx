@@ -23,6 +23,8 @@ class Guidance:
     explanation: str
     steps: tuple[str, ...] = field(default_factory=tuple)
     doc_anchor: str | None = None
+    command: str | None = None
+    keygen_command: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -30,7 +32,50 @@ class Guidance:
             "explanation": self.explanation,
             "steps": list(self.steps),
             "doc_anchor": self.doc_anchor,
+            "command": self.command,
+            "keygen_command": self.keygen_command,
         }
+
+
+_SSH_TARGET = r"(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9._-]+"
+_FAILED_FOR_TARGET = re.compile(
+    rf"(?:probe|preflight|connection) failed for (?P<target>{_SSH_TARGET})(?=[:\s])",
+    re.I,
+)
+_UNKNOWN_HOST_KEY = re.compile(
+    rf"no (?:ED25519|ECDSA|RSA|DSA) host key is known for (?P<host>{_SSH_TARGET})",
+    re.I,
+)
+
+
+def _first_seen_host_guidance(message: str) -> Guidance | None:
+    """Attach a safe, copyable command to OpenSSH's first-seen-key error."""
+
+    unknown = _UNKNOWN_HOST_KEY.search(message)
+    if unknown is None:
+        return None
+    target_match = _FAILED_FOR_TARGET.search(message)
+    target = (
+        target_match.group("target")
+        if target_match is not None
+        else unknown.group("host")
+    )
+    return Guidance(
+        "The other Mac isn't trusted yet",
+        "SSH stopped before login because this Mac has not recorded the peer's "
+        "host key. oMLX can set up its managed key, or Terminal can install it "
+        "in one command.",
+        (
+            "Recommended: open SSH setup in oMLX and exchange the generated key.",
+            "Terminal alternative: run the command below on this Mac, confirm "
+            "the fingerprint, and enter the other Mac account's password.",
+            "If the account names differ, change the target to user@host first, "
+            "then retry the peer check.",
+        ),
+        "pairing",
+        f"ssh-copy-id -i ~/.ssh/omlx_cluster.pub {target}",
+        "ssh-keygen -t ed25519 -f ~/.ssh/omlx_cluster -N '' -C omlx-cluster",
+    )
 
 
 # Ordered: the first pattern that matches wins, so put specific before general.
@@ -274,6 +319,9 @@ def explain(message: str | None) -> Guidance:
 
     if not message:
         return _FALLBACK
+    first_seen = _first_seen_host_guidance(message)
+    if first_seen is not None:
+        return first_seen
     for pattern, guidance in _RULES:
         if pattern.search(message):
             return guidance

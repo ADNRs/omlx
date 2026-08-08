@@ -6,6 +6,7 @@ import struct
 from types import SimpleNamespace
 
 import mlx.nn.layers.distributed as distributed_layers
+import pytest
 
 from omlx.cluster.planner import _supports_tensor_parallel
 from omlx.cluster.progressive_loading import (
@@ -353,6 +354,7 @@ def test_progressive_pipeline_load_preserves_single_file_model_support(tmp_path)
     )
     utils = SimpleNamespace(
         _download=lambda _repo, allow_patterns=None: tmp_path,
+        load_config=lambda _path: {"model_type": "llama", "eos_token_id": 2},
         load_model=lambda *_args, **_kwargs: (model, {"eos_token_id": 2}),
         load_tokenizer=lambda *_args, **_kwargs: "tokenizer",
         tree_flatten=lambda parameters: parameters,
@@ -380,3 +382,27 @@ def test_progressive_pipeline_load_preserves_single_file_model_support(tmp_path)
     assert loaded is model
     assert tokenizer == "tokenizer"
     assert not (tmp_path / "model.safetensors.index.json").exists()
+
+
+def test_progressive_loader_checks_tokenizer_trust_before_model_load(tmp_path):
+    calls = []
+
+    def reject_tokenizer(_path, config, **_kwargs):
+        calls.append(("tokenizer", config))
+        raise ValueError("trust_remote_code=True is required")
+
+    utils = SimpleNamespace(
+        _download=lambda _repo, allow_patterns=None: tmp_path,
+        load_config=lambda _path: {"model_type": "llama"},
+        load_tokenizer=reject_tokenizer,
+        load_model=lambda *_args, **_kwargs: calls.append(("model", None)),
+    )
+
+    with pytest.raises(ValueError, match="trust_remote_code=True"):
+        progressive_sharded_load(
+            tmp_path,
+            utils_module=utils,
+            mx_module=_FakeMX(),
+        )
+
+    assert calls == [("tokenizer", {"trust_remote_code": False})]

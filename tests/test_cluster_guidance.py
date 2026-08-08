@@ -59,8 +59,30 @@ def test_empty_and_none_are_safe():
 
 def test_guidance_serialises_for_the_dashboard():
     payload = explain("Host key verification failed.").to_dict()
-    assert set(payload) == {"title", "explanation", "steps", "doc_anchor"}
+    assert set(payload) == {
+        "title",
+        "explanation",
+        "steps",
+        "doc_anchor",
+        "command",
+        "keygen_command",
+    }
     assert isinstance(payload["steps"], list)
+
+
+def test_first_seen_host_key_has_a_copyable_terminal_fallback():
+    guidance = explain(
+        "peer capability probe failed for clusteruser@studio: "
+        "No ED25519 host key is known for studio and you have "
+        "requested strict checking. Host key verification failed."
+    )
+
+    assert "isn't trusted yet" in guidance.title
+    assert guidance.doc_anchor == "pairing"
+    assert guidance.command == (
+        "ssh-copy-id -i ~/.ssh/omlx_cluster.pub clusteruser@studio"
+    )
+    assert guidance.keygen_command.startswith("ssh-keygen -t ed25519")
 
 
 def test_specific_rules_win_over_general_ones():

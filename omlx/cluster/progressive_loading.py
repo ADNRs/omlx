@@ -106,6 +106,19 @@ def progressive_sharded_load(
             "*.jinja",
         ],
     )
+    from ..utils.model_loading import ensure_model_code_trusted
+
+    metadata_config = utils_module.load_config(model_path)
+    ensure_model_code_trusted(
+        metadata_config,
+        model_path=model_path,
+        trust_remote_code=trust_remote_code,
+    )
+    tokenizer = utils_module.load_tokenizer(
+        model_path,
+        tokenizer_config or {"trust_remote_code": trust_remote_code},
+        eos_token_ids=metadata_config.get("eos_token_id", None),
+    )
     model, config = utils_module.load_model(
         model_path,
         lazy=True,
@@ -166,11 +179,6 @@ def progressive_sharded_load(
     else:
         utils_module._download(repo)
 
-    tokenizer = utils_module.load_tokenizer(
-        model_path,
-        tokenizer_config or {"trust_remote_code": True},
-        eos_token_ids=config.get("eos_token_id", None),
-    )
     model, _ = utils_module.load_model(
         model_path,
         lazy=True,

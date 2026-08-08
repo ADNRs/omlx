@@ -22,6 +22,7 @@ def test_new_aliases_are_accepted_without_weakening_changed_key_checks():
     assert "KbdInteractiveAuthentication=no" in options
     assert "StrictHostKeyChecking=accept-new" in options
     assert "CheckHostIP=no" in options
+    assert "IdentityFile=~/.ssh/omlx_cluster" in options
     assert "LogLevel=ERROR" in options
     assert "StrictHostKeyChecking=no" not in options
     assert "ConnectTimeout=5" in options
