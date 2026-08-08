@@ -253,6 +253,31 @@ def test_no_unreachable_functions_in_the_cluster_package():
     )
 
 
+def test_every_literal_ssh_and_scp_command_uses_the_shared_policy():
+    """One raw subprocess is enough to bring an interactive prompt back."""
+
+    offenders = []
+    for path in sorted(_CLUSTER.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.List) or not node.elts:
+                continue
+            first = node.elts[0]
+            if not isinstance(first, ast.Constant) or first.value not in {"ssh", "scp"}:
+                continue
+            protected = any(
+                isinstance(item, ast.Starred)
+                and isinstance(item.value, ast.Call)
+                and isinstance(item.value.func, ast.Name)
+                and item.value.func.id == "cluster_ssh_options"
+                for item in node.elts
+            )
+            if not protected:
+                offenders.append((path.name, node.lineno, first.value))
+
+    assert not offenders, f"SSH/SCP commands bypass shared policy: {offenders}"
+
+
 def test_discovery_does_not_import_the_transport_prober():
     """Peer listing must not sit behind an SSH round trip.
 

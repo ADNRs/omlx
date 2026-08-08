@@ -14,7 +14,7 @@ from omlx.cluster.guidance import explain
             "plan changed",
         ),
         ("weight file is missing: model-00002-of-00058.safetensors", "shard"),
-        ("Host key verification failed.", "trusted"),
+        ("Host key verification failed.", "identity changed"),
         ("ssh: connect to host studio.local port 22: Connection refused", "reach"),
         ("Permission denied (publickey).", "rejected"),
         ("ssh: Could not resolve hostname studio.local", "resolve"),

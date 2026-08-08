@@ -26,6 +26,7 @@ from .deployment import ClusterDeployment, validate_ssh_target
 from .liveness import read_marker, read_remote_marker
 from .models import CLUSTER_PROTOCOL_VERSION
 from .performance import performance_profiles_from_records
+from .ssh_policy import cluster_ssh_options
 from .staging import validate_staged_model
 
 _EVENT_PREFIX = "OMLX_CLUSTER_EVENT:"
@@ -321,7 +322,7 @@ def run_cluster_performance_probe(
         prefix="omlx-distributed-performance-"
     ) as temporary_name:
         temporary = Path(temporary_name)
-        _install_strict_ssh_wrapper(temporary)
+        _install_cluster_ssh_wrapper(temporary)
         hostfile = temporary / "hostfile.json"
         hostfile.write_text(
             json.dumps(
@@ -427,51 +428,33 @@ def _openssh_executable() -> str:
     return str(executable)
 
 
-def _strict_ssh_argv(ssh_target: str, remote_command: str) -> list[str]:
+def _cluster_ssh_argv(ssh_target: str, remote_command: str) -> list[str]:
     return [
         _openssh_executable(),
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=5",
-        "-o",
-        "StrictHostKeyChecking=yes",
         # A control channel that goes idle while ranks talk over RDMA is the
         # one that gets dropped — and the remote rank dies of SIGHUP with it.
         # Both MiniMax runs that reached ready ended exactly this way.
-        "-o",
-        "ServerAliveInterval=15",
-        "-o",
-        "ServerAliveCountMax=4",
-        "-o",
-        "TCPKeepAlive=yes",
+        *cluster_ssh_options(connect_timeout=5, keepalive=True),
         validate_ssh_target(ssh_target),
         remote_command,
     ]
 
 
-def _install_strict_ssh_wrapper(directory: Path) -> Path:
-    """Make MLX's internal SSH calls inherit the preflight trust policy."""
+def _install_cluster_ssh_wrapper(directory: Path) -> Path:
+    """Make MLX's internal SSH calls inherit the prompt-free trust policy."""
 
     executable = _openssh_executable()
     wrapper = directory / "ssh"
+    options = shlex.join(cluster_ssh_options(connect_timeout=5, keepalive=True))
     wrapper.write_text(
-        "#!/bin/sh\n"
-        f"exec {shlex.quote(executable)} "
-        "-o BatchMode=yes "
-        "-o ConnectTimeout=5 "
-        "-o StrictHostKeyChecking=yes "
-        "-o ServerAliveInterval=15 "
-        "-o ServerAliveCountMax=4 "
-        "-o TCPKeepAlive=yes "
-        '"$@"\n',
+        f'#!/bin/sh\nexec {shlex.quote(executable)} {options} "$@"\n',
         encoding="utf-8",
     )
     wrapper.chmod(0o700)
     return wrapper
 
 
-def _run_strict_ssh(
+def _run_cluster_ssh(
     ssh_target: str,
     remote_command: str,
     *,
@@ -480,7 +463,7 @@ def _run_strict_ssh(
 ) -> subprocess.CompletedProcess[str]:
     try:
         completed = runner(
-            _strict_ssh_argv(ssh_target, remote_command),
+            _cluster_ssh_argv(ssh_target, remote_command),
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -529,7 +512,7 @@ def probe_remote_admission_ceiling(
         "    ceiling=int(ceiling_breakdown().get('hard_limit',0))\n"
         "print(json.dumps({'admission_ceiling_bytes':ceiling}))"
     )
-    completed = _run_strict_ssh(
+    completed = _run_cluster_ssh(
         ssh_target,
         shlex.join([python_executable, "-c", script]),
         timeout=timeout,
@@ -578,7 +561,7 @@ def probe_remote_host(
     ]
     if route_to is not None:
         command.extend(["--route-to", route_to])
-    completed = _run_strict_ssh(
+    completed = _run_cluster_ssh(
         ssh_target,
         shlex.join(command),
         timeout=timeout,
@@ -723,7 +706,7 @@ def preflight_remote_hosts(
             ]
         )
         try:
-            completed = _run_strict_ssh(
+            completed = _run_cluster_ssh(
                 host.ssh,
                 remote_command,
                 timeout=timeout,
@@ -954,7 +937,7 @@ class DistributedJobSupervisor:
 
         self._temporary = tempfile.TemporaryDirectory(prefix="omlx-distributed-launch-")
         hostfile = Path(self._temporary.name) / "hostfile.json"
-        _install_strict_ssh_wrapper(Path(self._temporary.name))
+        _install_cluster_ssh_wrapper(Path(self._temporary.name))
         hostfile.write_text(
             json.dumps(
                 self.deployment.hostfile_dict(),

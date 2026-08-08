@@ -1192,7 +1192,7 @@ def peer_import_issues(
     check trusts is a peer the launch will also trust.
     """
 
-    from .launch import DistributedLaunchError, _run_strict_ssh
+    from .launch import DistributedLaunchError, _run_cluster_ssh
 
     requirements = required_imports(model_path)
     if not requirements:
@@ -1207,7 +1207,7 @@ def peer_import_issues(
         if ssh_target in _LOCAL_SSH_TARGETS:
             continue
         try:
-            completed = _run_strict_ssh(
+            completed = _run_cluster_ssh(
                 ssh_target, command, timeout=timeout, runner=runner
             )
         except (DistributedLaunchError, ValueError) as exc:

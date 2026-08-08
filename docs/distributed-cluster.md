@@ -11,7 +11,8 @@ The implementation currently provides:
 
 - read-only Thunderbolt, RDMA interface, IP, route, memory, and runtime probes;
 - untrusted Bonjour suggestions for Macs advertising SSH;
-- strict, non-interactive SSH verification against the user's `known_hosts`;
+- prompt-free SSH trust-on-first-use: new peer aliases are recorded in the
+  user's `known_hosts`, while changed keys are still refused;
 - exact oMLX, MLX, MLX-LM, cluster-protocol, remote model-path, and bounded
   model-manifest preflight (config/tokenizer metadata plus weight headers);
 - safetensors-header planning across unequal memory budgets;
@@ -32,8 +33,10 @@ The implementation currently provides:
   rate, measured collective bandwidth, predicted stage time, active requests,
   and cumulative token counts.
 
-oMLX does not enable RDMA, change interfaces, install SSH keys, accept unknown
-host keys, or copy model files. Those remain explicit administrator actions.
+oMLX does not enable RDMA without approval, overwrite changed SSH host keys, or
+install login credentials without pairing. Those remain explicit administrator
+actions. A new hostname or link address is recorded using OpenSSH's
+``accept-new`` policy so setup never pauses for a terminal prompt.
 
 ## Architecture
 
@@ -71,7 +74,8 @@ On both Macs:
 1. Run the same oMLX build and matching MLX/MLX-LM versions.
 2. Keep the downloaded model at the same absolute path.
 3. Enable Remote Login and use key-based SSH for the coordinator account.
-4. Connect once from Terminal so the peer host key is present in `known_hosts`.
+4. Pair the Macs in oMLX. The first connection records a new hostname or
+   Thunderbolt address without prompting; an identity change is still refused.
 5. For JACCL, configure Thunderbolt RDMA outside oMLX and confirm `rdma_ctl
    status` and `ibv_devices` report the link.
 
@@ -106,8 +110,9 @@ On the coordinator:
 
 1. Connect the Thunderbolt cable. A nearby Mac should appear under
    **Detected nearby** or via the QR code pairing.
-2. Select the peer or enter its SSH hostname. **Check peer** requires an
-   already-known host key and a non-interactive SSH key.
+2. Select the peer or enter its SSH hostname. **Check peer** records a new host
+   alias automatically, refuses a changed key, and requires a non-interactive
+   SSH login key.
 3. Select **Downloaded model**, choose its local directory, set a reserve for
    KV/activations, and build the unequal plan.
 4. Select JACCL, JACCL Ring, or the TCP Ring fallback and choose an execution

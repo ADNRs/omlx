@@ -1565,8 +1565,8 @@
                         </template>
 
                         <p class="mt-3 text-[11px] text-neutral-500">
-                            First connection only: open Terminal and SSH to the peer once so macOS records its host key.
-                            Password prompts are intentionally refused by the GUI; configure an SSH key for unattended launches.
+                            First connection only: oMLX records a new peer address automatically and refuses changed host keys.
+                            Password prompts are never shown by the GUI; configure an SSH key for unattended launches.
                         </p>
                         <div class="mt-3 flex justify-end"
                              x-show="clusterPeerProbe?.runtime_compatible">

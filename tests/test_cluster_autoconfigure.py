@@ -1775,8 +1775,8 @@ def test_a_peer_missing_the_interpreter_says_so_rather_than_reporting_no_imports
     assert "/peer/.venv/bin/python" in issues[0].detail
 
 
-def test_the_peer_is_asked_over_the_same_strict_ssh_the_launch_uses(tmp_path):
-    """A preflight that trusts a host key the launch would refuse proves nothing."""
+def test_the_peer_uses_the_same_prompt_free_ssh_as_the_launch(tmp_path):
+    """Preflight and launch must share one changed-key refusal policy."""
 
     from omlx.cluster.autoconfigure import peer_import_issues
 
@@ -1793,7 +1793,8 @@ def test_the_peer_is_asked_over_the_same_strict_ssh_the_launch_uses(tmp_path):
     )
 
     assert "BatchMode=yes" in seen["argv"]
-    assert "StrictHostKeyChecking=yes" in seen["argv"]
+    assert "StrictHostKeyChecking=accept-new" in seen["argv"]
+    assert "CheckHostIP=no" in seen["argv"]
 
 
 def test_the_summary_shows_the_fix_and_not_only_the_failure(tmp_path):

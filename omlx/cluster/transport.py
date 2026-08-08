@@ -13,14 +13,18 @@ import re
 import secrets
 import shlex
 import subprocess
+import threading
 from collections.abc import Callable, Sequence
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import Any
+
+from .ssh_policy import apply_cluster_ssh_policy, cluster_ssh_options
 
 # Link speed thresholds for distinguishing TB4 from TB5
 _TB4_MAX_SPEED_GTBS = 40  # TB4 is up to 40 Gb/s
 _TB5_MIN_SPEED_GTBS = 80  # TB5 starts at 80 Gb/s
+_MLX_CONFIG_RUN_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -53,6 +57,7 @@ def _import_mlx_config() -> Any:
 
     try:
         import mlx._distributed_utils.config as config
+
         return config
     except ImportError as exc:
         raise RuntimeError(
@@ -61,11 +66,41 @@ def _import_mlx_config() -> Any:
         ) from exc
 
 
+@contextmanager
+def _mlx_config_ssh_policy(config: Any):
+    """Make MLX's hard-coded ``ssh`` subprocess use the cluster policy."""
+
+    original_run = getattr(config, "run", None)
+    if original_run is None:
+        # Small test doubles and future MLX versions may inject transport by a
+        # different seam. Their own implementation remains authoritative.
+        yield
+        return
+
+    with _MLX_CONFIG_RUN_LOCK:
+
+        def policy_run(argv: list[str], *args: Any, **kwargs: Any):
+            if argv and str(argv[0]).rsplit("/", 1)[-1] in {"ssh", "scp"}:
+                argv = apply_cluster_ssh_policy(argv, connect_timeout=10)
+            return original_run(argv, *args, **kwargs)
+
+        config.run = policy_run
+        try:
+            yield
+        finally:
+            config.run = original_run
+
+
 def _run_ssh(ssh_hostname: str, command: str) -> str:
     """Run a command over SSH and return stdout."""
 
     result = subprocess.run(
-        ["ssh", ssh_hostname, command],
+        [
+            "ssh",
+            *cluster_ssh_options(connect_timeout=10),
+            ssh_hostname,
+            command,
+        ],
         capture_output=True,
         text=True,
         check=False,
@@ -164,7 +199,12 @@ def _rdma_devices(ssh_hostname: str) -> list[str]:
     if ssh_hostname in _LOCAL_HOSTS:
         command = ["ibv_devices"]
     else:
-        command = ["ssh", ssh_hostname, "ibv_devices"]
+        command = [
+            "ssh",
+            *cluster_ssh_options(connect_timeout=10),
+            ssh_hostname,
+            "ibv_devices",
+        ]
     try:
         result = subprocess.run(
             command, capture_output=True, text=True, check=False, timeout=30
@@ -223,9 +263,10 @@ def detect_transports(
 
     # Try Thunderbolt connectivity
     try:
-        tb_hosts, uuid_reverse_index = config.extract_connectivity(
-            mlx_hosts, verbose=False
-        )
+        with _mlx_config_ssh_policy(config):
+            tb_hosts, uuid_reverse_index = config.extract_connectivity(
+                mlx_hosts, verbose=False
+            )
         connectivity = config.make_connectivity_matrix(tb_hosts, uuid_reverse_index)
 
         # Extract transport info from the connectivity matrix
@@ -544,7 +585,12 @@ def _rdma_port_state(ssh_hostname: str, device: str) -> str | None:
 
     command = ["ibv_devinfo", "-d", device]
     if ssh_hostname not in _LOCAL_HOSTS:
-        command = ["ssh", ssh_hostname, *command]
+        command = [
+            "ssh",
+            *cluster_ssh_options(connect_timeout=10),
+            ssh_hostname,
+            *command,
+        ]
     try:
         result = subprocess.run(
             command, capture_output=True, text=True, check=False, timeout=30
@@ -578,7 +624,12 @@ def _interface_ip(ssh_hostname: str, interface: str) -> str | None:
 
     command = ["ifconfig", interface]
     if ssh_hostname not in _LOCAL_HOSTS:
-        command = ["ssh", ssh_hostname, *command]
+        command = [
+            "ssh",
+            *cluster_ssh_options(connect_timeout=10),
+            ssh_hostname,
+            *command,
+        ]
     try:
         result = subprocess.run(
             command, capture_output=True, text=True, check=False, timeout=30
@@ -631,10 +682,7 @@ def _remote_gui_authorize(host: str, shell_command: str) -> None:
         return subprocess.run(
             [
                 "ssh",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=10",
+                *cluster_ssh_options(connect_timeout=10),
                 host,
                 shlex.join(argv),
             ],
@@ -1078,7 +1126,12 @@ def _read(ssh_hostname: str, command: list[str]) -> str:
     """Run one read-only command on a host, returning "" when it cannot run."""
 
     if ssh_hostname not in _LOCAL_HOSTS:
-        command = ["ssh", ssh_hostname, *command]
+        command = [
+            "ssh",
+            *cluster_ssh_options(connect_timeout=10),
+            ssh_hostname,
+            *command,
+        ]
     try:
         result = subprocess.run(
             command, capture_output=True, text=True, check=False, timeout=30

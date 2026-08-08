@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Turn cluster failures into something a person can act on.
 
-Distributed setup fails in a handful of predictable ways — SSH not trusted yet,
+Distributed setup fails in a handful of predictable ways — an SSH identity changed,
 a model missing on the other Mac, versions out of step, a cable in the wrong
 port. The underlying errors are accurate and unreadable. This maps them to a
 title, a plain explanation, and concrete next steps.
@@ -75,15 +75,34 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
         ),
     ),
     (
-        re.compile(r"host key verification failed|no matching host key", re.I),
+        re.compile(
+            r"remote host identification has changed|"
+            r"offending .* host key|"
+            r"host key verification failed",
+            re.I,
+        ),
         Guidance(
-            "The other Mac isn't trusted yet",
-            "SSH refused the connection because this Mac has never seen the "
-            "peer's host key before.",
+            "The other Mac's saved identity changed",
+            "SSH refused the connection because this address now presents a "
+            "different key. oMLX records new addresses automatically but does "
+            "not overwrite an existing identity.",
             (
-                "Pair the two Macs using the copy/paste key above — pairing adds "
-                "the host key for you.",
-                "Or connect once manually in Terminal and accept the fingerprint.",
+                "Confirm the address still belongs to the expected Mac.",
+                "After verifying its fingerprint on that Mac, remove only the "
+                "stale entry with ssh-keygen -R, then retry pairing.",
+            ),
+            "pairing",
+        ),
+    ),
+    (
+        re.compile(r"no matching host key", re.I),
+        Guidance(
+            "The Macs could not agree on an SSH host key",
+            "The peer is reachable, but its SSH server did not offer a host-key "
+            "algorithm this Mac accepts.",
+            (
+                "Enable Remote Login again on the peer to refresh its SSH host keys.",
+                "Retry pairing after both Macs are updated to a current macOS release.",
             ),
             "pairing",
         ),

@@ -26,6 +26,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from .ssh_policy import cluster_ssh_options
+
 _LAYER = re.compile(r"(?:^|\.)(?:layers|h|blocks|block)\.(\d+)(?:\.|$)")
 _MAX_HEADER_BYTES = 64 * 1024 * 1024
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -623,7 +625,7 @@ def _finish_remote_staged_file(
         )
     )
     result = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", host, command],
+        ["ssh", *cluster_ssh_options(connect_timeout=10), host, command],
         capture_output=True,
         text=True,
         check=False,
@@ -642,8 +644,7 @@ def _discard_remote_staged_file(host: str, temporary_path: str) -> None:
     subprocess.run(
         [
             "ssh",
-            "-o",
-            "BatchMode=yes",
+            *cluster_ssh_options(connect_timeout=10),
             host,
             " ".join(
                 (
@@ -711,8 +712,7 @@ def scp_push(
     mkdir = subprocess.run(
         [
             "ssh",
-            "-o",
-            "BatchMode=yes",
+            *cluster_ssh_options(connect_timeout=10),
             destination_host,
             f"mkdir -p {remote_dir}",
         ],
@@ -739,8 +739,7 @@ def scp_push(
             [
                 "scp",
                 "-q",
-                "-o",
-                "BatchMode=yes",
+                *cluster_ssh_options(connect_timeout=10),
                 "-c",
                 cipher,
                 str(source),
@@ -824,8 +823,7 @@ def scp_copy(
                 [
                     "scp",
                     "-q",
-                    "-o",
-                    "BatchMode=yes",
+                    *cluster_ssh_options(connect_timeout=10),
                     "-c",
                     cipher,
                     f"{source_host}:{remote_source}",
@@ -846,8 +844,7 @@ def scp_copy(
         mkdir = subprocess.run(
             [
                 "ssh",
-                "-o",
-                "BatchMode=yes",
+                *cluster_ssh_options(connect_timeout=10),
                 destination_host,
                 f"mkdir -p {remote_destination}",
             ],
@@ -874,8 +871,7 @@ def scp_copy(
                     "scp",
                     "-3",
                     "-q",
-                    "-o",
-                    "BatchMode=yes",
+                    *cluster_ssh_options(connect_timeout=10),
                     "-c",
                     cipher,
                     f"{source_host}:{remote_source}",
@@ -1044,7 +1040,9 @@ def run_remote_python(
 
     result = subprocess.run(
         [
-            "ssh", "-o", "BatchMode=yes", ssh_target,
+            "ssh",
+            *cluster_ssh_options(connect_timeout=10),
+            ssh_target,
             f"{python_executable} -c {shlex.quote(snippet)} {shlex.quote(argument)}",
         ],
         capture_output=True,
@@ -1212,7 +1210,12 @@ def free_disk_bytes(path: str | Path, *, ssh_target: str | None = None) -> int:
         result = subprocess.run(
             # Unquoted so the remote shell expands ~; the path comes from a
             # validated model directory, not user text.
-            ["ssh", "-o", "BatchMode=yes", ssh_target, f"df -k {path} | tail -1"],
+            [
+                "ssh",
+                *cluster_ssh_options(connect_timeout=10),
+                ssh_target,
+                f"df -k {path} | tail -1",
+            ],
             capture_output=True,
             text=True,
             check=False,

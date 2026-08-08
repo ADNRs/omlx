@@ -47,6 +47,8 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any
 
+from .ssh_policy import cluster_ssh_options
+
 GiB = 1024**3
 
 # Enough for a browser, an editor, a chat client and the OS to stay responsive
@@ -239,7 +241,12 @@ def metal_cap_bytes(*, ssh_target: str | None = None, runner: Any = None) -> int
     runner = runner or subprocess.run
     command = ["sysctl", "-n", "iogpu.wired_limit_mb"]
     if ssh_target and ssh_target not in {"127.0.0.1", "localhost", "::1"}:
-        command = ["ssh", "-o", "BatchMode=yes", ssh_target, "sysctl -n iogpu.wired_limit_mb"]
+        command = [
+            "ssh",
+            *cluster_ssh_options(connect_timeout=10),
+            ssh_target,
+            "sysctl -n iogpu.wired_limit_mb",
+        ]
     try:
         result = runner(command, capture_output=True, text=True, timeout=15, check=False)
     except (OSError, subprocess.SubprocessError):
@@ -255,7 +262,12 @@ def installed_memory_bytes(*, ssh_target: str | None = None, runner: Any = None)
     runner = runner or subprocess.run
     command = ["sysctl", "-n", "hw.memsize"]
     if ssh_target and ssh_target not in {"127.0.0.1", "localhost", "::1"}:
-        command = ["ssh", "-o", "BatchMode=yes", ssh_target, "sysctl -n hw.memsize"]
+        command = [
+            "ssh",
+            *cluster_ssh_options(connect_timeout=10),
+            ssh_target,
+            "sysctl -n hw.memsize",
+        ]
     try:
         result = runner(command, capture_output=True, text=True, timeout=15, check=False)
     except (OSError, subprocess.SubprocessError):

@@ -35,6 +35,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .ssh_policy import cluster_ssh_options
+
 # A rank refreshes its marker on every phase change, while serving, and on a
 # fixed heartbeat interval even when idle (``RuntimeTelemetry``). Three missed
 # intervals distinguishes "busy with a long prefill" from "gone".
@@ -135,10 +137,7 @@ def probe_peer(
         result = runner(
             [
                 "ssh",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                f"ConnectTimeout={int(max(1, timeout))}",
+                *cluster_ssh_options(connect_timeout=timeout),
                 ssh_target,
                 "true",
             ],
@@ -203,10 +202,7 @@ def read_remote_marker(
         result = runner(
             [
                 "ssh",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                f"ConnectTimeout={int(max(1, timeout))}",
+                *cluster_ssh_options(connect_timeout=timeout),
                 ssh_target,
                 command,
             ],

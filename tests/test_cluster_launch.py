@@ -14,9 +14,9 @@ from omlx.cluster.deployment import ClusterDeployment, ClusterHost
 from omlx.cluster.launch import (
     DistributedLaunchError,
     _available_launch_ports,
-    _install_strict_ssh_wrapper,
+    _cluster_ssh_argv,
+    _install_cluster_ssh_wrapper,
     _local_runtime_versions,
-    _strict_ssh_argv,
     build_mlx_launch_argv,
     preflight_remote_hosts,
     probe_remote_host,
@@ -251,7 +251,7 @@ def test_supervisor_stop_reaps_group_when_launcher_already_exited(monkeypatch):
     assert supervisor.process is None
 
 
-def test_remote_preflight_uses_strict_noninteractive_ssh():
+def test_remote_preflight_uses_prompt_free_noninteractive_ssh():
     calls = []
     versions = _local_runtime_versions()
 
@@ -281,7 +281,9 @@ def test_remote_preflight_uses_strict_noninteractive_ssh():
     assert len(calls) == 1
     argv, kwargs = calls[0]
     assert "BatchMode=yes" in argv
-    assert "StrictHostKeyChecking=yes" in argv
+    assert "StrictHostKeyChecking=accept-new" in argv
+    assert "CheckHostIP=no" in argv
+    assert "LogLevel=ERROR" in argv
     # The control channel must not die of an idle timeout: both MiniMax runs
     # that reached ready lost their Studio rank to a dropped ssh session.
     assert "ServerAliveInterval=15" in argv
@@ -293,7 +295,7 @@ def test_remote_preflight_uses_strict_noninteractive_ssh():
     assert kwargs["check"] is False
 
 
-def test_remote_memory_probe_is_fast_and_uses_strict_ssh():
+def test_remote_memory_probe_is_fast_and_uses_prompt_free_ssh():
     calls = []
 
     def runner(argv, **kwargs):
@@ -314,7 +316,8 @@ def test_remote_memory_probe_is_fast_and_uses_strict_ssh():
     assert ceiling == 213 * 1024**3
     argv, kwargs = calls[0]
     assert "BatchMode=yes" in argv
-    assert "StrictHostKeyChecking=yes" in argv
+    assert "StrictHostKeyChecking=accept-new" in argv
+    assert "CheckHostIP=no" in argv
     assert "system_profiler" not in argv[-1]
     assert "127.0.0.1:9000/health" in argv[-1]
     assert kwargs["timeout"] == 8.0
@@ -336,22 +339,25 @@ def test_preflight_refuses_a_stage_above_the_live_rank_ceiling():
         )
 
 
-def test_launcher_wraps_every_upstream_ssh_call_with_strict_policy(tmp_path):
-    wrapper = _install_strict_ssh_wrapper(tmp_path)
+def test_launcher_wraps_every_upstream_ssh_call_with_cluster_policy(tmp_path):
+    wrapper = _install_cluster_ssh_wrapper(tmp_path)
     content = wrapper.read_text()
-    argv = _strict_ssh_argv("user@studio.local", "true")
+    argv = _cluster_ssh_argv("user@studio.local", "true")
 
     assert wrapper.name == "ssh"
     assert stat.S_IMODE(wrapper.stat().st_mode) == 0o700
     assert "BatchMode=yes" in content
     assert "ConnectTimeout=5" in content
-    assert "StrictHostKeyChecking=yes" in content
+    assert "StrictHostKeyChecking=accept-new" in content
+    assert "CheckHostIP=no" in content
+    assert "LogLevel=ERROR" in content
     assert "ServerAliveInterval=15" in content
     assert "ServerAliveCountMax=4" in content
     assert "TCPKeepAlive=yes" in content
     assert Path(argv[0]).is_absolute()
     assert "BatchMode=yes" in argv
-    assert "StrictHostKeyChecking=yes" in argv
+    assert "StrictHostKeyChecking=accept-new" in argv
+    assert "CheckHostIP=no" in argv
 
 
 def test_remote_preflight_rejects_runtime_drift():
@@ -474,7 +480,7 @@ def test_remote_preflight_rejects_an_incomplete_rank_stage(
         )
 
 
-def test_peer_probe_is_strict_and_reports_runtime_compatibility():
+def test_peer_probe_is_prompt_free_and_reports_runtime_compatibility():
     calls = []
     versions = _local_runtime_versions()
     status = {
@@ -510,7 +516,8 @@ def test_peer_probe_is_strict_and_reports_runtime_compatibility():
     assert result["runtime_compatible"] is True
     argv, kwargs = calls[0]
     assert "BatchMode=yes" in argv
-    assert "StrictHostKeyChecking=yes" in argv
+    assert "StrictHostKeyChecking=accept-new" in argv
+    assert "CheckHostIP=no" in argv
     assert kwargs["check"] is False
     assert "--route-to 192.168.5.1" in argv[-1]
 
