@@ -94,15 +94,67 @@ def test_cached_tokens_are_not_charged_twice():
     guard.check(150_000, cached_tokens=149_000, current_usage_bytes=4 * GiB)
 
 
-# --- The desync rule: only the rank that owns the request may reject. -------
+# --- The desync rule: all ranks vote and leave the request together. ---------
 
 
-def test_only_rank_zero_rejects():
-    """A raise on a follower rank strands its peers inside the collective."""
-
+def test_follower_ranks_guard_their_own_slice():
     follower = _guard(ceiling=1 * GiB, rank=1)
-    assert not follower.active
-    follower.check(500_000, current_usage_bytes=1 * GiB)  # must not raise
+    assert follower.active
+    with pytest.raises(PrefillMemoryExceededError):
+        follower.check(500_000, current_usage_bytes=1 * GiB)
+
+
+class _CollectiveValue:
+    def __init__(self, value):
+        self.value = value
+
+    def tolist(self):
+        return self.value
+
+
+class _CollectiveMX:
+    def __init__(self, *, rank, votes):
+        self._rank = rank
+        self._votes = votes
+        self.distributed = self
+
+    def init(self):
+        return self
+
+    def rank(self):
+        return self._rank
+
+    def size(self):
+        return len(self._votes)
+
+    def array(self, value):
+        return value
+
+    def all_sum(self, _value):
+        return _CollectiveValue(self._votes)
+
+
+def test_peer_rejection_makes_an_accepting_rank_leave_before_model_execution():
+    guard = _guard(ceiling=64 * GiB, rank=0)
+    mx = _CollectiveMX(rank=0, votes=[0, 1])
+
+    with pytest.raises(PrefillMemoryExceededError, match="rejected by rank 1"):
+        guard.check_collective(
+            2048,
+            current_usage_bytes=1 * GiB,
+            mx_module=mx,
+        )
+
+
+def test_collective_admission_allows_every_rank_to_continue():
+    guard = _guard(ceiling=64 * GiB, rank=1)
+    mx = _CollectiveMX(rank=1, votes=[0, 0])
+
+    guard.check_collective(
+        2048,
+        current_usage_bytes=1 * GiB,
+        mx_module=mx,
+    )
 
 
 def test_an_unreadable_model_disables_the_guard():

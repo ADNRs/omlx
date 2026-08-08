@@ -277,8 +277,16 @@ def test_server_patch_binds_batch_uid_and_restores_mlx_lm_classes(monkeypatch):
     import mlx_lm.server as mlx_server
 
     class FakeResponseGenerator:
+        def __init__(self):
+            self.model_provider = SimpleNamespace(model_key="model")
+            self.prompt_cache = mlx_server.LRUPromptCache()
+
         def _share_request(self, request):
             return request
+
+        def _tokenize(self, _tokenizer, _request, _args):
+            prompt = [1, 2, 3, 4]
+            return prompt, [prompt], ["assistant"], "normal"
 
     class FakeBatchGenerator:
         def __init__(self):
@@ -297,16 +305,35 @@ def test_server_patch_binds_batch_uid_and_restores_mlx_lm_classes(monkeypatch):
             self.removed.extend(uids)
             return "removed"
 
+    class FakePromptCache:
+        def fetch_nearest_cache(self, _model, tokens):
+            return "cache", tokens[2:]
+
+        def insert_cache(self, *args, **kwargs):
+            return None
+
+        def __len__(self):
+            return 1
+
+        @property
+        def nbytes(self):
+            return 64
+
     monkeypatch.setattr(
         mlx_server,
         "ResponseGenerator",
         FakeResponseGenerator,
     )
     monkeypatch.setattr(mlx_server, "BatchGenerator", FakeBatchGenerator)
+    monkeypatch.setattr(mlx_server, "LRUPromptCache", FakePromptCache)
     marker = _Marker()
     target = _Queue()
+    guard_calls = []
+    guard = SimpleNamespace(
+        check_collective=lambda *args, **kwargs: guard_calls.append((args, kwargs))
+    )
 
-    with install_server_telemetry(marker) as telemetry:
+    with install_server_telemetry(marker, prefill_guard=guard) as telemetry:
         generator = mlx_server.ResponseGenerator()
         queue, request, args = generator._share_request((target, "request", "args"))
         queue.put(
@@ -323,6 +350,16 @@ def test_server_patch_binds_batch_uid_and_restores_mlx_lm_classes(monkeypatch):
         assert progress["total"] == 3
         assert progress["active"] is True
         assert batch.remove([73]) == "removed"
+        assert generator._tokenize(None, None, None)[0] == [1, 2, 3, 4]
+        assert generator.prompt_cache.fetch_nearest_cache(
+            "model", [1, 2, 3, 4]
+        ) == (
+            "cache",
+            [3, 4],
+        )
+        assert guard_calls[0][0] == (4,)
+        assert guard_calls[0][1]["cached_tokens"] == 2
+        assert guard_calls[0][1]["mx_module"] is not None
         assert request == "request"
         assert args == "args"
         assert telemetry.snapshot()["requests_cancelled"] == 1

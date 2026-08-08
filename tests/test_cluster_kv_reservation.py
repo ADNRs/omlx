@@ -51,6 +51,38 @@ def test_head_dim_is_derived_when_absent():
     assert _kv_bytes_per_token_per_layer(config) == 8 * 512 * 2 * 2
 
 
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (
+            {
+                "num_attention_heads": 64,
+                "num_key_value_heads": 8,
+                "hidden_size": 8192,
+            },
+            8 * 128 * 2 * 2,
+        ),
+        (
+            {
+                "num_attention_heads": 40,
+                "hidden_size": 5120,
+            },
+            40 * 128 * 2 * 2,
+        ),
+    ],
+    ids=("qwen2.5-72b", "llama-13b"),
+)
+def test_large_hidden_sizes_without_head_dim_still_reserve_kv(config, expected):
+    """Real model widths above the count-field ceiling must not become zero KV."""
+
+    assert _kv_bytes_per_token_per_layer(config) == expected
+
+
+def test_non_divisible_hidden_size_is_not_rounded_down():
+    config = {"num_attention_heads": 8, "hidden_size": 4097}
+    assert _kv_bytes_per_token_per_layer(config) == 0
+
+
 def test_mla_models_are_not_over_counted():
     """GLM/DeepSeek store a latent key plus RoPE under one head.
 

@@ -705,14 +705,8 @@ def install_server_telemetry(
             return prompt_responses, generation_responses
 
     class TelemetryPromptCache(original_prompt_cache):
-        def fetch_nearest_cache(self, model: Any, tokens: list[int]) -> Any:
+        def _fetch_observed(self, model: Any, tokens: list[int]) -> Any:
             cache, rest = super().fetch_nearest_cache(model, tokens)
-            if prefill_guard is not None and prefill_guard.active:
-                # Before the first model() call, so a rejection cannot leave
-                # peer ranks blocked inside a collective this rank abandoned.
-                prefill_guard.check(
-                    len(tokens), cached_tokens=len(tokens) - len(rest)
-                )
             telemetry.observe_cache_lookup(
                 prompt_tokens=len(tokens),
                 remaining_tokens=len(rest),
@@ -720,6 +714,24 @@ def install_server_telemetry(
                 nbytes=self.nbytes,
             )
             return cache, rest
+
+        def prefetch_nearest_cache(self, model: Any, tokens: list[int]) -> Any:
+            """Look up once during caught preflight, then hand it to MLX-LM."""
+
+            result = self._fetch_observed(model, tokens)
+            self._omlx_prefetched: Any = ((model, tuple(tokens)), result)
+            return result
+
+        def discard_prefetched_cache(self) -> None:
+            self._omlx_prefetched = None
+
+        def fetch_nearest_cache(self, model: Any, tokens: list[int]) -> Any:
+            key = (model, tuple(tokens))
+            prefetched = getattr(self, "_omlx_prefetched", None)
+            self._omlx_prefetched = None
+            if prefetched is not None and prefetched[0] == key:
+                return prefetched[1]
+            return self._fetch_observed(model, tokens)
 
         def insert_cache(self, *args: Any, **kwargs: Any) -> Any:
             result = super().insert_cache(*args, **kwargs)
@@ -755,6 +767,31 @@ def install_server_telemetry(
                 return None
             response_queue, *rest = shared
             return _TelemetryQueue(response_queue, telemetry), *rest
+
+        def _tokenize(self, tokenizer: Any, request: Any, args: Any) -> Any:
+            tokenized = super()._tokenize(tokenizer, request, args)
+            if prefill_guard is None:
+                return tokenized
+
+            prompt = tokenized[0]
+            _cache, rest = self.prompt_cache.prefetch_nearest_cache(
+                self.model_provider.model_key,
+                prompt,
+            )
+            try:
+                # MLX-LM catches tokenization failures for batched requests.
+                # Keeping the rank vote inside that boundary rejects just this
+                # request; raising from its later cache lookup kills the whole
+                # generation thread.
+                prefill_guard.check_collective(
+                    len(prompt),
+                    cached_tokens=len(prompt) - len(rest),
+                    mx_module=mx,
+                )
+            except Exception:
+                self.prompt_cache.discard_prefetched_cache()
+                raise
+            return tokenized
 
         def _serve_single(self, request: Any) -> Any:
             # The coordinated context above makes every rank observe the same

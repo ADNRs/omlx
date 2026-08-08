@@ -16,11 +16,10 @@ rank holding 22 of 92 layers would be charged 4x its real KV growth and reject
 prompts it could serve. So the extracted dims are corrected: KV layers to the
 stage's layer count, attention heads to this rank's shard.
 
-**A raise must not desync the collective.** If one rank raises while the others
-enter the all-reduce, the survivors block forever and the deployment hangs —
-worse than the OOM. The guard therefore runs only where the request enters, on
-rank 0, before the first ``model()`` call. Rejecting there means no rank ever
-begins that prefill; the others simply keep waiting for the next request.
+**A raise must not desync the collective.** Every rank checks its own slice and
+then contributes a rejection vote before the first ``model()`` call. If any
+slice would exceed its local ceiling, every rank leaves the request together;
+otherwise every rank enters the model collectives together.
 """
 
 from __future__ import annotations
@@ -117,7 +116,7 @@ class RankPrefillGuard:
 
     @property
     def active(self) -> bool:
-        return self._monitor is not None and self._ceiling > 0 and self._rank == 0
+        return self._monitor is not None and self._ceiling > 0
 
     def check(
         self,
@@ -162,6 +161,74 @@ class RankPrefillGuard:
             )
             logger.warning("Cluster prefill rejected on %s: %s", where, exc)
             raise
+
+    def check_collective(
+        self,
+        num_prompt_tokens: int,
+        *,
+        cached_tokens: int = 0,
+        request_id: str | None = None,
+        current_usage_bytes: int | None = None,
+        mx_module: Any | None = None,
+    ) -> None:
+        """Make prefill admission one rank-agreed decision.
+
+        The request has already been broadcast by MLX-LM when its prompt cache
+        is consulted. A local raise at that point lets peer ranks continue into
+        the model collective and hang. Instead, every rank measures its own
+        resident slice, exchanges a one-hot rejection vote, and raises before
+        model execution if any rank refused the prompt.
+        """
+
+        from omlx.exceptions import PrefillMemoryExceededError
+
+        local_error: PrefillMemoryExceededError | None = None
+        try:
+            self.check(
+                num_prompt_tokens,
+                cached_tokens=cached_tokens,
+                request_id=request_id,
+                current_usage_bytes=current_usage_bytes,
+            )
+        except PrefillMemoryExceededError as exc:
+            local_error = exc
+
+        if mx_module is None:
+            import mlx.core as collective_mx
+        else:
+            collective_mx = mx_module
+
+        group = collective_mx.distributed.init()
+        world_size = int(group.size())
+        if world_size <= 1:
+            if local_error is not None:
+                raise local_error
+            return
+
+        rank = int(group.rank())
+        votes = [0] * world_size
+        if local_error is not None:
+            votes[rank] = 1
+        agreed_votes = collective_mx.distributed.all_sum(
+            collective_mx.array(votes)
+        ).tolist()
+        rejecting_ranks = [
+            index for index, rejected in enumerate(agreed_votes) if int(rejected)
+        ]
+        if not rejecting_ranks:
+            return
+        if local_error is not None:
+            raise local_error
+
+        rejecting = rejecting_ranks[0]
+        raise PrefillMemoryExceededError(
+            message=(
+                f"Cluster prefill rejected by rank {rejecting}: its local model "
+                "slice would exceed the host memory limit. Reduce context length "
+                "or free memory on that node."
+            ),
+            request_id=request_id,
+        )
 
 
 def build_guard(

@@ -14,7 +14,8 @@ Run the reference on one machine::
 Then the distributed run, from the coordinator::
 
     .venv/bin/mlx.launch --hostfile hostfile.json --backend ring \\
-        benchmarks/tp_identity_probe.py -- --model <path> --tokens 40 \\
+        -- .venv/bin/python benchmarks/tp_identity_probe.py \\
+        --model <path> --tokens 40 \\
         --tensor-parallel-size 2
 
 Rank 0 prints a JSON line with the token ids. Identical ids means the split is
@@ -26,6 +27,8 @@ from __future__ import annotations
 import argparse
 import json
 import time
+
+from omlx.cluster.tensor_strategies import apply_tensor_strategy
 
 
 def _greedy_token_ids(model, tokenizer, prompt: str, max_tokens: int) -> list[int]:
@@ -76,8 +79,6 @@ def main() -> int:
     import mlx.core as mx
     from mlx_lm import load
 
-    from omlx.cluster.inference_worker import _make_tensor_parallel_group, _shard_stage
-
     rank, world = 0, 1
     tp_group = None
     if args.tensor_parallel_size > 1:
@@ -88,7 +89,9 @@ def main() -> int:
                 f"world size {world} != tensor_parallel_size "
                 f"{args.tensor_parallel_size}; this probe uses one pipeline stage"
             )
-        tp_group = _make_tensor_parallel_group(group, args.tensor_parallel_size)
+        # This probe deliberately uses one pipeline stage, so the global group
+        # is exactly the tensor-parallel group used by the worker.
+        tp_group = group
 
     model, tokenizer = load(args.model)
     layer_count = len(model.model.layers)
@@ -96,7 +99,7 @@ def main() -> int:
     if tp_group is not None:
         # One pipeline stage: this rank holds every layer, sharded across the
         # tensor-parallel group. Exactly the path the cluster worker takes.
-        _shard_stage(model, tp_group, 0, layer_count)
+        apply_tensor_strategy(model, tp_group, mx_module=mx)
         mx.eval(model.parameters())
 
     started = time.perf_counter()

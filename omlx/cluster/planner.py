@@ -541,7 +541,21 @@ def _model_config(model_path: Path) -> dict[str, Any]:
     return _bounded_json_object(config_path, limit=_MAX_METADATA_FILE_BYTES)
 
 
-def _config_int(config: dict[str, Any], key: str, default: int) -> int:
+def _config_int(
+    config: dict[str, Any],
+    key: str,
+    default: int,
+    *,
+    maximum: int = 4096,
+) -> int:
+    """Read a positive bounded integer from the model's text config.
+
+    Most callers read counts or per-head dimensions, for which 4096 is a
+    useful corruption bound. Whole-model widths are routinely larger than
+    that, however, so those callers must opt into an appropriate ceiling
+    instead of silently treating a valid value as absent.
+    """
+
     candidates = [config]
     for nested in ("text_config", "language_config", "llm_config"):
         value = config.get(nested)
@@ -553,7 +567,7 @@ def _config_int(config: dict[str, Any], key: str, default: int) -> int:
             for candidate in candidates
             if isinstance((value := candidate.get(key)), int)
             and not isinstance(value, bool)
-            and 0 < value <= 4096
+            and 0 < value <= maximum
         ),
         default,
     )
@@ -728,8 +742,14 @@ def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
     kv_heads = _config_int(config, "num_key_value_heads", heads)
     head_dim = _config_int(config, "head_dim", 0)
     if head_dim <= 0:
-        hidden = _config_int(config, "hidden_size", 0)
-        head_dim = hidden // heads if hidden and heads else 0
+        hidden = _config_int(config, "hidden_size", 0, maximum=1_000_000)
+        head_dim = (
+            hidden // heads
+            if hidden and heads and hidden % heads == 0
+            else 0
+        )
+    if head_dim > 4096:
+        return 0
     if kv_heads <= 0 or head_dim <= 0:
         return 0
     return kv_heads * head_dim * 2 * dtype_size
