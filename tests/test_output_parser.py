@@ -1066,6 +1066,19 @@ class TestInklingOutputParserSession:
         visible.append(final.visible_text)
         return "".join(stream), "".join(visible), stopped, final
 
+    def _parse_tool_call_payload(self, payload):
+        token_map = {
+            1: "<|content_invoke_tool_json|>",
+            2: payload,
+            3: "<|end_message|>",
+            4: "<|content_model_end_sampling|>",
+        }
+        tokenizer, factory = self._factory(token_map)
+        session = factory.create_session(tokenizer)
+        _, _, stopped, final = self._run(session, [1, 2, 3, 4])
+        assert stopped
+        return final
+
     def test_thinking_then_text(self):
         token_map = {
             1: "<|content_thinking|>",
@@ -1112,6 +1125,54 @@ class TestInklingOutputParserSession:
         assert final.tool_calls[0]["name"] == "get_weather"
         assert json.loads(final.tool_calls[0]["arguments"]) == {"city": "Seoul"}
         assert final.finish_reason == "tool_calls"
+
+    def test_tool_call_accepts_json_encoded_arguments(self):
+        arguments = {
+            "city": "Chicago",
+            "guests": {"adults": 2, "children": 1},
+        }
+        payload = json.dumps(
+            {
+                "name": "book_hotel",
+                "arguments": json.dumps(arguments, separators=(",", ":")),
+            },
+            separators=(",", ":"),
+        )
+
+        final = self._parse_tool_call_payload(payload)
+
+        assert final.tool_calls[0]["name"] == "book_hotel"
+        assert json.loads(final.tool_calls[0]["arguments"]) == arguments
+        assert final.finish_reason == "tool_calls"
+
+    def test_tool_call_repairs_missing_outer_brace(self):
+        arguments = {
+            "city": "Chicago",
+            "guests": {"adults": 2, "children": 1},
+        }
+        payload = json.dumps(
+            {"name": "book_hotel", "args": arguments},
+            separators=(",", ":"),
+        )[:-1]
+
+        final = self._parse_tool_call_payload(payload)
+
+        assert final.tool_calls[0]["name"] == "book_hotel"
+        assert json.loads(final.tool_calls[0]["arguments"]) == arguments
+        assert final.finish_reason == "tool_calls"
+
+    def test_truncated_tool_call_ignores_braces_inside_strings(self):
+        for text in ("open { brace", "close } brace", 'quoted "} brace'):
+            payload = json.dumps(
+                {"name": "write", "args": {"text": text}},
+                separators=(",", ":"),
+            )[:-1]
+
+            final = self._parse_tool_call_payload(payload)
+
+            assert len(final.tool_calls) == 1, text
+            assert json.loads(final.tool_calls[0]["arguments"]) == {"text": text}
+            assert final.finish_reason == "tool_calls"
 
     def test_partial_marker_across_tokens(self):
         token_map = {

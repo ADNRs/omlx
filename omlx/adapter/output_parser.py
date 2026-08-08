@@ -702,6 +702,36 @@ def _is_inkling_model(
     return "inkling" in model_name.lower()
 
 
+def _append_missing_json_object_closers(payload: str) -> str | None:
+    """Append missing object closers without counting braces in strings."""
+    depth = 0
+    in_string = False
+    escaped = False
+
+    for char in payload:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            if depth == 0:
+                return None
+            depth -= 1
+
+    if in_string or depth <= 0:
+        return None
+    return payload + "}" * depth
+
+
 class _InklingChannelSplitter:
     """Streaming splitter for inkling's channel protocol.
 
@@ -922,10 +952,10 @@ class InklingOutputParserSession:
                 # args object short exactly one "}" before <|end_message|>).
                 # Brace-balance repair only runs after strict parsing failed,
                 # so well-formed payloads are never touched.
-                balance = payload.count("{") - payload.count("}")
-                if balance > 0:
+                repaired_payload = _append_missing_json_object_closers(payload)
+                if repaired_payload is not None:
                     try:
-                        parsed = json.loads(payload + "}" * balance)
+                        parsed = json.loads(repaired_payload)
                     except (json.JSONDecodeError, ValueError):
                         logger.debug("Inkling tool-call payload not valid JSON")
                         continue
