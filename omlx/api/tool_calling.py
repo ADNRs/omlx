@@ -1891,7 +1891,7 @@ class ToolCallStreamFilter:
         self._pending_start_marker = None
         self._reset_json_scan()
 
-    # -- Incremental JSON-object scan over a suppressed payload (#2507) -----
+    # -- Incremental JSON scan over a suppressed payload (#2507) ------------
     #
     # A close marker inside a JSON string argument must not end the envelope,
     # or the rest of the tool call is emitted as visible content mid-stream.
@@ -1900,7 +1900,9 @@ class ToolCallStreamFilter:
     # long tool calls. Model output is untrusted and attacker-influenceable, so
     # this module's rule is that parsing stays linear (see the bounds above
     # _GEMMA4_MAX_ARGS_LEN). This scanner therefore examines each character
-    # exactly once, carrying brace/string state across chunks.
+    # exactly once, carrying bracket/string state across chunks. It covers
+    # object payloads and ``[{...}]`` array payloads, matching the shapes the
+    # non-streaming parser accepts from ``_json_value_end``.
 
     def _reset_json_scan(self) -> None:
         self._json_state = "undecided"
@@ -1944,11 +1946,16 @@ class ToolCallStreamFilter:
                     return
                 if buffer[i] == "{":
                     self._json_state = "scanning"
+                elif buffer[i] == "[":
+                    # A leading '[' is either a JSON array of calls ("[{")
+                    # or the Hermes bracket dialect ([execute_code(...)]),
+                    # which never parses as JSON and must not be treated as
+                    # an unfinished value or the envelope is suppressed
+                    # forever. The next non-space character settles it.
+                    self._json_state = "array_head"
+                    self._json_depth = 1
+                    i += 1
                 else:
-                    # A leading '[' is the Hermes bracket dialect
-                    # ([execute_code(...)]), which never parses as JSON, so
-                    # treating it as an unfinished object would suppress the
-                    # envelope forever.
                     head_chunk = buffer[i:n]
 
             if head_chunk is not None:
@@ -1966,6 +1973,16 @@ class ToolCallStreamFilter:
                         "xml" if head == _XML_FUNCTION_OPEN else "not_json"
                     )
 
+        if self._json_state == "array_head":
+            while i < n and buffer[i] in " \t\r\n":
+                i += 1
+            if i >= n:
+                self._json_scan_off = i
+                return
+            # The scan loop consumes the '{' itself, raising the depth above
+            # the pending '[' so the array completes on its closing ']'.
+            self._json_state = "scanning" if buffer[i] == "{" else "not_json"
+
         if self._json_state != "scanning":
             self._json_scan_off = n
             return
@@ -1981,9 +1998,9 @@ class ToolCallStreamFilter:
                     self._json_in_string = False
             elif ch == '"':
                 self._json_in_string = True
-            elif ch == "{":
+            elif ch in "{[":
                 self._json_depth += 1
-            elif ch == "}":
+            elif ch in "}]":
                 self._json_depth -= 1
                 if self._json_depth == 0:
                     self._json_state = "complete"

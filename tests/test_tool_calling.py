@@ -1260,6 +1260,65 @@ def test_embedded_close_marker_still_bounds_the_envelope():
     assert visible == "Before  After"
 
 
+@pytest.mark.parametrize("chunk_size", [0, 1, 7])
+def test_array_payload_with_embedded_close_marker_is_suppressed(chunk_size):
+    """A ``[{...}]`` array payload gets the same #2507 protection as an object.
+
+    Classifying every leading ``[`` as the Hermes bracket dialect made the
+    filter fall back to first-marker splitting, so an embedded close marker
+    leaked the array's tail as visible content while the non-streaming parser
+    recovered the call.
+    """
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        'A <tool_call>[{"name":"f","arguments":'
+        '{"s":"a </tool_call> b"}}]</tool_call> AFTER'
+    )
+
+    visible = _feed_chunked(f, text, chunk_size) + f.finish()
+
+    assert visible == "A  AFTER"
+    assert f.take_recovery_candidate() == ""
+
+
+def test_array_payload_with_leading_whitespace_is_suppressed():
+    """Whitespace between ``[`` and ``{`` still classifies as a JSON array."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        'A <tool_call>[ {"name":"f","arguments":'
+        '{"s":"</tool_call>"}} ]</tool_call> AFTER'
+    )
+
+    visible = "".join(f.feed(ch) for ch in text) + f.finish()
+
+    assert visible == "A  AFTER"
+    assert f.take_recovery_candidate() == ""
+
+
+def test_unterminated_array_payload_becomes_recovery_candidate():
+    """An array payload that never closes stays withheld like an object."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+
+    visible = "".join(f.feed(ch) for ch in 'A <tool_call>[{"x"') + f.finish()
+
+    assert visible == "A "
+    assert f.take_recovery_candidate() == '<tool_call>[{"x"'
+
+
+def test_object_payload_with_nested_array_and_embedded_marker():
+    """Array depth tracking must not break object payloads with inner arrays."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        'A <tool_call>{"name":"f","arguments":'
+        '{"a":[1,2],"s":"</tool_call>"}}</tool_call> AFTER'
+    )
+
+    visible = "".join(f.feed(ch) for ch in text) + f.finish()
+
+    assert visible == "A  AFTER"
+    assert f.take_recovery_candidate() == ""
+
+
 def test_payload_without_any_close_marker_is_still_withheld():
     """No close marker at all means the envelope tail stays hidden."""
     f = ToolCallStreamFilter(_make_tokenizer())
