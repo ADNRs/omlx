@@ -324,9 +324,14 @@ _CACHELIST_NON_SLICEABLE_SUB_CLASSES = frozenset(
 
 _ARRAYS_SUB_CLASSES = frozenset({"ArraysCache", "SizedArraysCache"})
 _POOLING_SUB_CLASSES = frozenset({"PoolingCache", "BatchPoolingCache"})
-_PM_SLICEABLE_SUB_CLASSES = frozenset(
-    {"KVCache", "BatchKVCache", "QuantizedKVCache"}
-)
+# Sliceable KV sub-cache classes inside a CacheList (4D sequence tensors).
+# Shared with prefix_cache.cachelist_pm_member_plan (single source so the
+# class-level expectation and the shape-level store plan cannot drift).
+# QuantizedKVCache is deliberately absent: its state elements are tuples of
+# packed/scale/bias arrays, so the 4D shape plan can never classify it as
+# sliceable — listing it here would stamp an @pm expectation that stores can
+# never satisfy, sweeping every block on each restart.
+_PM_SLICEABLE_SUB_CLASSES = frozenset({"KVCache", "BatchKVCache"})
 
 # Storage-layout token appended to a mixed CacheList layer's subtype
 # descriptor when the layer uses per-member block storage. Part of the

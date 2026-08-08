@@ -31,15 +31,11 @@ from .paged_cache import (
     compute_block_hash,
     resolve_block_extra_keys,
 )
-from .paged_ssd_cache import PagedSSDCacheManager
+from .paged_ssd_cache import _PM_SLICEABLE_SUB_CLASSES, PagedSSDCacheManager
 from .pooling_delta import POOLING_CACHE_DELTA_CLASS
 from .stats import PrefixCacheStats
 from .type_registry import CacheTypeRegistry
 
-# Sliceable KV sub-cache classes inside a CacheList (4D sequence tensors).
-_PM_SLICEABLE_SUB_CLASSES = frozenset(
-    {"KVCache", "BatchKVCache", "QuantizedKVCache"}
-)
 # Non-sliceable CacheList member classes safe for per-member block storage.
 # PoolingCache (delta chains) and rotating families keep the legacy
 # cumulative path; ArraysCache state is small, positionless, and
@@ -659,6 +655,26 @@ class BlockAwarePrefixCache(CacheManager):
                 )
                 if type_name != "CacheList":
                     continue
+                state_list = layer_state.get("state")
+                if isinstance(state_list, list) and any(
+                    isinstance(ss, (list, tuple)) and len(ss) == 0
+                    for ss in state_list
+                ):
+                    # A CacheList store source with a blanked member has no
+                    # storable state for that sub (a member-filtered snapshot
+                    # promoted without refill). The legacy branch would
+                    # silently drop the sub, and the short-payload blocks
+                    # then poison this prefix through token-hash dedup, so
+                    # refuse the whole store.
+                    logger.warning(
+                        "store_cache aborted for %s: CacheList layer has a "
+                        "blanked member state; refusing to store a partial "
+                        "composite",
+                        request_id,
+                    )
+                    return None
+                if pm_layers_present:
+                    continue
                 names = layer_state.get("sub_class_names") or []
                 if not names:
                     meta = layer_state.get("meta_state")
@@ -675,7 +691,6 @@ class BlockAwarePrefixCache(CacheManager):
                     is not None
                 ):
                     pm_layers_present = True
-                    break
         require_contiguous_pooling_snapshots = bool(
             boundary_snapshots
         ) and _contains_pooling_cache_state(cache_data)
@@ -2676,7 +2691,10 @@ class BlockAwarePrefixCache(CacheManager):
                                                 c.shape[2] for c in column
                                             )
                                             cat_elements.append(
-                                                mx.zeros(tuple(shape))
+                                                mx.zeros(
+                                                    tuple(shape),
+                                                    dtype=first.dtype,
+                                                )
                                             )
                                         else:
                                             cat_elements.append(

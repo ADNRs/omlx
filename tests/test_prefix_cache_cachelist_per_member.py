@@ -431,3 +431,38 @@ def test_decode_snapshot_fallback_filters_kv(tmp_path):
     assert extracted[0]["state"][0] == (), "KV member must be blanked"
     conv_slot0 = extracted[0]["state"][1][0]
     assert mx.max(mx.abs(conv_slot0 - BLOCK_SIZE)).item() == 0.0
+
+
+def test_store_refuses_blanked_member_source(tmp_path):
+    """Parser-stop regression (#2550 follow-up): a store source whose KV
+    member is still blanked (member-filtered snapshot promoted without
+    refill) must refuse to store entirely. The legacy branch used to drop
+    the blanked sub silently, and the short-payload blocks then poisoned
+    the prefix for the whole session via token-hash dedup."""
+    cache, ssd = _make_cache(tmp_path)
+    num_blocks = 3
+    tokens = list(range(num_blocks * BLOCK_SIZE))
+
+    table = cache.store_cache(
+        "req-blank-source",
+        tokens,
+        _cache_data(len(tokens), blank_kv=True),
+        boundary_snapshots=_boundary_snapshots(num_blocks, blank_kv=True),
+    )
+    assert table is None
+
+    # The refused store must leave nothing behind: a proper store of the
+    # same tokens builds a clean pm chain that restores.
+    table2 = _store_blocks(cache, num_blocks, request_id="req-proper")
+    assert table2 is not None
+    assert len(table2.block_ids) == num_blocks
+    for bid in table2.block_ids:
+        block = cache.paged_cache.allocated_blocks[bid]
+        payload, _ = ssd.load_block_with_metadata(block.block_hash)
+        layer = payload[0]
+        assert (
+            isinstance(layer, tuple) and layer[0] == "__cache_list_pm__"
+        ), "refused store must not leave short-payload legacy blocks behind"
+    _assert_restored(
+        cache.reconstruct_cache(table2), expected_seq_len=num_blocks * BLOCK_SIZE
+    )
