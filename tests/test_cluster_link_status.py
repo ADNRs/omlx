@@ -25,6 +25,7 @@ from omlx.cluster.transport import (
     resolve_link_addresses,
     select_backend,
     shared_link_addresses,
+    verify_link_reachability,
 )
 
 HOSTS = ("127.0.0.1", "Studio.local")
@@ -116,6 +117,21 @@ def test_no_peers_is_not_reported_as_a_failure():
     assert status.commands == ()
 
 
+def test_failed_peer_probe_is_not_mislabeled_as_rdma_disabled(monkeypatch):
+    def rejected(_host):
+        raise RuntimeError("SSH permission denied")
+
+    monkeypatch.setattr("omlx.cluster.transport._rdma_devices", rejected)
+
+    status = assess_link(HOSTS)
+
+    assert status.state == "unknown"
+    assert status.ready is False
+    assert status.title == "Could not verify the peer's RDMA state"
+    assert "SSH permission denied" in status.detail
+    assert status.commands == ()
+
+
 def test_routable_rdma_fabric_overrides_stale_port_down_state(monkeypatch):
     """The address path is stronger evidence than stale ibv PORT_DOWN."""
 
@@ -149,6 +165,99 @@ def test_routable_rdma_fabric_overrides_stale_port_down_state(monkeypatch):
     assert status.ready is True
     assert "en6" in status.detail
     assert "en5" in status.detail
+
+
+def test_link_status_does_not_call_unreachable_rdma_addresses_ready(monkeypatch):
+    monkeypatch.setattr(
+        "omlx.cluster.transport._rdma_devices",
+        lambda host: ["rdma_en6"] if host == HOSTS[0] else ["rdma_en5"],
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.transport._active_rdma_port",
+        lambda host: "en6" if host == HOSTS[0] else "en5",
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.transport._interface_ip",
+        lambda host, _interface: "10.0.1.1" if host == HOSTS[0] else "10.0.1.2",
+    )
+    interfaces = {
+        HOSTS[0]: _host(HOSTS[0], [("en6", "10.0.1.1", 30)], rdma=("en6",)),
+        HOSTS[1]: _host(HOSTS[1], [("en5", "10.0.1.2", 30)], rdma=("en5",)),
+    }
+
+    status = assess_link(
+        HOSTS,
+        probe=interfaces.__getitem__,
+        verify=lambda _link: (False, "the peer did not answer"),
+    )
+
+    assert status.state == "thunderbolt"
+    assert status.ready is False
+    assert status.backend == "ring"
+    assert "did not answer" in status.detail
+
+
+def test_link_status_reports_verified_ethernet_when_rdma_does_not_answer(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "omlx.cluster.transport._rdma_devices",
+        lambda host: ["rdma_en6"] if host == HOSTS[0] else ["rdma_en5"],
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.transport._active_rdma_port",
+        lambda host: "en6" if host == HOSTS[0] else "en5",
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.transport._interface_ip",
+        lambda host, _interface: "10.0.1.1" if host == HOSTS[0] else "10.0.1.2",
+    )
+    interfaces = {
+        HOSTS[0]: _host(
+            HOSTS[0],
+            [("en6", "10.0.1.1", 30), ("en0", "192.168.4.21", 24)],
+            rdma=("en6",),
+        ),
+        HOSTS[1]: _host(
+            HOSTS[1],
+            [("en5", "10.0.1.2", 30), ("en0", "192.168.4.22", 24)],
+            rdma=("en5",),
+        ),
+    }
+
+    status = assess_link(
+        HOSTS,
+        probe=interfaces.__getitem__,
+        verify=lambda link: (link.kind == "ethernet", "RDMA did not answer"),
+    )
+
+    assert status.state == "ethernet"
+    assert status.ready is True
+    assert status.backend == "ring"
+    assert "192.168.4.21" in status.detail
+    assert "verified path" in status.detail
+
+
+def test_link_status_does_not_call_an_unverified_network_route_ready(monkeypatch):
+    monkeypatch.setattr("omlx.cluster.transport._rdma_devices", lambda _host: [])
+    monkeypatch.setattr(
+        "omlx.cluster.transport._active_rdma_port", lambda _host: None
+    )
+    interfaces = {
+        HOSTS[0]: _host(HOSTS[0], [("en0", "192.168.4.21", 24)]),
+        HOSTS[1]: _host(HOSTS[1], [("en0", "192.168.4.22", 24)]),
+    }
+
+    status = assess_link(
+        HOSTS,
+        probe=interfaces.__getitem__,
+        verify=lambda _link: (False, "the peer did not answer"),
+    )
+
+    assert status.state == "unknown"
+    assert status.ready is False
+    assert status.backend == "ring"
+    assert "unverified address" in status.detail
 
 
 def test_gui_setup_addresses_only_the_missing_endpoint(monkeypatch):
@@ -588,6 +697,92 @@ def test_resolving_a_link_reads_both_hosts_instead_of_a_written_address():
 
     assert probed == ["127.0.0.1", "Studio.local"]
     assert link.source.address == "10.0.1.1"
+
+
+def test_resolving_a_link_can_reject_an_unreachable_shared_subnet():
+    hosts = {"127.0.0.1": _laptop(), "Studio.local": _studio()}
+
+    link = resolve_link_addresses(
+        "127.0.0.1",
+        "Studio.local",
+        probe=hosts.__getitem__,
+        verify=lambda _link: (False, "the peer did not answer on that address"),
+    )
+
+    assert not link.ok
+    assert link.kind == "rdma"
+    assert "did not answer" in link.reason
+
+
+def test_resolving_a_link_falls_back_to_a_verified_ethernet_path():
+    hosts = {
+        "127.0.0.1": _host(
+            "127.0.0.1",
+            [("en4", "10.0.1.1", 30), ("en0", "192.168.4.21", 24)],
+            rdma=("en4",),
+            thunderbolt=("en4",),
+        ),
+        "Studio.local": _host(
+            "Studio.local",
+            [("en5", "10.0.1.2", 30), ("en0", "192.168.4.22", 24)],
+            rdma=("en5",),
+            thunderbolt=("en5",),
+        ),
+    }
+    checked = []
+
+    def verify(link):
+        checked.append(link.kind)
+        return (link.kind == "ethernet", f"{link.kind} did not answer")
+
+    link = resolve_link_addresses(
+        "127.0.0.1",
+        "Studio.local",
+        probe=hosts.__getitem__,
+        verify=verify,
+    )
+
+    assert checked == ["rdma", "ethernet"]
+    assert link.ok
+    assert link.kind == "ethernet"
+    assert link.source.address == "192.168.4.21"
+    assert link.peer.address == "192.168.4.22"
+
+
+def test_link_verification_checks_route_and_ping_from_both_macs():
+    link = shared_link_addresses(_laptop(), _studio())
+    calls = []
+
+    def runner(host, command):
+        calls.append((host, tuple(command)))
+        if command[0] == "/sbin/route":
+            interface = "en4" if host == "127.0.0.1" else "en5"
+            return subprocess.CompletedProcess(command, 0, f"interface: {interface}\n", "")
+        return subprocess.CompletedProcess(command, 0, "one packet received\n", "")
+
+    verified, reason = verify_link_reachability(link, runner=runner)
+
+    assert verified is True
+    assert reason == link.reason
+    assert [command[0] for _, command in calls] == [
+        "/sbin/route",
+        "/sbin/ping",
+        "/sbin/route",
+        "/sbin/ping",
+    ]
+
+
+def test_link_verification_rejects_a_route_on_the_wrong_interface():
+    link = shared_link_addresses(_laptop(), _studio())
+
+    def runner(_host, command):
+        return subprocess.CompletedProcess(command, 0, "interface: en0\n", "")
+
+    verified, reason = verify_link_reachability(link, runner=runner)
+
+    assert verified is False
+    assert "uses en0" in reason
+    assert "en4" in reason
 
 
 def test_the_detected_link_speed_is_carried_into_the_explanation():

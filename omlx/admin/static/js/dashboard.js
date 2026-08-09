@@ -928,15 +928,30 @@
 
             async clusterResponseError(response, fallback) {
                 const payload = await response.json().catch(() => ({}));
-                const detail = payload.detail;
-                const message = Array.isArray(detail)
-                    ? detail.map(item => item?.msg || String(item)).join(', ')
-                    : (detail || fallback);
+                const message = this.clusterErrorMessage(payload.detail, fallback);
                 // Fetch recovery steps for the failure the user is about to see.
                 // Fire-and-forget: guidance is an improvement on the raw message,
                 // never a precondition for showing it.
                 this.explainClusterError(message);
                 return message;
+            },
+
+            clusterErrorMessage(detail, fallback = 'Something went wrong') {
+                if (!Array.isArray(detail)) {
+                    if (detail && typeof detail === 'object') {
+                        return detail.msg || detail.message || JSON.stringify(detail);
+                    }
+                    return String(detail || fallback);
+                }
+                const messages = detail.map(item => {
+                    if (!item || typeof item !== 'object') return String(item);
+                    const location = Array.isArray(item.loc)
+                        ? item.loc.filter(part => part !== 'body').join('.')
+                        : '';
+                    const message = item.msg || item.message || JSON.stringify(item);
+                    return location ? `${location}: ${message}` : message;
+                });
+                return messages.filter(Boolean).join(', ') || fallback;
             },
 
             async explainClusterError(message) {
@@ -1262,7 +1277,6 @@
                 }
                 this.clusterPeerProbeLoading = true;
                 this.clusterPeerProbe = null;
-                this.clusterError = '';
                 try {
                     const request = { ssh };
                     if (this.clusterLocalIp.trim()) request.route_to = this.clusterLocalIp.trim();
@@ -1279,6 +1293,11 @@
                         throw new Error(await this.clusterResponseError(response, 'Peer probe failed'));
                     }
                     const result = await response.json();
+                    // Keep the previous actionable failure mounted while an
+                    // automatic retry is in flight. Clearing it before SSH
+                    // answers made the whole page jump every ten seconds.
+                    this.clusterError = '';
+                    this.dismissClusterGuidance();
                     this.clusterPeerProbe = result;
                     this.clusterPeerProbes = {
                         ...(this.clusterPeerProbes || {}),
@@ -1288,11 +1307,18 @@
                     const status = result.status || {};
                     const node = status.node || {};
                     if (this.clusterPlanNodes[1]) {
+                        this.clusterPlanNodes[1].ssh = ssh;
                         this.clusterPlanNodes[1].node_id = node.hostname || this.clusterPlanNodes[1].node_id;
-                        if (Number(node.recommended_working_set_bytes) > 0) {
+                        const exactCapacity = Number(
+                            node.admission_ceiling_bytes
+                            || node.recommended_working_set_bytes
+                            || 0
+                        );
+                        if (exactCapacity > 0) {
                             this.clusterPlanNodes[1].capacity_gib = Number(
-                                (node.recommended_working_set_bytes / (1024 ** 3)).toFixed(2)
+                                (exactCapacity / (1024 ** 3)).toFixed(2)
                             );
+                            this.clusterPlanNodes[1].capacity_bytes = exactCapacity;
                         }
                     }
                     await this.$nextTick();
@@ -1383,22 +1409,37 @@
                 this.clusterModelInventory = null;
                 this.clusterCatalogue = null;
                 const gib = 1024 ** 3;
-                const localCapacity = Number(
-                    this.clusterStatus?.node?.recommended_working_set_bytes || 0
-                ) / gib;
+                const localCapacityBytes = Number(
+                    this.clusterStatus?.node?.admission_ceiling_bytes
+                    || this.clusterStatus?.node?.recommended_working_set_bytes
+                    || 0
+                );
+                const localCapacity = localCapacityBytes / gib;
                 const existing = new Map(
                     (this.clusterPlanNodes || []).map(node => [node.node_id, node])
                 );
+                const existingBySsh = new Map(
+                    (this.clusterPlanNodes || [])
+                        .filter(node => String(node.ssh || '').trim())
+                        .map(node => [String(node.ssh).trim(), node])
+                );
                 const localName = this.clusterStatus?.node?.hostname || 'this-mac';
-                const local = existing.get(localName) || this.clusterPlanNodes?.[0] || {};
+                const local = existingBySsh.get('127.0.0.1')
+                    || existing.get(localName)
+                    || this.clusterPlanNodes?.[0]
+                    || {};
                 const nodes = [{
                     ...local,
                     key: local.key || 1,
                     node_id: localName,
+                    ssh: '127.0.0.1',
                     capacity_gib: localCapacity > 0
                         ? Number(localCapacity.toFixed(2))
-                        : Number(local.capacity_gib || 64),
-                    reserve_gib: Number(local.reserve_gib || 8),
+                        : Number(local.capacity_gib || 0),
+                    capacity_bytes: localCapacityBytes > 0
+                        ? localCapacityBytes
+                        : Number(local.capacity_bytes || 0),
+                    reserve_gib: Number(local.reserve_gib || 0),
                     role: 'workstation',
                 }];
                 this.clusterWorkerPeers().forEach((peer, index) => {
@@ -1406,13 +1447,40 @@
                         peer.name || peer.ssh,
                         `worker-${index + 1}`,
                     );
-                    const previous = existing.get(nodeId) || {};
+                    const namedPrevious = existing.get(nodeId);
+                    const previous = existingBySsh.get(peer.ssh)
+                        || (
+                            namedPrevious && !String(namedPrevious.ssh || '').trim()
+                                ? namedPrevious
+                                : {}
+                        );
+                    const hardware = this.clusterPeerProbes?.[peer.ssh]?.status?.node || {};
+                    const exactCapacityBytes = Number(
+                        hardware.admission_ceiling_bytes
+                        || peer.admission_ceiling_bytes
+                        || previous.capacity_bytes
+                        || 0
+                    );
+                    const displayCapacityBytes = exactCapacityBytes || Number(
+                        hardware.recommended_working_set_bytes
+                        || peer.recommended_working_set_bytes
+                        || 0
+                    );
                     nodes.push({
                         ...previous,
                         key: previous.key || (index + 2),
                         node_id: nodeId,
-                        capacity_gib: Number(previous.capacity_gib || 64),
-                        reserve_gib: Number(previous.reserve_gib || 8),
+                        ssh: peer.ssh,
+                        // Unknown is shown as unknown. The old 64 - 8 GiB
+                        // placeholder became a confident-looking “56 GiB
+                        // usable” warning whenever SSH had not answered yet.
+                        capacity_gib: displayCapacityBytes > 0
+                            ? Number((displayCapacityBytes / gib).toFixed(2))
+                            : 0,
+                        capacity_bytes: exactCapacityBytes,
+                        reserve_gib: displayCapacityBytes > 0
+                            ? Number(previous.reserve_gib || 0)
+                            : 0,
                         role: 'headless',
                     });
                 });
@@ -1961,6 +2029,9 @@
                                     recommended_working_set_bytes: Number(
                                         node.recommended_working_set_bytes || 0
                                     ),
+                                    admission_ceiling_bytes: Number(
+                                        node.admission_ceiling_bytes || 0
+                                    ),
                                 },
                             },
                         };
@@ -1984,6 +2055,9 @@
                         link_speed_gbps: Number(peer?.link_speed_gbps) || null,
                         recommended_working_set_bytes: Number(
                             peer?.recommended_working_set_bytes || 0
+                        ),
+                        admission_ceiling_bytes: Number(
+                            peer?.admission_ceiling_bytes || 0
                         ),
                         physical_memory_bytes: Number(
                             peer?.physical_memory_bytes || 0
@@ -2010,6 +2084,9 @@
                             ),
                             recommended_working_set_bytes: Number(
                                 node.recommended_working_set_bytes || 0
+                            ),
+                            admission_ceiling_bytes: Number(
+                                node.admission_ceiling_bytes || 0
                             ),
                         };
                     });
@@ -3531,39 +3608,47 @@
                 return (this.clusterPlanNodes || [])
                     .slice(0, quickNodes.length)
                     .map((budget, index) => {
-                    const quick = quickNodes[index] || {};
-                    const capacityGiB = Math.max(0, Number(budget.capacity_gib || 0));
-                    const reserveGiB = Math.max(0, Number(budget.reserve_gib || 0));
-                    const measuredAutomaticReserve = Number(
-                        budget.automatic_reserve_gib
-                    );
-                    const automaticReserveGiB = (
-                        Number.isFinite(measuredAutomaticReserve)
-                        && measuredAutomaticReserve >= 0
-                    )
-                        ? Math.min(capacityGiB, measuredAutomaticReserve)
-                        : Math.min(capacityGiB, reserveGiB);
-                    return {
-                        budget,
-                        nodeId: budget.node_id || `mac-${index}`,
-                        name: quick.name || budget.node_id || `Mac ${index + 1}`,
-                        chip: quick.chip || '',
-                        physicalMemory: Number(quick.physicalMemory || 0),
-                        capacityGiB,
-                        reserveGiB,
-                        usableGiB: Math.max(0, capacityGiB - reserveGiB),
-                        automaticReserveGiB,
-                        minGiB: Math.min(capacityGiB, 4),
-                        physicalGiB: Math.max(
+                        const quick = quickNodes[index] || {};
+                        const capacityGiB = Math.max(
                             0,
-                            Number(quick.physicalMemory || 0) / (1024 ** 3)
-                        ),
-                    };
-                }).filter(node => node.capacityGiB > 0);
+                            Number(budget.capacity_gib || 0),
+                        );
+                        const reserveGiB = Math.max(
+                            0,
+                            Number(budget.reserve_gib || 0),
+                        );
+                        const measuredAutomaticReserve = Number(
+                            budget.automatic_reserve_gib
+                        );
+                        const automaticReserveGiB = (
+                            Number.isFinite(measuredAutomaticReserve)
+                            && measuredAutomaticReserve >= 0
+                        )
+                            ? Math.min(capacityGiB, measuredAutomaticReserve)
+                            : Math.min(capacityGiB, reserveGiB);
+                        return {
+                            budget,
+                            nodeId: budget.node_id || `mac-${index}`,
+                            name: quick.name || budget.node_id || `Mac ${index + 1}`,
+                            chip: quick.chip || '',
+                            physicalMemory: Number(quick.physicalMemory || 0),
+                            capacityGiB,
+                            reserveGiB,
+                            usableGiB: Math.max(0, capacityGiB - reserveGiB),
+                            automaticReserveGiB,
+                            minGiB: Math.min(capacityGiB, 4),
+                            physicalGiB: Math.max(
+                                0,
+                                Number(quick.physicalMemory || 0) / (1024 ** 3)
+                            ),
+                        };
+                    });
             },
 
             clusterMemoryAllowanceNodes() {
-                return this.clusterMemoryNodes();
+                return this.clusterMemoryNodes().filter(
+                    node => node.capacityGiB > 0
+                );
             },
 
             clusterMemoryAllowanceCustomized() {
@@ -3673,23 +3758,36 @@
             },
 
             clusterEffectiveTransportState() {
-                if (this.clusterFabric?.rdma?.ok) return 'rdma_ready';
+                if (
+                    !this.clusterIpsOverridden
+                    && this.clusterFabric?.backend === 'jaccl'
+                    && this.clusterFabric?.rdma?.ok
+                ) {
+                    return 'rdma_ready';
+                }
                 if (this.clusterPeerConnected()) return 'peer_linked_config_pending';
                 return this.clusterStatus?.transport?.state || 'unknown';
             },
 
             clusterConnectionLabel() {
+                if (this.clusterIpsOverridden) return 'Manual TCP route';
                 const physical = (
                     this.clusterStatus?.transport?.thunderbolt?.ports || []
                 ).find(port => port.peer_connected);
                 if (physical?.speed) return physical.speed;
-                if (this.clusterFabric?.rdma?.ok) return 'Thunderbolt RDMA';
+                if (
+                    this.clusterFabric?.backend === 'jaccl'
+                    && this.clusterFabric?.rdma?.ok
+                ) return 'Thunderbolt RDMA';
                 return this.clusterPeerConnected() ? 'Direct link' : 'Not connected';
             },
 
             clusterFriendlyConnectionLabel() {
                 if (this.clusterFabricLoading || this.clusterLinkStatusLoading) {
                     return 'Checking Thunderbolt…';
+                }
+                if (this.clusterIpsOverridden) {
+                    return 'TCP ring · manual addresses';
                 }
                 const classified = String(this.clusterLinkStatus?.link_label || '').trim();
                 if (classified) return classified.replace(' at ', ' · ');
@@ -3700,7 +3798,10 @@
                 const speed = Number(discovered?.link_speed_gbps || 0);
                 if (speed >= 80) return `Thunderbolt 5 · ${speed} Gb/s`;
                 if (speed >= 40) return `Thunderbolt 4 · ${speed} Gb/s`;
-                if (this.clusterFabric?.rdma?.ok) return 'Thunderbolt RDMA';
+                if (
+                    this.clusterFabric?.backend === 'jaccl'
+                    && this.clusterFabric?.rdma?.ok
+                ) return 'Thunderbolt RDMA';
                 const physical = (
                     this.clusterStatus?.transport?.thunderbolt?.ports || []
                 ).find(port => port.peer_connected);
@@ -3725,23 +3826,18 @@
                 if (count === 1) {
                     return `${this.clusterStatus?.node?.hostname || 'This Mac'} · coordinator`;
                 }
-                const link = this.clusterFabric?.backend === 'jaccl'
-                    ? 'Thunderbolt RDMA'
-                    : (this.clusterTransports?.transports?.[0]
-                        ? this.clusterTransportLabel(this.clusterTransports.transports[0])
-                        : 'direct link');
+                const link = this.clusterIpsOverridden
+                    ? 'TCP ring · manual addresses'
+                    : (this.clusterFabric?.backend === 'jaccl'
+                        ? 'Thunderbolt RDMA'
+                        : (this.clusterTransports?.transports?.[0]
+                            ? this.clusterTransportLabel(this.clusterTransports.transports[0])
+                            : 'direct link'));
                 return `${count} Macs · ${this.clusterStatus?.node?.hostname || 'This Mac'} coordinates · ${count - 1} workers · ${link}`;
             },
 
-            // Answer "what can these Macs actually run" before anything is
-            // staged. The server plans each model with the real planner, so a
-            // model listed as fitting is one that will load.
-            async loadClusterCatalogue() {
-                if (this.clusterCatalogueLoading) return;
-                if (!this.clusterModelInventory) {
-                    await this.loadClusterModelInventory();
-                }
-                const models = this.clusterAllModels()
+            clusterCatalogueModels() {
+                return this.clusterAllModels()
                     .filter(model => model?.model_path)
                     .map(model => ({
                         id: model.id || this.clusterModelDisplayName(model),
@@ -3751,10 +3847,61 @@
                         model_context_length:
                             model.model_context_length || null,
                     }));
+            },
+
+            clusterCatalogueInputsReady() {
+                const peers = this.clusterWorkerPeers();
+                if (!peers.length) return false;
+                if (
+                    this.clusterPeerProbeLoading
+                    || this.clusterBudgetsLoading
+                    || this.clusterFabricLoading
+                ) return false;
+                if ((this.clusterPlanNodes || []).length !== peers.length + 1) {
+                    return false;
+                }
+                const probes = this.clusterPeerProbes || {};
+                if (peers.some(peer => {
+                    const probe = probes[String(peer?.ssh || '').trim()];
+                    return !probe?.status?.node || probe.cached === true;
+                })) {
+                    return false;
+                }
+                return (this.clusterPlanNodes || []).every(
+                    node => Number(node.capacity_bytes || 0) > 0
+                );
+            },
+
+            clusterCatalogueRequestKey(models = null) {
+                return JSON.stringify({
+                    nodes: this.clusterNodePayloads(),
+                    models: models || this.clusterCatalogueModels(),
+                    execution_profile: this.clusterExecutionProfile,
+                });
+            },
+
+            // Answer "what can these Macs actually run" before anything is
+            // staged. The server plans each model with the real planner, so a
+            // model listed as fitting is one that will load. A catalogue made
+            // from placeholder peer memory is not a verdict: wait for every
+            // probe and discard any response whose input snapshot went stale.
+            async loadClusterCatalogue() {
+                if (this.clusterCatalogueLoading) return;
+                if (!this.clusterCatalogueInputsReady()) {
+                    this.clusterCatalogue = null;
+                    this.clusterCatalogueError = '';
+                    return;
+                }
+                if (!this.clusterModelInventory) {
+                    await this.loadClusterModelInventory();
+                }
+                if (!this.clusterCatalogueInputsReady()) return;
+                const models = this.clusterCatalogueModels();
                 if (!models.length) {
                     this.clusterCatalogueError = 'No downloaded MLX models were found.';
                     return;
                 }
+                const requestKey = this.clusterCatalogueRequestKey(models);
                 this.clusterCatalogueLoading = true;
                 this.clusterCatalogueError = '';
                 this.clusterCatalogue = null;
@@ -3774,8 +3921,15 @@
                         return;
                     }
                     const body = await response.json();
+                    if (
+                        !this.clusterCatalogueInputsReady()
+                        || requestKey !== this.clusterCatalogueRequestKey()
+                    ) return;
                     if (!response.ok) {
-                        this.clusterCatalogueError = body.detail || 'Could not read that folder.';
+                        this.clusterCatalogueError = this.clusterErrorMessage(
+                            body.detail,
+                            'Could not read that folder.',
+                        );
                         return;
                     }
                     this.clusterCatalogue = body;
@@ -3800,9 +3954,20 @@
                                 );
                     }
                 } catch (error) {
-                    this.clusterCatalogueError = String(error);
+                    if (
+                        this.clusterCatalogueInputsReady()
+                        && requestKey === this.clusterCatalogueRequestKey()
+                    ) {
+                        this.clusterCatalogueError = String(error);
+                    }
                 } finally {
                     this.clusterCatalogueLoading = false;
+                    if (
+                        this.clusterCatalogueInputsReady()
+                        && requestKey !== this.clusterCatalogueRequestKey()
+                    ) {
+                        await this.loadClusterCatalogue();
+                    }
                 }
             },
 
@@ -3903,6 +4068,10 @@
             // fabric reader is the only thing that may name one, and it falls
             // back to the TCP ring out loud rather than by accident.
             get clusterBackend() {
+                // A typed address is not enough evidence to construct a JACCL
+                // device matrix. Honour the override, but keep it on the TCP
+                // ring until the server has verified that exact path as RDMA.
+                if (this.clusterIpsOverridden) return 'ring';
                 return this.clusterFabric?.backend || 'ring';
             },
 
@@ -3985,7 +4154,12 @@
                         execution_profile: this.clusterExecutionProfile,
                         prefer: this.clusterAutoconfigurePrefer,
                         strategy: this.clusterStrategy,
-                        detect_transports: hosts.length > 0,
+                        // Hand-entered addresses are an explicit routing
+                        // decision. Rediscovery here would replace them just
+                        // before activation and could put the collective back
+                        // on an unrelated mDNS/default route.
+                        detect_transports:
+                            hosts.length > 0 && !this.clusterIpsOverridden,
                         auto_tune: this.clusterAutoTune,
                         // Measure before staging so the signed layer placement
                         // is the fast one. A post-staging re-plan can only report
@@ -4126,6 +4300,11 @@
                 }
                 let proposal = await this.autoconfigureCluster();
                 if (!proposal) return;
+                if (proposal.fabric_ready === false) {
+                    this.clusterAutoconfigureError = proposal.fabric_blocker
+                        || 'The Macs do not have a verified cluster route yet.';
+                    return;
+                }
                 if (proposal.staging && !proposal.staging.ready) {
                     const staged = await this.stageClusterModel(proposal);
                     if (!staged) return;
@@ -4465,7 +4644,7 @@
             // plan built on that number is refused at load.
             async measureClusterBudgets() {
                 if (this.clusterBudgetsLoading) return;
-                const hosts = this.clusterClusterHostsPayload();
+                const hosts = this.clusterBudgetHostsPayload();
                 if (!hosts.length) {
                     this.clusterBudgetsError = 'Add a peer Mac first.';
                     return;
@@ -4484,7 +4663,10 @@
                     });
                     const body = await response.json();
                     if (!response.ok) {
-                        this.clusterBudgetsError = body.detail || 'Could not measure the Macs.';
+                        this.clusterBudgetsError = this.clusterErrorMessage(
+                            body.detail,
+                            'Could not measure the Macs.',
+                        );
                         return;
                     }
                     const gib = 1024 ** 3;
@@ -4532,6 +4714,19 @@
                 }
             },
 
+            clusterBudgetHostsPayload() {
+                const nodes = this.clusterPlanNodes || [];
+                const sshHosts = [
+                    '127.0.0.1',
+                    ...this.clusterWorkerPeers().map(peer => peer.ssh),
+                ];
+                if (nodes.length < 2 || sshHosts.length !== nodes.length) return [];
+                return nodes.map((node, rank) => ({
+                    node_id: String(node.node_id || '').trim(),
+                    ssh: sshHosts[rank],
+                }));
+            },
+
             clusterClusterHostsPayload() {
                 const nodes = this.clusterPlanNodes;
                 const sshHosts = [
@@ -4540,6 +4735,7 @@
                 ];
                 if (nodes.length < 2 || sshHosts.length !== nodes.length) return [];
                 const fabricHosts = this.clusterFabric?.hosts || [];
+                const useDiscoveredFabric = !this.clusterIpsOverridden;
                 return nodes.map((node, rank) => {
                     const ssh = sshHosts[rank];
                     const fabric = fabricHosts.find(item => item.host === ssh);
@@ -4549,10 +4745,10 @@
                     return {
                         node_id: String(node.node_id || '').trim(),
                         ssh,
-                        ips: fabric?.ips?.length
+                        ips: useDiscoveredFabric && fabric?.ips?.length
                             ? [...fabric.ips]
                             : (fallbackIp ? [fallbackIp] : []),
-                        rdma: fabric?.rdma || [],
+                        rdma: useDiscoveredFabric ? (fabric?.rdma || []) : [],
                     };
                 });
             },

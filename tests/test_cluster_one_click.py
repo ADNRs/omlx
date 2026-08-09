@@ -263,7 +263,8 @@ component.clusterPlanNodes = [{
 }];
 component.clusterBudgetsLoading = false;
 component.clusterBudgetsError = '';
-component.clusterClusterHostsPayload = () => [{ ssh: '127.0.0.1' }];
+component.clusterBudgetHostsPayload = () => [{ ssh: '127.0.0.1' }];
+component.clusterErrorMessage = detail => String(detail || 'Could not measure the Macs.');
 component.invalidateClusterPlan = () => {};
 component.clusterSetMemoryAllowance({
   nodeId: 'MacBook-Pro',
@@ -315,6 +316,457 @@ process.stdout.write(JSON.stringify(component.clusterNodePayloads()));
     assert result[0]["manual_memory_limit"] is True
     assert result[1]["manual_memory_limit"] is False
     assert result[0]["reserve_bytes"] == 18 * 1024**3
+
+
+def test_memory_measurement_hosts_do_not_require_collective_addresses():
+    result = _run_dashboard_helpers(
+        ("clusterBudgetHostsPayload",),
+        """
+component.clusterPlanNodes = [
+  { node_id: 'local' },
+  { node_id: 'studio' },
+];
+component.clusterWorkerPeers = () => [{ ssh: 'studio.local' }];
+process.stdout.write(JSON.stringify(component.clusterBudgetHostsPayload()));
+""",
+    )
+
+    assert result == [
+        {"node_id": "local", "ssh": "127.0.0.1"},
+        {"node_id": "studio", "ssh": "studio.local"},
+    ]
+
+
+def test_unmeasured_peer_memory_is_unknown_not_a_56_gib_placeholder():
+    result = _run_dashboard_helpers(
+        ("syncClusterNodesFromPeers",),
+        """
+const gib = 1024 ** 3;
+component.clusterStatus = { node: {
+  hostname: 'local',
+  admission_ceiling_bytes: 498 * gib,
+} };
+component.clusterPlanNodes = [
+  { key: 1, node_id: 'this-mac', capacity_gib: 128, reserve_gib: 8 },
+  { key: 2, node_id: 'peer-mac', capacity_gib: 256, reserve_gib: 8 },
+];
+component.clusterPeerProbes = {};
+component.clusterWorkerPeers = () => [{ ssh: 'studio.local', name: 'studio' }];
+component.clusterFriendlyMacName = value => value;
+component.normalizeClusterTensorParallelSize = () => {};
+component.invalidateClusterPlan = () => {};
+component._clusterNodeKey = 2;
+component.syncClusterNodesFromPeers();
+process.stdout.write(JSON.stringify(component.clusterPlanNodes));
+""",
+    )
+
+    assert result[0]["capacity_bytes"] == 498 * 1024**3
+    assert result[1]["capacity_gib"] == 0
+    assert result[1]["capacity_bytes"] == 0
+    assert result[1]["reserve_gib"] == 0
+
+
+def test_same_named_peer_does_not_inherit_another_macs_capacity():
+    result = _run_dashboard_helpers(
+        ("syncClusterNodesFromPeers",),
+        """
+const gib = 1024 ** 3;
+component.clusterStatus = { node: {
+  hostname: 'local',
+  admission_ceiling_bytes: 120 * gib,
+} };
+component.clusterPlanNodes = [
+  { key: 1, node_id: 'local', ssh: '127.0.0.1', capacity_bytes: 120 * gib },
+  { key: 2, node_id: 'Mac Studio', ssh: 'old.local',
+    capacity_gib: 498, capacity_bytes: 498 * gib, reserve_gib: 50 },
+];
+component.clusterPeerProbes = {};
+component.clusterWorkerPeers = () => [{ ssh: 'new.local', name: 'Mac Studio' }];
+component.clusterFriendlyMacName = value => value;
+component.normalizeClusterTensorParallelSize = () => {};
+component.invalidateClusterPlan = () => {};
+component._clusterNodeKey = 2;
+component.syncClusterNodesFromPeers();
+process.stdout.write(JSON.stringify(component.clusterPlanNodes[1]));
+""",
+    )
+
+    assert result["ssh"] == "new.local"
+    assert result["capacity_gib"] == 0
+    assert result["capacity_bytes"] == 0
+    assert result["reserve_gib"] == 0
+
+
+def test_unknown_middle_peer_does_not_shift_memory_to_another_card():
+    result = _run_dashboard_helpers(
+        ("clusterMemoryNodes", "clusterMemoryAllowanceNodes"),
+        """
+component.clusterPlanNodes = [
+  { node_id: 'local', capacity_gib: 120, reserve_gib: 10 },
+  { node_id: 'unknown', capacity_gib: 0, reserve_gib: 0 },
+  { node_id: 'large', capacity_gib: 498, reserve_gib: 50 },
+];
+component.clusterQuickNodes = () => [
+  { name: 'Local' },
+  { name: 'Unknown peer' },
+  { name: 'Large peer' },
+];
+process.stdout.write(JSON.stringify({
+  memory: component.clusterMemoryNodes().map(node => ({
+    name: node.name,
+    capacity: node.capacityGiB,
+  })),
+  allowances: component.clusterMemoryAllowanceNodes().map(node => node.name),
+}));
+""",
+    )
+
+    assert result == {
+        "memory": [
+            {"name": "Local", "capacity": 120},
+            {"name": "Unknown peer", "capacity": 0},
+            {"name": "Large peer", "capacity": 498},
+        ],
+        "allowances": ["Local", "Large peer"],
+    }
+
+
+def test_peer_retry_keeps_the_existing_error_mounted_until_ssh_answers():
+    result = _run_dashboard_helpers(
+        ("probeClusterPeer",),
+        """
+let errorDuringFetch = null;
+global.window = { location: { href: '' } };
+global.fetch = async () => {
+  errorDuringFetch = component.clusterError;
+  return { status: 503, ok: false };
+};
+component.clusterPeerSsh = 'studio.local';
+component.clusterPeerProbeLoading = false;
+component.clusterPeerProbe = null;
+component.clusterLocalIp = '';
+component.clusterError = 'The other Mac rejected the login';
+component.clusterResponseError = async () => 'The other Mac rejected the login';
+(async () => {
+  await component.probeClusterPeer();
+  process.stdout.write(JSON.stringify({
+    errorDuringFetch,
+    finalError: component.clusterError,
+  }));
+})().catch(error => {
+  console.error(error);
+  process.exit(1);
+});
+""",
+    )
+
+    assert result == {
+        "errorDuringFetch": "The other Mac rejected the login",
+        "finalError": "The other Mac rejected the login",
+    }
+
+
+def test_validation_errors_are_rendered_as_messages_not_object_strings():
+    result = _run_dashboard_helpers(
+        ("clusterErrorMessage",),
+        """
+process.stdout.write(JSON.stringify(component.clusterErrorMessage([
+  { loc: ['body', 'hosts', 0, 'ips'], msg: 'List should have at least 1 item' },
+  { loc: ['body', 'hosts', 1, 'ips'], msg: 'List should have at least 1 item' },
+])));
+""",
+    )
+
+    assert result == (
+        "hosts.0.ips: List should have at least 1 item, "
+        "hosts.1.ips: List should have at least 1 item"
+    )
+
+
+def test_cached_peer_measurement_cannot_make_the_catalogue_ready():
+    result = _run_dashboard_helpers(
+        ("clusterCatalogueInputsReady",),
+        """
+component.clusterWorkerPeers = () => [{ ssh: 'studio.local' }];
+component.clusterPeerProbeLoading = false;
+component.clusterBudgetsLoading = false;
+component.clusterFabricLoading = false;
+component.clusterPlanNodes = [
+  { node_id: 'local', capacity_bytes: 120 },
+  { node_id: 'studio', capacity_bytes: 498 },
+];
+component.clusterPeerProbes = {
+  'studio.local': { cached: true, status: { node: { hostname: 'studio' } } },
+};
+const cached = component.clusterCatalogueInputsReady();
+component.clusterPeerProbes['studio.local'].cached = false;
+const live = component.clusterCatalogueInputsReady();
+process.stdout.write(JSON.stringify({ cached, live }));
+""",
+    )
+
+    assert result == {"cached": False, "live": True}
+
+
+def test_manual_link_addresses_override_discovery_and_drop_the_rdma_matrix():
+    result = _run_dashboard_helpers(
+        ("clusterClusterHostsPayload",),
+        """
+component.clusterPlanNodes = [
+  { node_id: 'local' },
+  { node_id: 'studio' },
+];
+component.clusterWorkerPeers = () => [{ ssh: 'studio.local' }];
+component.clusterLocalIp = '10.77.0.1';
+component.clusterPeerIp = '10.77.0.2';
+component.clusterIpsOverridden = true;
+component.clusterFabric = { hosts: [
+  { host: '127.0.0.1', ips: ['10.0.1.1'], rdma: [null, 'rdma_en4'] },
+  { host: 'studio.local', ips: ['10.0.1.2'], rdma: ['rdma_en5', null] },
+] };
+process.stdout.write(JSON.stringify({
+  hosts: component.clusterClusterHostsPayload(),
+}));
+""",
+    )
+
+    assert [host["ips"] for host in result["hosts"]] == [
+        ["10.77.0.1"],
+        ["10.77.0.2"],
+    ]
+    assert [host["rdma"] for host in result["hosts"]] == [[], []]
+
+
+def test_manual_link_addresses_disable_transport_rediscovery():
+    result = _run_dashboard_helpers(
+        ("autoconfigureCluster",),
+        """
+let posted = null;
+global.window = {
+  location: { href: '' },
+  localStorage: { setItem: () => {} },
+};
+global.fetch = async (_url, options) => {
+  posted = JSON.parse(options.body);
+  return {
+    status: 200,
+    ok: true,
+    json: async () => ({
+      ready_to_activate: false,
+      fabric: null,
+      tensor_parallel_size: 1,
+      plan: null,
+    }),
+  };
+};
+Object.assign(component, {
+  _clusterPlanRevision: 0,
+  clusterAutoconfigureLoading: false,
+  clusterAutoconfigureError: '',
+  clusterAutoconfigure: null,
+  clusterIpsOverridden: true,
+  clusterExecutionProfile: 'balanced',
+  clusterAutoconfigurePrefer: 'speed',
+  clusterStrategy: 'auto',
+  clusterAutoTune: false,
+  clusterSamplingRankOnly: true,
+  clusterAsyncOverlap: true,
+  clusterCacheAffinity: true,
+  clusterMaxKvSize: '',
+  clusterTargetContextTokens: 8192,
+  clusterRingConnectionsPerIp: 2,
+  clusterPlanMode: 'model',
+  clusterPlanModelPath: '/models/qwen',
+  clusterPlanModelSource: '127.0.0.1',
+  clusterNodePayloads: () => [
+    { node_id: 'local', capacity_bytes: 64 * (1024 ** 3) },
+    { node_id: 'studio', capacity_bytes: 64 * (1024 ** 3) },
+  ],
+  clusterClusterHostsPayload: () => [
+    { node_id: 'local', ssh: '127.0.0.1', ips: ['10.77.0.1'], rdma: [] },
+    { node_id: 'studio', ssh: 'studio.local', ips: ['10.77.0.2'], rdma: [] },
+  ],
+  adoptClusterFabric: () => {},
+  invalidateClusterPlan: () => {},
+});
+(async () => {
+  await component.autoconfigureCluster();
+  process.stdout.write(JSON.stringify(posted));
+})().catch(error => {
+  console.error(error);
+  process.exit(1);
+});
+""",
+    )
+
+    assert result["detect_transports"] is False
+    assert [host["ips"] for host in result["hosts"]] == [
+        ["10.77.0.1"],
+        ["10.77.0.2"],
+    ]
+
+
+def test_stale_catalogue_result_is_discarded_and_retried_with_measured_budgets():
+    result = _run_dashboard_helpers(
+        (
+            "clusterCatalogueModels",
+            "clusterCatalogueInputsReady",
+            "clusterCatalogueRequestKey",
+            "loadClusterCatalogue",
+        ),
+        """
+let releaseFirst = null;
+const requests = [];
+global.window = { location: { href: '' } };
+global.fetch = async (_url, options) => {
+  requests.push(JSON.parse(options.body));
+  if (requests.length === 1) {
+    return await new Promise(resolve => {
+      releaseFirst = () => resolve({
+        status: 200,
+        ok: true,
+        json: async () => ({ models: [{ model_path: '/deepseek', fits: false }] }),
+      });
+    });
+  }
+  return {
+    status: 200,
+    ok: true,
+    json: async () => ({ models: [{ model_path: '/deepseek', fits: true }] }),
+  };
+};
+component.clusterWorkerPeers = () => [{ ssh: 'studio.local' }];
+component.clusterPeerProbes = {
+  'studio.local': { status: { node: { hostname: 'studio' } } },
+};
+component.clusterPeerProbeLoading = false;
+component.clusterBudgetsLoading = false;
+component.clusterFabricLoading = false;
+component.clusterPlanNodes = [
+  { node_id: 'local', capacity_bytes: 120 },
+  { node_id: 'studio', capacity_bytes: 64 },
+];
+component.clusterNodePayloads = () => component.clusterPlanNodes.map(node => ({
+  node_id: node.node_id,
+  capacity_bytes: node.capacity_bytes,
+}));
+component.clusterAllModels = () => [{
+  id: 'deepseek',
+  model_path: '/deepseek',
+  model_source: '127.0.0.1',
+}];
+component.clusterModelDisplayName = model => model.id;
+component.clusterModelInventory = { models: [] };
+component.loadClusterModelInventory = async () => {};
+component.clusterCatalogueLoading = false;
+component.clusterCatalogueError = '';
+component.clusterExecutionProfile = 'balanced';
+component.clusterSelectedModel = () => null;
+const pending = component.loadClusterCatalogue();
+(async () => {
+  while (!releaseFirst) await new Promise(resolve => setImmediate(resolve));
+  component.clusterPlanNodes[1].capacity_bytes = 220;
+  releaseFirst();
+  await pending;
+  process.stdout.write(JSON.stringify({
+    requestCapacities: requests.map(request =>
+      request.nodes.map(node => node.capacity_bytes)
+    ),
+    fit: component.clusterCatalogue.models[0].fits,
+  }));
+})().catch(error => {
+  console.error(error);
+  process.exit(1);
+});
+""",
+    )
+
+    assert result == {
+        "requestCapacities": [[120, 64], [120, 220]],
+        "fit": True,
+    }
+
+
+def test_catalogue_waits_until_the_peer_probe_finishes():
+    result = _run_dashboard_helpers(
+        (
+            "clusterCatalogueModels",
+            "clusterCatalogueInputsReady",
+            "clusterCatalogueRequestKey",
+            "loadClusterCatalogue",
+        ),
+        """
+let calls = 0;
+global.fetch = async () => { calls += 1; throw new Error('must not fetch'); };
+component.clusterWorkerPeers = () => [{ ssh: 'studio.local' }];
+component.clusterPeerProbes = {};
+component.clusterPeerProbeLoading = true;
+component.clusterBudgetsLoading = false;
+component.clusterFabricLoading = false;
+component.clusterPlanNodes = [
+  { node_id: 'local', capacity_bytes: 120 },
+  { node_id: 'studio', capacity_bytes: 64 },
+];
+component.clusterNodePayloads = () => component.clusterPlanNodes;
+component.clusterAllModels = () => [];
+component.clusterCatalogueLoading = false;
+component.clusterCatalogue = { models: [{ fits: false }] };
+component.clusterCatalogueError = 'old refusal';
+(async () => {
+  await component.loadClusterCatalogue();
+  process.stdout.write(JSON.stringify({
+    calls,
+    catalogue: component.clusterCatalogue,
+    error: component.clusterCatalogueError,
+  }));
+})().catch(error => {
+  console.error(error);
+  process.exit(1);
+});
+""",
+    )
+
+    assert result == {"calls": 0, "catalogue": None, "error": ""}
+
+
+def test_catalogue_does_not_treat_a_display_placeholder_as_measured_memory():
+    result = _run_dashboard_helpers(
+        (
+            "clusterCatalogueModels",
+            "clusterCatalogueInputsReady",
+            "clusterCatalogueRequestKey",
+            "loadClusterCatalogue",
+        ),
+        """
+let calls = 0;
+global.fetch = async () => { calls += 1; throw new Error('must not fetch'); };
+component.clusterWorkerPeers = () => [{ ssh: 'studio.local' }];
+component.clusterPeerProbes = {
+  'studio.local': { status: { node: { hostname: 'studio' } } },
+};
+component.clusterPeerProbeLoading = false;
+component.clusterBudgetsLoading = false;
+component.clusterFabricLoading = false;
+component.clusterPlanNodes = [
+  { node_id: 'local', capacity_bytes: 120, capacity_gib: 120 },
+  { node_id: 'studio', capacity_gib: 64 },
+];
+component.clusterNodePayloads = () => component.clusterPlanNodes;
+component.clusterAllModels = () => [];
+component.clusterCatalogueLoading = false;
+component.clusterCatalogue = { models: [{ fits: false }] };
+(async () => {
+  await component.loadClusterCatalogue();
+  process.stdout.write(JSON.stringify({ calls, catalogue: component.clusterCatalogue }));
+})().catch(error => {
+  console.error(error);
+  process.exit(1);
+});
+""",
+    )
+
+    assert result == {"calls": 0, "catalogue": None}
 
 
 def test_model_context_is_clamped_to_what_the_cluster_can_serve():
@@ -668,6 +1120,7 @@ process.stdout.write(JSON.stringify({
             "chip_name": "Apple M3 Ultra",
             "physical_memory_bytes": 256 * 1024**3,
             "recommended_working_set_bytes": 223 * 1024**3,
+            "admission_ceiling_bytes": 0,
         },
         "runtimeCompatible": None,
         "needsSync": True,
@@ -1007,6 +1460,28 @@ def test_one_click_never_posts_a_blocked_proposal():
     assert result["deploymentLoads"] == 0
     assert result["activationResult"] is None
     assert result["autoconfigureError"] == "Studio is missing mlx_vlm."
+
+
+def test_one_click_does_not_stage_or_launch_without_a_verified_fabric():
+    result = _run_one_click(
+        {
+            "ready_to_activate": False,
+            "fabric_ready": False,
+            "fabric_blocker": "worker 1 cannot reach worker 2",
+            "staging": {"ready": False},
+            "activation": {"must_not": "launch"},
+            "fabric": {"ok": False},
+            "tensor_parallel_size": 1,
+            "summary": "blocked fabric",
+        }
+    )
+
+    assert [call["url"] for call in result["calls"]] == [
+        "/admin/api/cluster/autoconfigure"
+    ]
+    assert result["deploymentLoads"] == 0
+    assert result["activationResult"] is None
+    assert result["autoconfigureError"] == "worker 1 cannot reach worker 2"
 
 
 def test_one_click_prepares_thunderbolt_then_continues_to_activation():

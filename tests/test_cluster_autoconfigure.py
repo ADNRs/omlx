@@ -289,6 +289,75 @@ def test_autoconfigure_never_marks_incomplete_staging_ready(monkeypatch):
     assert body["staging"]["error"] == "model shards are missing on studio"
 
 
+def test_autoconfigure_never_marks_an_unverified_fabric_ready(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from omlx.cluster import routes
+
+    monkeypatch.setattr(
+        routes,
+        "detect_cluster_transports",
+        lambda _hosts: SimpleNamespace(transports=()),
+    )
+    monkeypatch.setattr(
+        routes,
+        "_resolve_fabric",
+        lambda _hosts: {
+            "ok": False,
+            "backend": "ring",
+            "backend_reason": "no verified cluster route",
+            "blocker": "studio.local did not answer",
+            "link": {"reason": "studio.local did not answer"},
+            "hosts": [],
+        },
+    )
+    monkeypatch.setattr(
+        routes,
+        "_execution_for_request",
+        lambda *_args, **_kwargs: pytest.fail(
+            "an unverified fabric must not start the distributed probe"
+        ),
+    )
+    monkeypatch.setattr(
+        routes,
+        "_model_and_nodes",
+        lambda _request: (_model(), _nodes(2)),
+    )
+    monkeypatch.setattr(routes, "_staging_for", lambda *_args: None)
+    payload = _autoconfigure_payload()
+    payload.pop("model_size_bytes")
+    payload.update(
+        {
+            "model_path": "/models/test",
+            "hosts": [
+                {
+                    "node_id": "node-0",
+                    "ssh": "127.0.0.1",
+                    "ips": ["10.0.1.1"],
+                },
+                {
+                    "node_id": "node-1",
+                    "ssh": "studio.local",
+                    "ips": ["10.0.1.2"],
+                },
+            ],
+            "detect_transports": True,
+            "measure_performance": True,
+            "preflight": False,
+        }
+    )
+
+    with TestClient(_app()) as client:
+        response = client.post("/admin/api/cluster/autoconfigure", json=payload)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["fabric_ready"] is False
+    assert body["ready_to_activate"] is False
+    assert body["fabric_blocker"] == "studio.local did not answer"
+    assert body["preflight"].startswith("Cluster link is not ready:")
+
+
 def test_performance_is_measured_and_applied_before_staging(tmp_path, monkeypatch):
     """The first copied shard map must already be the measured fast one."""
 

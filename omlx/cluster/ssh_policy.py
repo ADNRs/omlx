@@ -32,6 +32,12 @@ def cluster_ssh_options(
         "BatchMode=yes",
         "PasswordAuthentication=no",
         "KbdInteractiveAuthentication=no",
+        # Automatic cluster fabric discovery currently emits IPv4 addresses.
+        # Keep the SSH control channel on the same address family instead of
+        # letting a .local name select an unrelated or unroutable AAAA record.
+        # The hostname remains the known_hosts identity; only resolution is
+        # constrained, so pairing survives address changes.
+        "AddressFamily=inet",
         "StrictHostKeyChecking=accept-new",
         "CheckHostIP=no",
         # The pairing UI creates this dedicated identity. Naming it explicitly

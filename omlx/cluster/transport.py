@@ -209,8 +209,16 @@ def _rdma_devices(ssh_hostname: str) -> list[str]:
         result = subprocess.run(
             command, capture_output=True, text=True, check=False, timeout=30
         )
-    except (OSError, subprocess.SubprocessError):
-        return []
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(
+            f"RDMA device probe failed for {ssh_hostname}: {exc}"
+        ) from exc
+    if getattr(result, "returncode", 0) != 0:
+        detail = str(result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"RDMA device probe failed for {ssh_hostname}"
+            + (f": {detail[-400:]}" if detail else "")
+        )
     return [
         token
         for token in result.stdout.split()
@@ -595,8 +603,16 @@ def _rdma_port_state(ssh_hostname: str, device: str) -> str | None:
         result = subprocess.run(
             command, capture_output=True, text=True, check=False, timeout=30
         )
-    except (OSError, subprocess.SubprocessError):
-        return None
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(
+            f"RDMA port probe failed for {ssh_hostname}: {exc}"
+        ) from exc
+    if getattr(result, "returncode", 0) != 0:
+        detail = str(result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"RDMA port probe failed for {ssh_hostname}"
+            + (f": {detail[-400:]}" if detail else "")
+        )
     for line in result.stdout.splitlines():
         if "state:" in line and "PORT_" in line:
             return "PORT_ACTIVE" if "PORT_ACTIVE" in line else "PORT_DOWN"
@@ -634,8 +650,16 @@ def _interface_ip(ssh_hostname: str, interface: str) -> str | None:
         result = subprocess.run(
             command, capture_output=True, text=True, check=False, timeout=30
         )
-    except (OSError, subprocess.SubprocessError):
-        return None
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(
+            f"RDMA address probe failed for {ssh_hostname}: {exc}"
+        ) from exc
+    if getattr(result, "returncode", 0) != 0:
+        detail = str(result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"RDMA address probe failed for {ssh_hostname}"
+            + (f": {detail[-400:]}" if detail else "")
+        )
     for line in result.stdout.splitlines():
         fields = line.split()
         if fields and fields[0] == "inet" and len(fields) > 1:
@@ -841,16 +865,19 @@ def configure_link(hosts: list[str] | tuple[str, ...]) -> LinkStatus:
     if not initial.setup_available:
         raise LinkSetupError(initial.detail)
 
-    active_ports = {host: _active_rdma_port(host) for host in hosts}
-    if any(port is None for port in active_ports.values()):
-        raise LinkSetupError(
-            "The Thunderbolt RDMA port changed while it was being configured. "
-            "Check the cable and try Start Cluster again."
-        )
-    current_ips = {
-        host: _interface_ip(host, active_ports[host] or "")
-        for host in hosts
-    }
+    try:
+        active_ports = {host: _active_rdma_port(host) for host in hosts}
+        if any(port is None for port in active_ports.values()):
+            raise LinkSetupError(
+                "The Thunderbolt RDMA port changed while it was being configured. "
+                "Check the cable and try Start Cluster again."
+            )
+        current_ips = {
+            host: _interface_ip(host, active_ports[host] or "")
+            for host in hosts
+        }
+    except RuntimeError as exc:
+        raise LinkSetupError(str(exc)) from exc
 
     # Reuse the subnet already present on either endpoint. Otherwise choose a
     # private point-to-point range. Rank order makes retries deterministic.
@@ -876,6 +903,7 @@ def assess_link(
     *,
     transports: tuple[TransportInfo, ...] = (),
     probe: Callable[[str], HostInterfaces] | None = None,
+    verify: LinkVerifier | None = None,
 ) -> LinkStatus:
     """Probe every host and classify what the fabric can do right now."""
 
@@ -888,12 +916,27 @@ def assess_link(
             ready=False,
         )
 
-    rdma_devices = {host: _rdma_devices(host) for host in hosts}
-    active_ports = {host: _active_rdma_port(host) for host in hosts}
-    port_ips = {
-        host: _interface_ip(host, port) if port else None
-        for host, port in active_ports.items()
-    }
+    try:
+        rdma_devices = {host: _rdma_devices(host) for host in hosts}
+        active_ports = {host: _active_rdma_port(host) for host in hosts}
+        port_ips = {
+            host: _interface_ip(host, port) if port else None
+            for host, port in active_ports.items()
+        }
+    except RuntimeError as exc:
+        # An authentication/tooling failure is not evidence that RDMA is
+        # disabled. Calling it that sent users into Recovery even though both
+        # local diagnostics showed six healthy devices.
+        return LinkStatus(
+            state="unknown",
+            title="Could not verify the peer's RDMA state",
+            detail=(
+                f"{exc}. Fix the SSH connection and detect the link again; "
+                "oMLX has not changed the peer's RDMA configuration."
+            ),
+            backend="ring",
+            ready=False,
+        )
     thunderbolt = any(
         getattr(t, "kind", "") in _FAST_KINDS for t in transports
     ) or any(active_ports.values())
@@ -916,11 +959,18 @@ def assess_link(
     # that activation will correctly launch as JACCL.
     if len(hosts) == 2:
         try:
+            # An injected probe represents already-captured test/planning data
+            # and stays pure unless its caller also injects a verifier. The
+            # live product path proves reachability before saying "ready".
+            link_verifier = verify
+            if link_verifier is None and probe is None:
+                link_verifier = verify_link_reachability
             shared = resolve_link_addresses(
                 hosts[0],
                 hosts[1],
                 transports=transports,
                 probe=probe or probe_host_interfaces,
+                verify=link_verifier,
             )
         except (OSError, RuntimeError, ValueError):
             shared = None
@@ -938,6 +988,55 @@ def assess_link(
                 backend="jaccl",
                 ready=True,
                 link_label=label or "Thunderbolt RDMA",
+            )
+        if status.state == "rdma_ready" and shared is not None and shared.ok:
+            return LinkStatus(
+                state="ethernet",
+                title="Using the verified TCP route",
+                detail=(
+                    "The Thunderbolt RDMA addresses did not form the usable "
+                    f"route between these Macs. {shared.reason}. The cluster "
+                    "will use the TCP ring on this verified path."
+                ),
+                backend="ring",
+                ready=True,
+                link_label="Ethernet / Wi-Fi",
+            )
+        if status.state == "rdma_ready" and (shared is None or not shared.ok):
+            reason = (
+                shared.reason
+                if shared is not None
+                else "The live address check could not be completed."
+            )
+            return LinkStatus(
+                state="thunderbolt",
+                title="Thunderbolt addresses are not reachable",
+                detail=(
+                    f"{reason} oMLX will not put these addresses in a hostfile. "
+                    "Check the static addresses and routes on both Macs, or "
+                    "use a verified network address for the TCP ring."
+                ),
+                backend="ring",
+                ready=False,
+                link_label=status.link_label or "Thunderbolt",
+            )
+        if status.ready and (shared is None or not shared.ok):
+            reason = (
+                shared.reason
+                if shared is not None
+                else "The live address check could not be completed."
+            )
+            return LinkStatus(
+                state="unknown",
+                title="No verified cluster route",
+                detail=(
+                    f"{reason} oMLX will not put an unverified address in the "
+                    "cluster hostfile. Check the network addresses and routes "
+                    "on both Macs."
+                ),
+                backend="ring",
+                ready=False,
+                link_label=status.link_label,
             )
     return status
 
@@ -1187,6 +1286,7 @@ def _pair_kind(
 
 
 _Candidate = tuple[str, InterfaceAddress, InterfaceAddress]
+LinkVerifier = Callable[[SharedLink], tuple[bool, str]]
 
 
 def _preference(candidate: _Candidate) -> tuple[int, int, str, str]:
@@ -1203,6 +1303,52 @@ def _preference(candidate: _Candidate) -> tuple[int, int, str, str]:
         source_address.interface,
         peer_address.interface,
     )
+
+
+def _candidate_links(
+    source: HostInterfaces,
+    peer: HostInterfaces,
+    *,
+    link_speed_gbps: int | None = None,
+) -> tuple[SharedLink, ...]:
+    """Every shared address pair, fastest first."""
+
+    candidates: list[_Candidate] = []
+    for source_address in source.addresses:
+        for peer_address in peer.addresses:
+            if source_address.network != peer_address.network:
+                continue
+            if source_address.address == peer_address.address:
+                # Both ends holding one address is a coincidence of local
+                # bridges — VM networks all pick 192.168.x.1 — not a link.
+                continue
+            kind = _pair_kind(source, peer, source_address, peer_address)
+            candidates.append((kind, source_address, peer_address))
+
+    links = []
+    for kind, source_address, peer_address in sorted(candidates, key=_preference):
+        label = (
+            kind
+            if link_speed_gbps is None
+            else f"{kind} at {link_speed_gbps} Gb/s"
+        )
+        links.append(
+            SharedLink(
+                source=LinkEndpoint(
+                    source.host, source_address.interface, source_address.address
+                ),
+                peer=LinkEndpoint(
+                    peer.host, peer_address.interface, peer_address.address
+                ),
+                kind=kind,
+                reason=(
+                    f"{source.host} {source_address} and {peer.host} {peer_address} "
+                    f"share {source_address.network} over {label}"
+                ),
+                link_speed_gbps=link_speed_gbps,
+            )
+        )
+    return tuple(links)
 
 
 def shared_link_addresses(
@@ -1224,19 +1370,8 @@ def shared_link_addresses(
     if not peer.addresses:
         return SharedLink(reason=f"{peer.host} has no routable IPv4 address")
 
-    candidates: list[_Candidate] = []
-    for source_address in source.addresses:
-        for peer_address in peer.addresses:
-            if source_address.network != peer_address.network:
-                continue
-            if source_address.address == peer_address.address:
-                # Both ends holding one address is a coincidence of local
-                # bridges — VM networks all pick 192.168.x.1 — not a link.
-                continue
-            kind = _pair_kind(source, peer, source_address, peer_address)
-            candidates.append((kind, source_address, peer_address))
-
-    if not candidates:
+    links = _candidate_links(source, peer, link_speed_gbps=link_speed_gbps)
+    if not links:
         return SharedLink(
             reason=(
                 f"{source.host} and {peer.host} share no subnet. "
@@ -1244,21 +1379,7 @@ def shared_link_addresses(
                 f"{peer.host} has {', '.join(str(a) for a in peer.addresses)}."
             )
         )
-
-    kind, source_address, peer_address = min(candidates, key=_preference)
-    label = kind if link_speed_gbps is None else f"{kind} at {link_speed_gbps} Gb/s"
-    return SharedLink(
-        source=LinkEndpoint(
-            source.host, source_address.interface, source_address.address
-        ),
-        peer=LinkEndpoint(peer.host, peer_address.interface, peer_address.address),
-        kind=kind,
-        reason=(
-            f"{source.host} {source_address} and {peer.host} {peer_address} "
-            f"share {source_address.network} over {label}"
-        ),
-        link_speed_gbps=link_speed_gbps,
-    )
+    return links[0]
 
 
 def _pair_link_speed(
@@ -1284,6 +1405,7 @@ def resolve_link_addresses(
     *,
     transports: Sequence[TransportInfo] = (),
     probe: Callable[[str], HostInterfaces] = probe_host_interfaces,
+    verify: LinkVerifier | None = None,
 ) -> SharedLink:
     """Ask both hosts where they answer, rather than trusting a written address.
 
@@ -1292,8 +1414,105 @@ def resolve_link_addresses(
     remembering is what renumbering invalidates.
     """
 
-    return shared_link_addresses(
-        probe(source_host),
-        probe(peer_host),
-        link_speed_gbps=_pair_link_speed(transports, source_host, peer_host),
+    source = probe(source_host)
+    peer = probe(peer_host)
+    speed = _pair_link_speed(transports, source_host, peer_host)
+    link = shared_link_addresses(source, peer, link_speed_gbps=speed)
+    if verify is None or not link.ok:
+        return link
+    rejected = []
+    for candidate in _candidate_links(source, peer, link_speed_gbps=speed):
+        reachable, reason = verify(candidate)
+        if reachable:
+            return candidate
+        rejected.append(reason)
+    return SharedLink(
+        kind=link.kind,
+        reason="No verified shared path. " + " ".join(dict.fromkeys(rejected)),
+        link_speed_gbps=link.link_speed_gbps,
     )
+
+
+LinkCommandRunner = Callable[
+    [str, Sequence[str]], subprocess.CompletedProcess[str]
+]
+
+
+def _run_link_command(
+    ssh_hostname: str,
+    command: Sequence[str],
+) -> subprocess.CompletedProcess[str]:
+    """Run one bounded link check locally or through the paired SSH identity."""
+
+    argv = list(command)
+    if ssh_hostname not in _LOCAL_HOSTS:
+        argv = [
+            "ssh",
+            *cluster_ssh_options(connect_timeout=5),
+            ssh_hostname,
+            *argv,
+        ]
+    try:
+        return subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=8,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return subprocess.CompletedProcess(argv, 255, "", str(exc))
+
+
+def _route_interface(output: str) -> str:
+    """Interface selected by macOS ``route -n get`` output."""
+
+    for line in output.splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.strip().lower() == "interface":
+            return value.strip()
+    return ""
+
+
+def verify_link_reachability(
+    link: SharedLink,
+    *,
+    runner: LinkCommandRunner | None = None,
+) -> tuple[bool, str]:
+    """Prove both endpoints route and answer over the selected interfaces.
+
+    Sharing a subnet is only a candidate. Macs can retain stale addresses on
+    old Thunderbolt interfaces, and two unreachable interfaces can therefore
+    look like a perfect point-to-point link. The route must name the selected
+    interface in both directions and one bounded ICMP probe must succeed from
+    each endpoint before the address enters a hostfile.
+    """
+
+    source, peer = link.source, link.peer
+    if source is None or peer is None:
+        return False, link.reason or "the selected link has no endpoints"
+    run = runner or _run_link_command
+    directions = ((source, peer), (peer, source))
+    for local, remote in directions:
+        route = run(local.host, ("/sbin/route", "-n", "get", remote.address))
+        selected = _route_interface(route.stdout) if route.returncode == 0 else ""
+        if selected != local.interface:
+            detail = (
+                f"route uses {selected}"
+                if selected
+                else "macOS reported no usable route"
+            )
+            return False, (
+                f"{local.host} cannot use {local.interface} to reach "
+                f"{remote.address}: {detail}."
+            )
+        ping = run(
+            local.host,
+            ("/sbin/ping", "-n", "-c", "1", "-W", "1000", remote.address),
+        )
+        if ping.returncode != 0:
+            return False, (
+                f"{local.host} routes {remote.address} over {local.interface}, "
+                "but the peer did not answer on that address."
+            )
+    return True, link.reason

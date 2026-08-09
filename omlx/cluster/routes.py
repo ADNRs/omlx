@@ -103,6 +103,7 @@ from .transport import (
     detect_cluster_transports,
     probe_host_interfaces,
     resolve_link_addresses,
+    verify_link_reachability,
 )
 
 router = APIRouter(prefix="/admin/api/cluster", tags=["cluster"])
@@ -281,6 +282,21 @@ class ClusterHostRequest(BaseModel):
     ssh: str = Field(min_length=1, max_length=255)
     ips: list[str] = Field(min_length=1, max_length=16)
     rdma: list[str | list[str] | None] = Field(default_factory=list, max_length=64)
+
+
+def _validate_cluster_hosts(hosts: list[ClusterHostRequest]) -> None:
+    """Validate a hostfile before any request can use its SSH destinations."""
+
+    try:
+        for host in hosts:
+            ClusterHost(
+                node_id=host.node_id.strip(),
+                ssh=host.ssh,
+                ips=tuple(host.ips),
+                rdma=tuple(host.rdma),
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 class ClusterDeploymentRequest(BaseModel):
@@ -671,7 +687,11 @@ def _staging_for(
         return {"error": str(exc), "ready": False}
 
 
-def _resolve_fabric(hosts: list[str]) -> dict[str, Any]:
+def _resolve_fabric(
+    hosts: list[str],
+    *,
+    verifier: Any | None = None,
+) -> dict[str, Any]:
     """Where each Mac answers, and the backend those addresses actually allow.
 
     One reading of every host answers both questions. An address someone typed
@@ -682,29 +702,71 @@ def _resolve_fabric(hosts: list[str]) -> dict[str, Any]:
     """
 
     interfaces = {host: probe_host_interfaces(host) for host in hosts}
+    verify = verifier or verify_link_reachability
+    verified_links: dict[
+        tuple[tuple[str, str, str], ...], tuple[bool, str]
+    ] = {}
+
+    def verify_once(link: Any) -> tuple[bool, str]:
+        endpoints = (link.source, link.peer)
+        key = tuple(
+            sorted(
+                (endpoint.host, endpoint.interface, endpoint.address)
+                for endpoint in endpoints
+                if endpoint is not None
+            )
+        )
+        if key not in verified_links:
+            verified_links[key] = verify(link)
+        return verified_links[key]
+
     # Each host is described by its link to the first host that is not itself:
-    # that is the address the rest of the cluster reaches it on.
+    # that is the address the rest of the cluster reaches it on. Backend
+    # readiness is stricter: a collective is a full graph, so every pair must
+    # also answer before any fast backend is named or activation is allowed.
     links = [
         resolve_link_addresses(
             host,
             hosts[1 if index == 0 else 0],
             probe=lambda target: interfaces[target],
+            verify=verify_once,
         )
         for index, host in enumerate(hosts)
     ]
+    pair_links = [
+        resolve_link_addresses(
+            source,
+            peer,
+            probe=lambda target: interfaces[target],
+            verify=verify_once,
+        )
+        for index, source in enumerate(hosts)
+        for peer in hosts[index + 1 :]
+    ]
     matrix = build_rdma_matrix([interfaces[host] for host in hosts])
+    rdma = matrix.to_dict()
+    unverified_rdma = next(
+        (link for link in pair_links if not link.ok or link.kind != "rdma"),
+        None,
+    )
+    if rdma["ok"] and unverified_rdma is not None:
+        rdma["ok"] = False
+        rdma["reason"] = (
+            "not every cluster pair verified over RDMA: "
+            f"{unverified_rdma.reason}"
+        )
 
-    proposed, reason = choose_backend(links)
+    proposed, reason = choose_backend(pair_links)
     # choose_backend answers from what was detected, but no backend works
     # without an address both ends share, and every non-ring backend needs the
     # full RDMA matrix. Reconciling them here is what turns a failure inside a
     # constructor into a fallback the page can state.
-    unresolved = next((link for link in links if not link.ok), None)
+    unresolved = next((link for link in pair_links if not link.ok), None)
     blocker = ""
     if unresolved is not None:
         blocker = unresolved.reason
-    elif proposed != "ring" and not matrix.ok:
-        blocker = matrix.reason
+    elif proposed != "ring" and not rdma["ok"]:
+        blocker = str(rdma["reason"])
     fell_back = bool(blocker) and proposed != "ring"
     if fell_back:
         reason = f"{reason}; falling back to the TCP ring because {blocker}"
@@ -716,9 +778,10 @@ def _resolve_fabric(hosts: list[str]) -> dict[str, Any]:
         "ok": unresolved is None,
         "backend": backend,
         "backend_reason": reason,
+        "blocker": blocker,
         "fell_back": fell_back,
-        "link": links[0].to_dict(),
-        "rdma": matrix.to_dict(),
+        "link": (unresolved or links[0]).to_dict(),
+        "rdma": rdma,
         "hosts": [
             {
                 "host": host,
@@ -740,7 +803,7 @@ async def cluster_fabric(hosts: str = Query(...)):
     preference — so neither is a control the user has to get right.
     """
 
-    host_list = [item.strip() for item in hosts.split(",") if item.strip()]
+    host_list = _validated_ssh_targets(hosts)
     if len(host_list) < 2:
         raise HTTPException(
             status_code=400, detail="a distributed cluster needs at least two hosts"
@@ -758,6 +821,8 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     processes itself: the dashboard only posts its activation block after all
     preflight and staging checks report ready.
     """
+
+    _validate_cluster_hosts(request.hosts)
 
     plan_request = ClusterPlanRequest(
         model_path=request.model_path,
@@ -944,13 +1009,18 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     if request.detect_transports and len(ordered_hosts) > 1:
         ordered_host_targets = [host.ssh for host in ordered_hosts]
         if fabric is None or ordered_host_targets != requested_host_order:
+            # A fabric matrix is rank-ordered. If the placed order needs a new
+            # reading and that reading fails, the old matrix is actively
+            # unsafe — keeping it would hand each rank another Mac's path.
+            fabric = None
             try:
                 fabric = await asyncio.to_thread(
                     _resolve_fabric,
                     ordered_host_targets,
                 )
             except (OSError, RuntimeError, ValueError) as exc:
-                warnings.append(f"Address discovery failed: {exc}")
+                fabric_error = str(exc)
+                warnings.append(f"Address discovery failed: {fabric_error}")
     activation_hosts = [host.model_dump() for host in ordered_hosts]
     if fabric is not None:
         backend, backend_reason = fabric["backend"], fabric["backend_reason"]
@@ -959,7 +1029,21 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                 host["ips"] = discovered["ips"]
                 host["rdma"] = discovered["rdma"]
         else:
-            warnings.append(fabric["link"]["reason"])
+            warnings.append(fabric.get("blocker") or fabric["link"]["reason"])
+
+    fabric_required = request.detect_transports and len(ordered_hosts) > 1
+    fabric_ready = not fabric_required or bool(fabric and fabric.get("ok"))
+    fabric_blocker = ""
+    if not fabric_ready:
+        if fabric is not None:
+            fabric_blocker = str(
+                fabric.get("blocker")
+                or fabric.get("backend_reason")
+                or fabric.get("link", {}).get("reason")
+                or "the cluster route did not verify"
+            )
+        else:
+            fabric_blocker = fabric_error or "the cluster route could not be read"
 
     performance_probe: dict[str, Any] = {
         "ok": False,
@@ -980,7 +1064,8 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             "plan_changed": False,
         }
     elif (
-        request.measure_performance
+        fabric_ready
+        and request.measure_performance
         and request.auto_tune
         and request.model_path
         and len(activation_hosts) >= 2
@@ -1079,10 +1164,15 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     staging_ready = staging is None or bool(staging.get("ready"))
 
     plan_payload = _plan_with_signature(choice.plan.to_dict())
+    preflight_summary = describe_preflight(issues)
+    if fabric_blocker:
+        preflight_summary = f"Cluster link is not ready: {fabric_blocker}"
     return {
         "backend": backend,
         "backend_reason": backend_reason,
         "fabric": fabric,
+        "fabric_ready": fabric_ready,
+        "fabric_blocker": fabric_blocker,
         "tensor_parallel_size": choice.tensor_parallel_size,
         "pipeline_stages": choice.pipeline_stages,
         "summary": choice.reason,
@@ -1096,11 +1186,11 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         "performance_probe": performance_probe,
         "staging": staging,
         "strategies": STRATEGIES,
-        "preflight": describe_preflight(issues),
+        "preflight": preflight_summary,
         # Structured as well as summarised: an issue that carries a command is
         # a fix the user can paste, and a sentence hides it.
         "preflight_issues": [asdict(issue) for issue in issues],
-        "ready_to_activate": not issues and staging_ready,
+        "ready_to_activate": not issues and staging_ready and fabric_ready,
         "warnings": warnings,
         "transports": [transport.__dict__ for transport in transports],
         "plan": plan_payload,
@@ -1728,7 +1818,10 @@ async def cluster_link_setup(request: ClusterLinkSetupRequest):
     """
 
     try:
-        status = await asyncio.to_thread(configure_link, request.hosts)
+        hosts = [validate_ssh_target(host) for host in request.hosts]
+        status = await asyncio.to_thread(configure_link, hosts)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except LinkAuthorizationCancelledError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except LinkSetupError as exc:
@@ -2053,10 +2146,22 @@ class ClusterModelInventoryRequest(BaseModel):
     hosts: list[ClusterInventoryHostRequest] = Field(min_length=1, max_length=64)
 
 
+class ClusterNodeBudgetHostRequest(BaseModel):
+    """A Mac whose memory ceiling is measured over SSH.
+
+    Collective addresses do not belong here. Requiring ``ips`` before the
+    fabric was configured made the first memory measurement fail validation,
+    leaving the dashboard's old 64 GiB placeholder in place.
+    """
+
+    node_id: str = Field(min_length=1, max_length=128)
+    ssh: str = Field(min_length=1, max_length=255)
+
+
 class ClusterNodeBudgetRequest(BaseModel):
     """Ask each Mac what it can actually offer, rather than assuming."""
 
-    hosts: list[ClusterHostRequest] = Field(min_length=1, max_length=64)
+    hosts: list[ClusterNodeBudgetHostRequest] = Field(min_length=1, max_length=64)
     roles: dict[str, str] = Field(default_factory=dict)
 
 
@@ -2093,6 +2198,16 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
 
     from .node_role import suggest_budget
 
+    try:
+        hosts = [
+            host.model_copy(
+                update={"ssh": validate_ssh_target(host.ssh.strip())}
+            )
+            for host in request.hosts
+        ]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     async def _for(host: Any) -> dict[str, Any]:
         capacity_bytes = 0
         capacity_source: str | None = None
@@ -2112,7 +2227,7 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
         return {"node_id": host.node_id, "ssh": host.ssh, **budget.to_dict()}
 
     try:
-        nodes = list(await asyncio.gather(*(_for(host) for host in request.hosts)))
+        nodes = list(await asyncio.gather(*(_for(host) for host in hosts)))
     except (DistributedLaunchError, OSError, ValueError) as exc:
         raise HTTPException(
             status_code=503,

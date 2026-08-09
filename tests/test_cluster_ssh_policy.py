@@ -20,6 +20,7 @@ def test_new_aliases_are_accepted_without_weakening_changed_key_checks():
     assert "BatchMode=yes" in options
     assert "PasswordAuthentication=no" in options
     assert "KbdInteractiveAuthentication=no" in options
+    assert "AddressFamily=inet" in options
     assert "StrictHostKeyChecking=accept-new" in options
     assert "CheckHostIP=no" in options
     assert "IdentityFile=~/.ssh/omlx_cluster" in options
@@ -45,6 +46,7 @@ def test_policy_preserves_the_original_command_while_inserting_options(argv):
     assert protected[0] == original[0]
     assert protected[-2:] == original[-2:]
     assert "StrictHostKeyChecking=accept-new" in protected
+    assert "AddressFamily=inet" in protected
     assert "CheckHostIP=no" in protected
 
 

@@ -230,6 +230,24 @@ def test_link_setup_route_exposes_only_the_fixed_gui_operation(monkeypatch):
     assert injected.status_code == 422
 
 
+def test_link_setup_rejects_ssh_options_before_configuring(monkeypatch):
+    called = []
+    monkeypatch.setattr(
+        routes,
+        "configure_link",
+        lambda hosts: called.append(hosts),
+    )
+
+    response = _client().post(
+        "/admin/api/cluster/link-setup",
+        json={"hosts": ["127.0.0.1", "-oProxyCommand=touch /tmp/pwned"]},
+    )
+
+    assert response.status_code == 400
+    assert "invalid SSH target" in response.json()["detail"]
+    assert called == []
+
+
 def test_link_setup_route_reports_cancelled_native_authorization(monkeypatch):
     from omlx.cluster.transport import LinkAuthorizationCancelledError
 
@@ -426,12 +444,10 @@ def test_cluster_node_budgets_use_each_hosts_live_admission_ceiling(monkeypatch)
                 {
                     "node_id": "local",
                     "ssh": "127.0.0.1",
-                    "ips": ["10.0.0.1"],
                 },
                 {
                     "node_id": "studio",
                     "ssh": "studio.local",
-                    "ips": ["10.0.0.2"],
                 },
             ],
             "roles": {"local": "workstation", "studio": "headless"},
@@ -444,6 +460,31 @@ def test_cluster_node_budgets_use_each_hosts_live_admission_ceiling(monkeypatch)
     assert studio["capacity_bytes"] == 213 * gib + 123
     assert studio["capacity_source"] == "admission_ceiling"
     assert studio["capacity_bytes"] < 223 * gib
+
+
+def test_cluster_node_budgets_reject_ssh_options_before_probing(monkeypatch):
+    called = []
+    monkeypatch.setattr(
+        routes,
+        "probe_remote_admission_ceiling",
+        lambda ssh: called.append(ssh),
+    )
+
+    response = _client().post(
+        "/admin/api/cluster/node-budgets",
+        json={
+            "hosts": [
+                {
+                    "node_id": "peer",
+                    "ssh": "-oProxyCommand=touch /tmp/pwned",
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 400
+    assert "invalid SSH target" in response.json()["detail"]
+    assert called == []
 
 
 def test_cluster_plan_route_builds_unequal_pipeline():
@@ -969,6 +1010,11 @@ def _interfaces(name, addresses, *, rdma=(), thunderbolt=None):
 
 def _readings(monkeypatch, hosts):
     monkeypatch.setattr(routes, "probe_host_interfaces", lambda host: hosts[host])
+    monkeypatch.setattr(
+        routes,
+        "verify_link_reachability",
+        lambda link: (True, link.reason),
+    )
 
 
 def _no_links():
@@ -1134,6 +1180,127 @@ def test_the_fabric_reports_the_address_each_mac_answers_on(monkeypatch):
     ]
 
 
+def test_the_fabric_rejects_a_shared_subnet_that_does_not_answer(monkeypatch):
+    """Matching netmasks are a candidate, not proof of a working cable."""
+
+    _readings(
+        monkeypatch,
+        {
+            "127.0.0.1": _interfaces(
+                "127.0.0.1", [("en4", "10.0.1.1", 30)], rdma={"en4"}
+            ),
+            "studio.local": _interfaces(
+                "studio.local", [("en5", "10.0.1.2", 30)], rdma={"en5"}
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        routes,
+        "verify_link_reachability",
+        lambda _link: (
+            False,
+            "127.0.0.1 routes the address, but the peer did not answer.",
+        ),
+    )
+
+    body = (
+        _client()
+        .get("/admin/api/cluster/fabric", params={"hosts": "127.0.0.1,studio.local"})
+        .json()
+    )
+
+    assert body["ok"] is False
+    assert body["backend"] == "ring"
+    assert all(host["ips"] == [] for host in body["hosts"])
+    assert "did not answer" in body["backend_reason"]
+
+
+def test_the_fabric_falls_back_from_unreachable_rdma_to_verified_ethernet(
+    monkeypatch,
+):
+    """Dual-network Macs use the fastest path that actually answers."""
+
+    _readings(
+        monkeypatch,
+        {
+            "127.0.0.1": _interfaces(
+                "127.0.0.1",
+                [("en4", "10.0.1.1", 30), ("en0", "192.168.4.21", 24)],
+                rdma={"en4"},
+            ),
+            "studio.local": _interfaces(
+                "studio.local",
+                [("en5", "10.0.1.2", 30), ("en0", "192.168.4.22", 24)],
+                rdma={"en5"},
+            ),
+        },
+    )
+    checked = []
+
+    def verify(link):
+        checked.append(link.kind)
+        return (link.kind == "ethernet", f"{link.kind} did not answer")
+
+    monkeypatch.setattr(routes, "verify_link_reachability", verify)
+
+    body = (
+        _client()
+        .get("/admin/api/cluster/fabric", params={"hosts": "127.0.0.1,studio.local"})
+        .json()
+    )
+
+    assert checked == ["rdma", "ethernet"]
+    assert body["ok"] is True
+    assert body["backend"] == "ring"
+    assert body["rdma"]["ok"] is False
+    assert "verified" in body["rdma"]["reason"]
+    assert [host["ips"] for host in body["hosts"]] == [
+        ["192.168.4.21"],
+        ["192.168.4.22"],
+    ]
+
+
+def test_the_fabric_verifies_every_pair_not_only_the_coordinator_links(monkeypatch):
+    hosts = ("127.0.0.1", "studio.local", "mini.local")
+    _readings(
+        monkeypatch,
+        {
+            host: _interfaces(
+                host,
+                [(f"en{index + 4}", f"10.0.1.{index + 1}", 24)],
+                rdma={f"en{index + 4}"},
+            )
+            for index, host in enumerate(hosts)
+        },
+    )
+    checked = []
+
+    def verify(link):
+        pair = frozenset((link.source.host, link.peer.host))
+        checked.append(pair)
+        if pair == frozenset(("studio.local", "mini.local")):
+            return False, "studio.local cannot reach mini.local"
+        return True, link.reason
+
+    monkeypatch.setattr(routes, "verify_link_reachability", verify)
+
+    body = (
+        _client()
+        .get("/admin/api/cluster/fabric", params={"hosts": ",".join(hosts)})
+        .json()
+    )
+
+    assert set(checked) == {
+        frozenset(("127.0.0.1", "studio.local")),
+        frozenset(("127.0.0.1", "mini.local")),
+        frozenset(("studio.local", "mini.local")),
+    }
+    assert body["ok"] is False
+    assert body["backend"] == "ring"
+    assert body["rdma"]["ok"] is False
+    assert "studio.local cannot reach mini.local" in body["blocker"]
+
+
 def test_a_thunderbolt_pair_without_rdma_falls_back_to_the_ring_out_loud(monkeypatch):
     """A Thunderbolt link makes choose_backend say jaccl-ring, which needs a matrix.
 
@@ -1192,6 +1359,55 @@ def test_one_host_is_not_a_fabric():
     assert response.status_code == 400
 
 
+def test_fabric_rejects_an_ssh_option_before_running_a_probe(monkeypatch):
+    def unexpected_probe(_host):
+        raise AssertionError("an invalid SSH target reached the probe")
+
+    monkeypatch.setattr(
+        routes,
+        "probe_host_interfaces",
+        unexpected_probe,
+    )
+
+    response = _client().get(
+        "/admin/api/cluster/fabric",
+        params={"hosts": "127.0.0.1,-oProxyCommand=bad"},
+    )
+
+    assert response.status_code == 400
+    assert "invalid SSH target" in response.json()["detail"]
+
+
+def test_autoconfigure_rejects_an_invalid_manual_ip_before_planning():
+    response = _client().post(
+        "/admin/api/cluster/autoconfigure",
+        json={
+            "model_size_bytes": 40 * 1024**3,
+            "layer_count": 32,
+            "nodes": [
+                {"node_id": f"node-{index}", "capacity_bytes": 64 * 1024**3}
+                for index in range(2)
+            ],
+            "hosts": [
+                {
+                    "node_id": "node-0",
+                    "ssh": "127.0.0.1",
+                    "ips": ["not-an-ip"],
+                },
+                {
+                    "node_id": "node-1",
+                    "ssh": "studio.local",
+                    "ips": ["10.77.0.2"],
+                },
+            ],
+            "detect_transports": False,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "invalid communication IP" in response.text
+
+
 def test_autoconfigure_activates_on_discovered_addresses_not_supplied_ones(
     monkeypatch,
 ):
@@ -1244,6 +1460,122 @@ def test_autoconfigure_activates_on_discovered_addresses_not_supplied_ones(
         [None, "rdma_en4"],
         ["rdma_en5", None],
     ]
+
+
+def test_autoconfigure_uses_verified_ethernet_when_rdma_is_unreachable(
+    monkeypatch,
+):
+    _readings(
+        monkeypatch,
+        {
+            "127.0.0.1": _interfaces(
+                "127.0.0.1",
+                [("en4", "10.0.1.1", 30), ("en0", "192.168.4.21", 24)],
+                rdma={"en4"},
+            ),
+            "studio.local": _interfaces(
+                "studio.local",
+                [("en5", "10.0.1.2", 30), ("en0", "192.168.4.22", 24)],
+                rdma={"en5"},
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        routes,
+        "verify_link_reachability",
+        lambda link: (link.kind == "ethernet", f"{link.kind} did not answer"),
+    )
+    monkeypatch.setattr(routes, "detect_cluster_transports", lambda _hosts: _no_links())
+    monkeypatch.setattr(routes, "probe_remote_host", lambda _ssh, **_: None)
+
+    body = (
+        _client()
+        .post(
+            "/admin/api/cluster/autoconfigure",
+            json={
+                "model_size_bytes": 40 * 1024**3,
+                "layer_count": 32,
+                "nodes": [
+                    {"node_id": f"node-{index}", "capacity_bytes": 64 * 1024**3}
+                    for index in range(2)
+                ],
+                "hosts": [
+                    {
+                        "node_id": "node-0",
+                        "ssh": "127.0.0.1",
+                        "ips": ["10.0.1.1"],
+                    },
+                    {
+                        "node_id": "node-1",
+                        "ssh": "studio.local",
+                        "ips": ["10.0.1.2"],
+                    },
+                ],
+                "preflight": False,
+                "auto_tune": False,
+            },
+        )
+        .json()
+    )
+
+    assert body["backend"] == "ring"
+    assert body["activation"]["backend"] == "ring"
+    assert [host["ips"] for host in body["activation"]["hosts"]] == [
+        ["192.168.4.21"],
+        ["192.168.4.22"],
+    ]
+    assert [host["rdma"] for host in body["activation"]["hosts"]] == [[], []]
+
+
+def test_autoconfigure_preserves_manual_addresses_when_detection_is_disabled(
+    monkeypatch,
+):
+    """An operator-selected route must survive all the way to activation."""
+
+    def unexpected_discovery(*_args, **_kwargs):
+        raise AssertionError("manual addressing must not trigger rediscovery")
+
+    monkeypatch.setattr(routes, "detect_cluster_transports", unexpected_discovery)
+    monkeypatch.setattr(routes, "_resolve_fabric", unexpected_discovery)
+
+    body = (
+        _client()
+        .post(
+            "/admin/api/cluster/autoconfigure",
+            json={
+                "model_size_bytes": 40 * 1024**3,
+                "layer_count": 32,
+                "nodes": [
+                    {"node_id": f"node-{index}", "capacity_bytes": 64 * 1024**3}
+                    for index in range(2)
+                ],
+                "hosts": [
+                    {
+                        "node_id": "node-0",
+                        "ssh": "127.0.0.1",
+                        "ips": ["10.77.0.1"],
+                    },
+                    {
+                        "node_id": "node-1",
+                        "ssh": "studio.local",
+                        "ips": ["10.77.0.2"],
+                    },
+                ],
+                "detect_transports": False,
+                "preflight": False,
+                "auto_tune": False,
+            },
+        )
+        .json()
+    )
+
+    assert body["fabric"] is None
+    assert body["backend"] == "ring"
+    assert [host["ips"] for host in body["activation"]["hosts"]] == [
+        ["10.77.0.1"],
+        ["10.77.0.2"],
+    ]
+    assert [host["rdma"] for host in body["activation"]["hosts"]] == [[], []]
 
 
 def test_a_peer_that_cannot_import_blocks_activation_with_its_fix(

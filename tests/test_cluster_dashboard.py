@@ -143,6 +143,14 @@ def test_cluster_dashboard_names_roles_and_uses_detected_topology():
     )[0]
     assert "memory_guard_tier:" in node_payload
     assert "this.globalSettings?.memory?.memory_guard_tier || 'balanced'" in node_payload
+    assert "const useDiscoveredFabric = !this.clusterIpsOverridden" in javascript
+    assert "if (this.clusterIpsOverridden) return 'ring'" in javascript
+    assert "this.clusterFabric?.backend === 'jaccl'" in javascript
+    assert "hosts.length > 0 && !this.clusterIpsOverridden" in javascript
+    assert "TCP ring · manual addresses" in javascript
+    assert 'clusterFabric && !clusterIpsOverridden' in cluster
+    assert "clusterCatalogueInputsReady()" in javascript
+    assert "requestKey !== this.clusterCatalogueRequestKey()" in javascript
 
 
 def test_cluster_dashboard_leads_with_one_click_setup():

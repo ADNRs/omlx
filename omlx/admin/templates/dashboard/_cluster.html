@@ -1570,7 +1570,7 @@
                                 Use the discovered addresses
                             </button>
                             <span x-show="clusterIpsOverridden" x-cloak class="text-[10px] text-amber-700">
-                                Edited by hand — activation will use what is in the boxes.
+                                Edited by hand — activation will use these addresses over the TCP ring.
                             </span>
                             <template x-if="clusterFabric && !clusterIpsOverridden">
                                 <span class="text-[10px]"
@@ -1589,7 +1589,7 @@
                              but the TCP ring needs a full RDMA matrix, so when
                              one cannot be derived the fall back is said out
                              loud instead of dying inside a constructor. -->
-                        <template x-if="clusterFabric">
+                        <template x-if="clusterFabric && !clusterIpsOverridden">
                             <div class="mt-2 rounded-xl border px-3 py-2"
                                  :class="clusterFabric.fell_back
                                     ? 'border-amber-200 bg-amber-50'
