@@ -6061,3 +6061,43 @@ class TestSchedulerModelIdDerivation:
         progress_none = tracker.get_model_progress("def456")
         assert len(progress_none) == 0
         tracker.clear()
+
+
+class TestSupportsSkipLmHead:
+    """Regression coverage for Scheduler._supports_skip_lm_head.
+
+    Chunked prefill discards every chunk's logits, so patched DeepSeek-V4
+    models accept ``skip_lm_head=True`` to skip the full-vocabulary
+    projection. Unknown models must keep stock behavior.
+    """
+
+    def _scheduler_with_model(self, model):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.model = model
+        return scheduler
+
+    def test_detects_support(self):
+        class PatchedModel:
+            def __call__(self, inputs, cache=None, skip_lm_head=False):
+                return None
+
+        scheduler = self._scheduler_with_model(PatchedModel())
+        assert scheduler._supports_skip_lm_head() is True
+        # Result is cached on the instance.
+        assert scheduler._skip_lm_head_supported is True
+
+    def test_rejects_stock_model(self):
+        class StockModel:
+            def __call__(self, inputs, cache=None):
+                return None
+
+        scheduler = self._scheduler_with_model(StockModel())
+        assert scheduler._supports_skip_lm_head() is False
+        assert scheduler._skip_lm_head_supported is False
+
+    def test_rejects_missing_call(self):
+        class NoCall:
+            pass
+
+        scheduler = self._scheduler_with_model(NoCall())
+        assert scheduler._supports_skip_lm_head() is False

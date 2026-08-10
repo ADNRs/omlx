@@ -812,6 +812,7 @@ def test_step_prefill_reclaims_before_first_guard():
         _memory_limit_bytes=0,
         _glm_dsa_adaptive_prefill=None,
         model=lambda *args, **kwargs: events.append("model"),
+        _supports_skip_lm_head=lambda: False,
         _adaptive_chunk_size=lambda n, **kwargs: events.append("adaptive") or n,
         _guard_prefill_chunk=lambda n, **kwargs: events.append("guard") or n,
         _record_chunk_transient=MagicMock(),

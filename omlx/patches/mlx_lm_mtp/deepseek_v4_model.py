@@ -350,7 +350,33 @@ def _patch_model(dsv4: Any) -> None:
         cache=None,
         return_hidden: bool = False,
         n_confirmed: int = 0,
+        skip_lm_head: bool = False,
     ):
+        if skip_lm_head:
+            # Chunked prefill discards per-chunk logits (the prompt's final
+            # token is scored by the first decode step instead). Run the
+            # hidden pass and preserve capture side effects, but skip the
+            # full-vocabulary projection for every chunk.
+            if (
+                getattr(self, "_omlx_dspark_decode_enabled", False)
+                and not n_confirmed
+                and cache is not None
+            ):
+                h, h_aux = self.model(inputs, cache, return_dspark_hidden=True)
+                try:
+                    deepseek_v4_dspark.capture_prompt(self, inputs, h_aux, cache)
+                except Exception:
+                    logger.debug("DeepSeek DSpark prompt capture failed", exc_info=True)
+                return None
+            if not n_confirmed and prompt_priming.capture_eligible(self, cache):
+                h, h_raw = self.model(inputs, cache, return_raw_hidden=True)
+                try:
+                    prompt_priming.maybe_capture(self, inputs, h_raw, cache)
+                except Exception:
+                    logger.debug("MTP prompt-priming capture failed", exc_info=True)
+                return None
+            self.model(inputs, cache)
+            return None
         # ``n_confirmed`` is part of the patched-backbone interface:
         # batch_generator._call_backbone passes n_confirmed=1 during MTP
         # verify cycles. It only matters for models with module-level

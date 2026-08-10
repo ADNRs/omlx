@@ -3366,6 +3366,8 @@ class Scheduler:
                         model_kwargs["vlm_extra_kwargs"] = _slice_vlm_extra(
                             extra_kwargs, n_to_process
                         )
+                if self._supports_skip_lm_head():
+                    model_kwargs["skip_lm_head"] = True
                 self.model(
                     input_arr[:, :n_to_process],
                     cache=prompt_cache,
@@ -4431,6 +4433,36 @@ class Scheduler:
             self._prefill_transient_tracker.samples,
         )
 
+    def _supports_skip_lm_head(self) -> bool:
+        """Whether the loaded model accepts ``skip_lm_head=True``.
+
+        Chunked prefill discards every chunk's logits (the prompt's final
+        token is scored by the first decode step), so models whose patched
+        ``__call__`` accepts the flag can skip the full-vocabulary
+        projection for every prefill chunk — for a 129k-vocab model that
+        GEMM is the single largest per-chunk matmul and was pure waste.
+        Detected once per scheduler; unknown models keep stock behavior.
+        """
+        supported = getattr(self, "_skip_lm_head_supported", None)
+        if supported is None:
+            try:
+                import inspect
+
+                call = getattr(type(self.model), "__call__", None)
+                supported = bool(
+                    call is not None
+                    and "skip_lm_head" in inspect.signature(call).parameters
+                )
+            except Exception:
+                supported = False
+            self._skip_lm_head_supported = supported
+            if supported:
+                logger.info(
+                    "Prefill lm_head skip enabled: chunk logits are discarded, "
+                    "vocabulary projection deferred to first decode step."
+                )
+        return supported
+
     def _maybe_record_fixed_state_bytes(self, cache_list: Any) -> None:
         """Measure the GDN/Mamba fixed recurrent-state footprint once.
 
@@ -4650,7 +4682,10 @@ class Scheduler:
         with mx.stream(self._stream):
             chunk = state.tokens_remaining[:, :n]
             state.tokens_remaining = state.tokens_remaining[:, n:]
-            self.model(chunk, cache=state.cache)
+            if self._supports_skip_lm_head():
+                self.model(chunk, cache=state.cache, skip_lm_head=True)
+            else:
+                self.model(chunk, cache=state.cache)
             mx.eval([c.state for c in state.cache])
         _throttle_post = get_phys_footprint()
         self._record_chunk_transient(
