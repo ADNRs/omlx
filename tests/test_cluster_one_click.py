@@ -447,12 +447,14 @@ component.clusterPeerProbeLoading = false;
 component.clusterPeerProbe = null;
 component.clusterLocalIp = '';
 component.clusterError = 'The other Mac rejected the login';
+component.clusterConnectionError = 'The other Mac rejected the login';
 component.clusterResponseError = async () => 'The other Mac rejected the login';
 (async () => {
   await component.probeClusterPeer();
   process.stdout.write(JSON.stringify({
     errorDuringFetch,
     finalError: component.clusterError,
+    finalConnectionError: component.clusterConnectionError,
   }));
 })().catch(error => {
   console.error(error);
@@ -464,6 +466,157 @@ component.clusterResponseError = async () => 'The other Mac rejected the login';
     assert result == {
         "errorDuringFetch": "The other Mac rejected the login",
         "finalError": "The other Mac rejected the login",
+        "finalConnectionError": "The other Mac rejected the login",
+    }
+
+
+def test_successful_peer_retry_clears_connection_error_and_guidance():
+    result = _run_dashboard_helpers(
+        ("probeClusterPeer", "clusterDisplayedError"),
+        """
+global.window = { location: { href: '' } };
+global.fetch = async () => ({
+  status: 200,
+  ok: true,
+  json: async () => ({ status: { node: { hostname: 'studio' } } }),
+});
+component.clusterPeerSsh = 'studio.local';
+component.clusterPeerProbeLoading = false;
+component.clusterPeerProbe = null;
+component.clusterPeerProbes = {};
+component.clusterPlanNodes = [];
+component.clusterLocalIp = '';
+component.clusterConnectionError = 'The other Mac rejected the oMLX key';
+component.clusterError = 'The other Mac rejected the oMLX key';
+component.clusterGuidance = { title: 'Pair the Macs' };
+component.dismissClusterGuidance = () => { component.clusterGuidance = null; };
+component.saveClusterKnownNodes = () => {};
+component.$nextTick = async () => {};
+component.invalidateClusterPlan = () => {};
+component.loadClusterFabric = async () => {};
+(async () => {
+  await component.probeClusterPeer();
+  process.stdout.write(JSON.stringify({
+    displayed: component.clusterDisplayedError(),
+    genericError: component.clusterError,
+    connectionError: component.clusterConnectionError,
+    guidance: component.clusterGuidance,
+    probed: Boolean(component.clusterPeerProbe),
+  }));
+})().catch(error => {
+  console.error(error);
+  process.exit(1);
+});
+""",
+    )
+
+    assert result == {
+        "displayed": "",
+        "genericError": "",
+        "connectionError": "",
+        "guidance": None,
+        "probed": True,
+    }
+
+
+def test_status_polling_preserves_peer_connection_guidance():
+    result = _run_dashboard_helpers(
+        ("loadClusterStatus",),
+        """
+global.window = { location: { href: '' } };
+global.fetch = async () => ({
+  status: 200,
+  ok: true,
+  json: async () => ({ node: { hostname: 'local' } }),
+});
+component.clusterLoading = false;
+component.clusterError = 'The other Mac rejected the oMLX key';
+component.clusterConnectionError = 'The other Mac rejected the oMLX key';
+component.clusterGuidance = { title: 'Pair the Macs' };
+component.clusterRouteTo = '';
+component._clusterDefaultsApplied = true;
+component.loadRememberedClusterConfig = () => {};
+component.dismissClusterGuidance = () => { component.clusterGuidance = null; };
+(async () => {
+  await component.loadClusterStatus();
+  process.stdout.write(JSON.stringify({
+    genericError: component.clusterError,
+    connectionError: component.clusterConnectionError,
+    guidance: component.clusterGuidance,
+    statusHost: component.clusterStatus.node.hostname,
+  }));
+})().catch(error => {
+  console.error(error);
+  process.exit(1);
+});
+""",
+    )
+
+    assert result == {
+        "genericError": "",
+        "connectionError": "The other Mac rejected the oMLX key",
+        "guidance": {"title": "Pair the Macs"},
+        "statusHost": "local",
+    }
+
+
+def test_background_replanning_does_not_unmount_a_peer_connection_error():
+    result = _run_dashboard_helpers(
+        ("clusterDisplayedError", "invalidateClusterPlan"),
+        """
+component.clusterConnectionError = 'The other Mac rejected the oMLX key';
+component.clusterError = 'The other Mac rejected the oMLX key';
+component.clusterPlan = { ready: true };
+component.clusterPlanError = 'old plan';
+component.clusterAutoconfigureError = 'old setup';
+component.clusterActivationResult = { ok: false };
+component.clusterPlanChanges = { changed: true };
+component._clusterPlanSignature = 'old';
+component._clusterPlanRevision = 1;
+const before = component.clusterDisplayedError();
+component.invalidateClusterPlan();
+process.stdout.write(JSON.stringify({
+  before,
+  after: component.clusterDisplayedError(),
+  genericError: component.clusterError,
+  connectionError: component.clusterConnectionError,
+}));
+""",
+    )
+
+    assert result == {
+        "before": "The other Mac rejected the oMLX key",
+        "after": "The other Mac rejected the oMLX key",
+        "genericError": "",
+        "connectionError": "The other Mac rejected the oMLX key",
+    }
+
+
+def test_changing_the_peer_clears_its_connection_error_and_guidance():
+    result = _run_dashboard_helpers(
+        ("clusterDisplayedError", "invalidateClusterPeer"),
+        """
+component.clusterPeerProbe = { ok: false };
+component.clusterConnectionError = 'The old Mac rejected the oMLX key';
+component.clusterError = 'The old Mac rejected the oMLX key';
+component.clusterGuidance = { title: 'Pair the old Mac' };
+component.dismissClusterGuidance = () => { component.clusterGuidance = null; };
+component.invalidateClusterPlan = () => {};
+component.invalidateClusterPeer(false);
+process.stdout.write(JSON.stringify({
+  displayed: component.clusterDisplayedError(),
+  genericError: component.clusterError,
+  connectionError: component.clusterConnectionError,
+  guidance: component.clusterGuidance,
+}));
+""",
+    )
+
+    assert result == {
+        "displayed": "",
+        "genericError": "",
+        "connectionError": "",
+        "guidance": None,
     }
 
 

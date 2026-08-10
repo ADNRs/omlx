@@ -263,6 +263,11 @@
             clusterStatus: null,
             clusterLoading: false,
             clusterError: '',
+            // Connection failures outlive plan invalidation. Automatic memory,
+            // model and fabric refreshes rebuild the plan in the background;
+            // treating that as permission to unmount an SSH error made the
+            // whole page jump on every retry.
+            clusterConnectionError: '',
             clusterRouteTo: '',
             clusterWorkerRunning: false,
             clusterWorkerResult: null,
@@ -393,6 +398,7 @@
             clusterPairingToken: null,
             clusterPairingTokenLoading: false,
             clusterPairingSecret: '',
+            clusterPairingSecretCopied: false,
             clusterSshKey: null,
             clusterSshKeyLoading: false,
             clusterSshKeyGenerating: false,
@@ -954,6 +960,10 @@
                 return messages.filter(Boolean).join(', ') || fallback;
             },
 
+            clusterDisplayedError() {
+                return this.clusterConnectionError || this.clusterError;
+            },
+
             async explainClusterError(message) {
                 this.clusterGuidance = null;
                 if (!message) return;
@@ -990,7 +1000,10 @@
                 if (this.clusterLoading) return;
                 this.clusterLoading = true;
                 this.clusterError = '';
-                this.dismissClusterGuidance();
+                // Status polling is unrelated to an in-flight peer login. Keep
+                // that login's recovery steps mounted until it succeeds or the
+                // user changes the peer.
+                if (!this.clusterConnectionError) this.dismissClusterGuidance();
                 this.loadRememberedClusterConfig();
                 try {
                     const params = new URLSearchParams();
@@ -1297,6 +1310,7 @@
                     // automatic retry is in flight. Clearing it before SSH
                     // answers made the whole page jump every ten seconds.
                     this.clusterError = '';
+                    this.clusterConnectionError = '';
                     this.dismissClusterGuidance();
                     this.clusterPeerProbe = result;
                     this.clusterPeerProbes = {
@@ -1327,7 +1341,9 @@
                     // rather than leaving two addresses to be typed.
                     await this.loadClusterFabric();
                 } catch (error) {
-                    this.clusterError = error?.message || 'Peer probe failed';
+                    const message = error?.message || 'Peer probe failed';
+                    this.clusterError = message;
+                    this.clusterConnectionError = message;
                 } finally {
                     this.clusterPeerProbeLoading = false;
                 }
@@ -1629,6 +1645,16 @@
                 // Tokens are bound to the secret that authenticated them.
                 this.clusterPairingToken = null;
                 this.clusterExchangeToken = null;
+                this.clusterPairingSecretCopied = false;
+            },
+
+            copyClusterPairingSecret() {
+                if (this.clusterPairingSecret.length < 16) return;
+                this.copyToClipboard(this.clusterPairingSecret);
+                this.clusterPairingSecretCopied = true;
+                setTimeout(() => {
+                    this.clusterPairingSecretCopied = false;
+                }, 2000);
             },
 
             async generatePairingToken() {
@@ -1818,6 +1844,11 @@
 
             invalidateClusterPeer(clearNetwork = false) {
                 this.clusterPeerProbe = null;
+                if (this.clusterError === this.clusterConnectionError) {
+                    this.clusterError = '';
+                }
+                this.clusterConnectionError = '';
+                this.dismissClusterGuidance();
                 if (clearNetwork) {
                     this.clusterPeerProbes = {};
                     // A different peer is a different fabric: its addresses and

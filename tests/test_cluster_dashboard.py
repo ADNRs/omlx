@@ -394,6 +394,14 @@ def test_pairing_failure_exposes_omlx_and_terminal_recovery_paths():
     assert "Open SSH setup in oMLX" in cluster
     assert "Or run this in Terminal on this Mac" in cluster
     assert "Don't have the oMLX SSH key yet?" in cluster
+    assert "Terminal SSH can work while oMLX cannot" in cluster
+    assert "Step 1 of 3" in cluster
+    assert "Step 2 of 3" in cluster
+    assert "Step 3 of 3" in cluster
+    assert "Repeat in the other direction" in cluster
+    assert "copyClusterPairingSecret()" in cluster
+    assert "t('cluster.pairing.shared_secret')" in cluster
+    assert "t('cluster.pairing.shared_secret_hint')" in cluster
     assert "data-cluster-ssh-setup" in cluster
     assert "openClusterPairingSetup()" in javascript
 
