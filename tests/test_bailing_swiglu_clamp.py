@@ -13,6 +13,7 @@ mx = pytest.importorskip("mlx.core")
 
 from omlx.patches.bailing_hybrid import apply_bailing_hybrid_patch  # noqa: E402
 from omlx.patches.bailing_hybrid.swiglu_clamp import (  # noqa: E402
+    bind_limits,
     layer_swiglu_limit,
 )
 
@@ -130,6 +131,41 @@ class TestWiring:
                 shared.append((idx, _shared_limit(se)))
         assert routed == [(N_LAYERS - 2, 4.0), (N_LAYERS - 1, 4.0)]
         assert shared == [(N_LAYERS - 2, 5.0), (N_LAYERS - 1, 7.0)]
+
+    def test_dense_layers_ignore_routed_expert_limits(self):
+        cfg = dict(CFG)
+        cfg["first_k_dense_replace"] = 2
+        cfg["expert_swiglu_limit_list"] = [4, 4] + [0] * (N_LAYERS - 2)
+        model = bh.Model(bh.ModelArgs.from_dict(cfg))
+
+        for layer in model.model.layers[:2]:
+            assert getattr(layer.mlp, "switch_mlp", None) is None
+            assert getattr(layer.mlp, "swiglu_limit", None) is None
+
+    def test_installed_path_ignores_dense_layer_limits(self):
+        from types import SimpleNamespace
+
+        dense = SimpleNamespace()
+        routed = SimpleNamespace(activation=None)
+        shared = SimpleNamespace()
+        moe = SimpleNamespace(switch_mlp=routed, shared_experts=shared)
+        model = SimpleNamespace(
+            model=SimpleNamespace(
+                layers=[SimpleNamespace(mlp=dense), SimpleNamespace(mlp=moe)]
+            )
+        )
+        config = SimpleNamespace(
+            expert_swiglu_limit_list=[4, 4],
+            share_expert_swiglu_limit_list=[5, 5],
+        )
+        module = SimpleNamespace(
+            ClampedSwiGLU=lambda limit: SimpleNamespace(limit=limit)
+        )
+
+        assert bind_limits(module, model, config) == 2
+        assert not hasattr(dense, "_omlx_swiglu_limit")
+        assert routed.activation.limit == 4.0
+        assert shared._omlx_swiglu_limit == 5.0
 
     def test_without_limits_model_is_unclamped(self):
         model = bh.Model(bh.ModelArgs.from_dict(dict(CFG)))

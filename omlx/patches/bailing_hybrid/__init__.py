@@ -18,6 +18,8 @@ import logging
 import sys
 from pathlib import Path
 
+from .swiglu_clamp import ensure_swiglu_clamp
+
 logger = logging.getLogger(__name__)
 
 BRANCH_HEAD_SHA = "d719464ff754e65d9dec496ef3fea27bddefd79c"
@@ -75,23 +77,14 @@ def apply_bailing_hybrid_patch() -> bool:
         models_pkg.bailing_hybrid = module
         applied = False
 
-    _APPLIED = True
-
     # Whichever build ended up live, make sure Ling's trained SwiGLU clamp is
     # in force. The vendored copy implements it in-source; an mlx-lm build
     # that already ships bailing_hybrid does not.
-    try:
-        from .swiglu_clamp import ensure_swiglu_clamp
+    module = importlib.import_module(_MODULE_NAME)
+    if ensure_swiglu_clamp(module):
+        logger.info("Ling SwiGLU clamp installed on %s", _MODULE_NAME)
 
-        module = importlib.import_module(_MODULE_NAME)
-        if ensure_swiglu_clamp(module):
-            logger.info("Ling SwiGLU clamp installed on %s", _MODULE_NAME)
-    except Exception:
-        logger.warning(
-            "Could not install Ling SwiGLU clamp; the model will run "
-            "unclamped and lose accuracy",
-            exc_info=True,
-        )
+    _APPLIED = True
 
     if applied:
         logger.info(

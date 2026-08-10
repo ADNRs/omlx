@@ -19,33 +19,25 @@ can come from either place:
 
 * oMLX's vendored copy in this package, which implements the clamp natively —
   ``ensure_swiglu_clamp`` detects that and does nothing;
-* an mlx-lm build that already ships ``bailing_hybrid`` (oMLX's bundled one
-  does), in which case the clamp is installed onto the live classes here.
+* an mlx-lm build that already ships ``bailing_hybrid``, in which case the
+  clamp is installed onto the live classes here.
 
 Semantics match vLLM exactly::
 
     silu(gate).clamp(max=limit) * up.clamp(-limit, limit)
-
-Set ``OMLX_LING_NO_SWIGLU_CLAMP=1`` to restore the unclamped behaviour; that
-is how the A/B above was produced.
 """
 
 from __future__ import annotations
 
 import logging
-import os
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 _LIMIT_ATTR = "_omlx_swiglu_limit"
 
 
-def clamp_disabled() -> bool:
-    return os.environ.get("OMLX_LING_NO_SWIGLU_CLAMP") == "1"
-
-
-def layer_swiglu_limit(limit_list: Any, layer_idx: int) -> Optional[float]:
+def layer_swiglu_limit(limit_list: Any, layer_idx: int) -> float | None:
     """Per-layer limit, or None when the list is absent, short, or zero."""
     if not limit_list or layer_idx >= len(limit_list):
         return None
@@ -91,7 +83,7 @@ def _install(module: Any) -> None:
     if not getattr(mlp_cls.__dict__.get("__call__"), "_omlx_clamp", False):
         stock_swiglu = module.swiglu
 
-        def __call__(self, x):
+        def patched_call(self, x):
             gate = self.gate_proj(x)
             up = self.up_proj(x)
             limit = getattr(self, _LIMIT_ATTR, None)
@@ -99,14 +91,12 @@ def _install(module: Any) -> None:
                 return self.down_proj(module.clamped_swiglu(gate, up, limit))
             return self.down_proj(stock_swiglu(gate, up))
 
-        __call__._omlx_clamp = True
-        mlp_cls.__call__ = __call__
+        patched_call._omlx_clamp = True
+        mlp_cls.__call__ = patched_call
 
 
 def bind_limits(module: Any, model: Any, config: Any) -> int:
     """Bind per-layer limits onto a constructed model. Returns paths clamped."""
-    if clamp_disabled():
-        return 0
     expert_list = getattr(config, "expert_swiglu_limit_list", None)
     shared_list = getattr(config, "share_expert_swiglu_limit_list", None)
     if not expert_list and not shared_list:
@@ -129,12 +119,6 @@ def bind_limits(module: Any, model: Any, config: Any) -> int:
                 if limit:
                     setattr(shared, _LIMIT_ATTR, limit)
                     clamped += 1
-        else:
-            # Dense layer: its own MLP takes the routed-expert limit.
-            limit = layer_swiglu_limit(expert_list, idx)
-            if limit:
-                setattr(mlp, _LIMIT_ATTR, limit)
-                clamped += 1
     return clamped
 
 
@@ -144,13 +128,6 @@ def ensure_swiglu_clamp(module: Any) -> bool:
     Returns True when the clamp had to be installed (i.e. the module did not
     already implement it natively).
     """
-    if clamp_disabled():
-        logger.warning(
-            "Ling SwiGLU clamp disabled via OMLX_LING_NO_SWIGLU_CLAMP; the "
-            "model will run unclamped and lose accuracy"
-        )
-        return False
-
     if getattr(module, "_omlx_swiglu_clamp_native", False):
         return False
     # The vendored copy implements the clamp in-source; nothing to do.
@@ -183,7 +160,7 @@ def ensure_swiglu_clamp(module: Any) -> bool:
     if not getattr(model_cls, "_omlx_clamp_init", False):
         original_init = model_cls.__init__
 
-        def __init__(self, config):
+        def patched_init(self, config):
             original_init(self, config)
             clamped = bind_limits(module, self, config)
             if clamped:
@@ -194,7 +171,7 @@ def ensure_swiglu_clamp(module: Any) -> bool:
                     clamped,
                 )
 
-        model_cls.__init__ = __init__
+        model_cls.__init__ = patched_init
         model_cls._omlx_clamp_init = True
 
     module._omlx_swiglu_clamp_installed = True
@@ -203,7 +180,6 @@ def ensure_swiglu_clamp(module: Any) -> bool:
 
 __all__ = [
     "bind_limits",
-    "clamp_disabled",
     "ensure_swiglu_clamp",
     "layer_swiglu_limit",
 ]

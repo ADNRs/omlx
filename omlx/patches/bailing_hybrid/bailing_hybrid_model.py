@@ -652,12 +652,7 @@ class DecoderLayer(nn.Module):
         if args.num_experts is not None and layer_idx >= args.first_k_dense_replace:
             self.mlp = SparseMoeBlock(args, layer_idx=layer_idx)
         else:
-            self.mlp = MLP(
-                args,
-                swiglu_limit=layer_swiglu_limit(
-                    args.expert_swiglu_limit_list, layer_idx
-                ),
-            )
+            self.mlp = MLP(args)
 
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
