@@ -253,6 +253,28 @@ def test_encode_image_matches_get_input_embeddings(applied):
     assert bool(mx.allclose(direct.inputs_embeds, replayed.inputs_embeds))
 
 
+def test_centered_rms_norm_preserves_transformers_fp32_order(applied):
+    # Ported from mlx-vlm PR #1838 (commit edfb0ef1): the centered scale is
+    # applied in FP32 before the single downcast. Casting earlier (the old
+    # mx.fast.rms_norm(x, 1+w) form) shifts ~39% of bf16 outputs by up to
+    # 4 ulps on real weights, enough to flip near-tie decode choices.
+    from mlx_vlm.models.muse_glimmer.language import CenteredRMSNorm
+
+    norm = CenteredRMSNorm(4, eps=1e-6)
+    norm.weight = (mx.arange(4, dtype=mx.float32) * 0.031 - 0.2).astype(mx.bfloat16)
+    inputs = (
+        (mx.arange(4, dtype=mx.float32) * 0.37 - 1.13).reshape(1, 4).astype(mx.bfloat16)
+    )
+
+    inputs32 = inputs.astype(mx.float32)
+    variance = mx.mean(mx.square(inputs32), axis=-1, keepdims=True)
+    expected = inputs32 * mx.rsqrt(variance + 1e-6)
+    expected = expected * (1.0 + norm.weight.astype(mx.float32))
+    expected = expected.astype(mx.bfloat16)
+
+    assert bool(mx.array_equal(norm(inputs), expected))
+
+
 def test_quantization_preserves_embedding_norm(applied):
     import mlx.nn as nn
 

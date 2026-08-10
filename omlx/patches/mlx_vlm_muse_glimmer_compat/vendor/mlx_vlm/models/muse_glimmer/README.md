@@ -1,8 +1,14 @@
 # Vendored mlx-vlm muse_glimmer (Meta Muse Glimmer 30B)
 
 Source: Blaizzy/mlx-vlm PR #1838 head (model package + prompt_utils
-registration), plus the quantization fix from PR #1839. Vendored because
-both PRs are newer than oMLX's mlx-vlm pin (`78b96eb`).
+registration; includes the CenteredRMSNorm FP32 operation-order fix from
+commits edfb0ef1 + 6242d295), plus the quantization fix from PR #1839.
+Vendored because both PRs are newer than oMLX's mlx-vlm pin (`78b96eb`).
+
+The CenteredRMSNorm implementation is duplicated in dflash-mlx's
+`dflash_mlx/models/muse_glimmer.py`; the two must stay numerically
+identical or DFlash verify logits drift from serving logits
+(tests/test_dflash_muse_glimmer.py guards this).
 
 ## oMLX deltas against the PR head (marked with `oMLX:` comments)
 
