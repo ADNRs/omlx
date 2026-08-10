@@ -67,6 +67,16 @@ class PrefillTransientTracker:
         if reclaimed_bytes > 0:
             self._recent_reclaim_bytes += int(reclaimed_bytes)
 
+    def clear_reclaim(self) -> None:
+        """Drop the charge once any positive measurement confirms realloc.
+
+        Callers invoke this for every positive delta, including samples the
+        EWMA gates skip (sub-floor tails, speed-priority partials) — the
+        footprint has grown back, so keeping the charge would double count
+        against the guard's gates.
+        """
+        self._recent_reclaim_bytes = 0
+
     def update(
         self, n_tokens: int, transient_bytes: int, *, floor_sample: bool = False
     ) -> None:

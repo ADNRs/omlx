@@ -4252,6 +4252,15 @@ class Scheduler:
         charge.
         """
         delta = post_bytes - pre_bytes
+        # The reclaim ledger sees every measurement, including samples the
+        # EWMA gates below skip: a release on a sub-floor tail must still be
+        # priced, and any positive growth confirms the pool reallocation and
+        # drops the one-shot charge — leaving it armed after the footprint
+        # recovered would double count against the guard's gates.
+        if delta <= 0:
+            self._prefill_transient_tracker.record_reclaim(-delta)
+        else:
+            self._prefill_transient_tracker.clear_reclaim()
         min_chunk = max(1, self._prefill_min_chunk_tokens)
         if n_tokens < min_chunk:
             logger.debug(
@@ -4265,7 +4274,6 @@ class Scheduler:
             )
             return
         if delta <= 0:
-            self._prefill_transient_tracker.record_reclaim(-delta)
             logger.debug(
                 "[throttle:%s] measure rid=%s n=%d delta=%dB "
                 "(excluded from EWMA; tracked as reclaim)",

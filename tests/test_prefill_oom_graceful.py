@@ -550,6 +550,85 @@ def test_predicted_transient_does_not_double_count_reclaim_covered_by_raw():
     assert predicted == pytest.approx(raw_prediction)
 
 
+def test_sub_floor_tail_release_is_charged():
+    """A release on a tail below min_chunk still feeds the reclaim ledger."""
+    released = 6 * _GB
+    ns = _throttle_ctx(current=97 * _GB, hard=119 * _GB)
+    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+        ns, Scheduler
+    )
+
+    ns._record_chunk_transient(
+        17,
+        100 * _GB,
+        100 * _GB - released,
+        request_id="r",
+        loop_label="test",
+        requested_step=2048,
+    )
+
+    assert ns._prefill_transient_tracker.recent_reclaim_bytes == released
+
+
+def test_skipped_positive_sample_clears_reclaim_charge():
+    """Any positive delta drops the charge, even on EWMA-skipped samples."""
+    released = 6 * _GB
+    ns = _throttle_ctx(current=97 * _GB, hard=119 * _GB)
+    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+        ns, Scheduler
+    )
+    ns._record_chunk_transient(
+        512,
+        100 * _GB,
+        100 * _GB - released,
+        request_id="r",
+        loop_label="test",
+        requested_step=512,
+    )
+    assert ns._prefill_transient_tracker.recent_reclaim_bytes == released
+
+    # Positive growth on a sub-floor tail is excluded from the EWMA but the
+    # footprint recovered, so the one-shot charge must not stay armed.
+    ns._record_chunk_transient(
+        17,
+        94 * _GB,
+        99 * _GB,
+        request_id="r",
+        loop_label="test",
+        requested_step=2048,
+    )
+    assert ns._prefill_transient_tracker.recent_reclaim_bytes == 0
+
+
+def test_speed_partial_positive_clears_reclaim_charge():
+    """Speed-priority partial chunks also confirm reallocation."""
+    released = 6 * _GB
+    ns = _throttle_ctx(current=97 * _GB, hard=119 * _GB)
+    ns._prefill_speed_priority = True
+    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+        ns, Scheduler
+    )
+    ns._record_chunk_transient(
+        512,
+        100 * _GB,
+        100 * _GB - released,
+        request_id="r",
+        loop_label="test",
+        requested_step=512,
+    )
+    assert ns._prefill_transient_tracker.recent_reclaim_bytes == released
+
+    ns._record_chunk_transient(
+        256,
+        94 * _GB,
+        99 * _GB,
+        request_id="r",
+        loop_label="test",
+        requested_step=512,
+    )
+    assert ns._prefill_transient_tracker.recent_reclaim_bytes == 0
+
+
 def test_record_chunk_transient_skips_tail_samples():
     tracker = PrefillTransientTracker()
     ns = SimpleNamespace(
