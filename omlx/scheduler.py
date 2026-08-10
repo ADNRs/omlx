@@ -15,6 +15,7 @@ import concurrent.futures
 import copy
 import gc
 import importlib
+import inspect
 import logging
 import os
 import threading
@@ -4446,8 +4447,6 @@ class Scheduler:
         supported = getattr(self, "_skip_lm_head_supported", None)
         if supported is None:
             try:
-                import inspect
-
                 call = getattr(type(self.model), "__call__", None)
                 supported = bool(
                     call is not None

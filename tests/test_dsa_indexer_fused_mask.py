@@ -14,10 +14,12 @@ from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
 
 pytestmark = pytest.mark.skipif(
     not (
-        glm_fast.has_symbol("dsa_indexer_scores")
+        glm_fast.is_native_available()
+        and glm_fast._EXT_MASK_FOLD
+        and glm_fast.has_symbol("dsa_indexer_scores")
         and glm_fast.has_symbol("dsa_topk_indices")
     ),
-    reason="glm_moe_dsa native extension not built",
+    reason="fold-aware glm_moe_dsa native extension not built",
 )
 
 
