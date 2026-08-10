@@ -2507,12 +2507,21 @@ class PagedSSDCacheManager(CacheManager):
         turboquant_kv_bits: float | None = None,
         cachelist_subtypes: dict[str, list[str]] | None = None,
     ) -> str:
-        """Build the exact compatibility signature used by this manager."""
+        """Build the exact compatibility signature used by this manager.
+
+        GDN sidecar lookups hash this signature into a directory name, so
+        unlike block metadata checks there is no compare-time normalization.
+        Wrapper spellings must collapse here: a warm-restored request
+        extracts ``SizedArraysCache`` while block metadata says
+        ``ArraysCache``, and without canonicalization the commit and restore
+        paths address different sidecar directories.
+        """
         return _cache_compat_signature(
             model_name=model_name,
             num_layers=num_layers,
             block_size=block_size,
-            layer_cache_types=layer_cache_types,
+            layer_cache_types=_canonicalize_layer_cache_types(layer_cache_types)
+            or [],
             turboquant_kv_bits=(
                 self._expected_turboquant_kv_bits
                 if turboquant_kv_bits is None

@@ -547,3 +547,49 @@ def test_split_save_writes_format_five_and_payload_layout_metadata(tmp_path):
         assert manager.load_block(block_hash) is not None
     finally:
         manager.close()
+
+
+def test_sidecar_signature_canonicalizes_wrapper_class_names(tmp_path):
+    """Warm-restored requests extract SizedArraysCache; cold stores and block
+    metadata say ArraysCache. Both spellings must address the same sidecar
+    directory or commits from resumed requests become unrestorable."""
+    cold_types = ["ArraysCache", "ArraysCache", "ArraysCache", "KVCache"]
+    resumed_types = [
+        "SizedArraysCache",
+        "SizedArraysCache",
+        "SizedArraysCache",
+        "KVCache",
+    ]
+
+    manager = _make_manager(tmp_path / "cache", gdn_ssd_split_enabled=True)
+    try:
+        cold_signature = manager.cache_signature_for(
+            model_name="model",
+            num_layers=4,
+            block_size=2048,
+            layer_cache_types=cold_types,
+        )
+        resumed_signature = manager.cache_signature_for(
+            model_name="model",
+            num_layers=4,
+            block_size=2048,
+            layer_cache_types=resumed_types,
+        )
+        assert cold_signature == resumed_signature
+
+        staged = tmp_path / "staged.safetensors"
+        staged.write_bytes(b"checkpoint")
+        assert (
+            manager.commit_gdn_checkpoint_file(
+                b"source",
+                staged,
+                token_count=2048,
+                model_name="model",
+                cache_signature=resumed_signature,
+                block_size=2048,
+            )
+            is not None
+        )
+        assert manager.has_gdn_checkpoint(b"source", cold_signature)
+    finally:
+        manager.close()
