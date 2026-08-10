@@ -91,6 +91,19 @@ def _patch_hardware(monkeypatch) -> None:
     )
     monkeypatch.setattr(probe.hardware, "get_mlx_version", lambda: "0.32.0")
     monkeypatch.setattr(probe.hardware, "get_mlx_lm_version", lambda: "0.31.3")
+    monkeypatch.setattr(
+        probe,
+        "detect_accelerator_hardware",
+        lambda: probe.AcceleratorHardware(
+            kind="metal",
+            vendor="apple",
+            memory_kind="unified",
+            name="Apple M5 Max",
+            physical_memory_bytes=128 * 1024**3,
+            recommended_working_set_bytes=115_448_725_504,
+            distributed_backends=("ring", "jaccl"),
+        ),
+    )
     monkeypatch.setattr(probe.socket, "gethostname", lambda: "MacBook-Pro")
     monkeypatch.setattr(probe.platform, "platform", lambda: "macOS-26.5.2-arm64")
     monkeypatch.setattr(probe.platform, "python_version", lambda: "3.11.14")
@@ -140,6 +153,9 @@ def test_collect_status_distinguishes_enabled_from_linked(monkeypatch):
     serialized = status.to_dict()
     assert serialized["protocol_version"] == "1.0"
     assert serialized["node"]["admission_ceiling_bytes"] == 100 * 1024**3
+    assert serialized["node"]["accelerator"] == "metal"
+    assert serialized["node"]["accelerator_vendor"] == "apple"
+    assert serialized["node"]["distributed_backends"] == ["ring", "jaccl"]
     assert serialized["transport"]["state"] == "enabled_no_peer"
     assert serialized["transport"]["rdma"]["enabled"] is True
     assert serialized["transport"]["rdma"]["addresses"]["rdma_en1"] == "169.254.42.1"
@@ -196,3 +212,150 @@ def test_mlx_version_uses_core_module_version(monkeypatch):
         SimpleNamespace(__version__="0.32.0"),
     )
     assert probe.hardware.get_mlx_version() == "0.32.0"
+
+
+def test_cuda_status_reports_connectx_and_safe_model_budget(monkeypatch):
+    _patch_hardware(monkeypatch)
+    monkeypatch.setattr(
+        probe,
+        "detect_accelerator_hardware",
+        lambda: probe.AcceleratorHardware(
+            kind="cuda",
+            vendor="nvidia",
+            memory_kind="unified",
+            name="NVIDIA GB10",
+            physical_memory_bytes=128 * 1024**3,
+            recommended_working_set_bytes=128 * 1024**3,
+            distributed_backends=("ring", "nccl"),
+        ),
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.memory_guard.ceiling_breakdown",
+        lambda *_a, **_k: {"hard_limit": 0},
+    )
+    runner = FakeRunner(
+        {
+            "ibv_devices": (
+                0,
+                "    device            node GUID\n"
+                "    ------          ----------------\n"
+                "    mlx5_0          a0910a0a8bd8ac05\n",
+                "",
+            ),
+        }
+    )
+
+    status = probe.collect_cluster_status(runner=runner)
+
+    assert status.accelerator == "cuda"
+    assert status.accelerator_vendor == "nvidia"
+    assert status.chip_name == "NVIDIA GB10"
+    assert status.fabric_kind == "connectx-7"
+    assert status.fabric_group_id is None
+    assert status.admission_ceiling_bytes == int(128 * 1024**3 * 0.90)
+    assert status.to_dict()["node"]["memory_kind"] == "unified"
+
+
+def test_linux_cuda_probe_maps_connectx_device_to_network_interface(monkeypatch):
+    _patch_hardware(monkeypatch)
+    monkeypatch.setattr(probe.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(
+        probe,
+        "detect_accelerator_hardware",
+        lambda: probe.AcceleratorHardware(
+            kind="cuda",
+            vendor="nvidia",
+            memory_kind="unified",
+            name="NVIDIA GB10",
+            physical_memory_bytes=128 * 1024**3,
+            recommended_working_set_bytes=128 * 1024**3,
+            distributed_backends=("ring", "nccl"),
+        ),
+    )
+    monkeypatch.setattr(
+        probe.hardware,
+        "detect_hardware",
+        lambda: (_ for _ in ()).throw(AssertionError("macOS probe ran on Linux")),
+    )
+    runner = FakeRunner(
+        {
+            "rdma": (
+                0,
+                json.dumps([{"ifname": "mlx5_0/1", "netdev": "enp1s0f0np0"}]),
+                "",
+            ),
+            "ibv_devices": (
+                0,
+                "    device            node GUID\n"
+                "    ------          ----------------\n"
+                "    mlx5_0          a0910a0a8bd8ac05\n",
+                "",
+            ),
+            "ip": (
+                0,
+                json.dumps(
+                    [
+                        {
+                            "ifname": "enp1s0f0np0",
+                            "addr_info": [
+                                {"local": "192.168.100.1", "scope": "global"}
+                            ],
+                        }
+                    ]
+                ),
+                "",
+            ),
+        }
+    )
+
+    status = probe.collect_cluster_status(runner=runner)
+    serialized = status.to_dict()
+
+    assert status.fabric_kind == "connectx-7"
+    assert serialized["transport"]["rdma"]["addresses"] == {
+        "mlx5_0": "192.168.100.1"
+    }
+    assert serialized["transport"]["rdma"]["network_interfaces"] == {
+        "mlx5_0": "enp1s0f0np0"
+    }
+
+
+def test_linux_probe_accepts_dgx_spark_roce_device_names():
+    devices = probe.parse_ibv_devices(
+        probe.CommandResult(
+            args=("ibv_devices",),
+            returncode=0,
+            stdout=(
+                "    device             node GUID\n"
+                "    ------          ----------------\n"
+                "    rocep1s0f1       10b6760300f01ade\n"
+                "    roceP2p1s0f1     10b6760300f01ae2\n"
+            ),
+        )
+    )
+    links = probe.parse_linux_rdma_links(
+        probe.CommandResult(
+            args=("rdma",),
+            returncode=0,
+            stdout=json.dumps(
+                [
+                    {
+                        "ifname": "rocep1s0f1",
+                        "state": "ACTIVE",
+                        "netdev": "enp1s0f1np1",
+                    },
+                    {
+                        "ifname": "roceP2p1s0f1",
+                        "state": "ACTIVE",
+                        "netdev": "enP2p1s0f1np1",
+                    },
+                ]
+            ),
+        )
+    )
+
+    assert devices == ("rocep1s0f1", "roceP2p1s0f1")
+    assert links == {
+        "rocep1s0f1": "enp1s0f1np1",
+        "roceP2p1s0f1": "enP2p1s0f1np1",
+    }
