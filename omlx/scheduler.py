@@ -2369,12 +2369,48 @@ class Scheduler:
 
         return window_sizes
 
+    def _detect_pooling_cache(self) -> bool:
+        """Return True if model.make_cache() contains a PoolingCache."""
+        if not hasattr(self.model, "make_cache"):
+            return False
+
+        try:
+            cache_list = self.model.make_cache()
+        except Exception as e:
+            logger.debug(f"Failed to inspect model pooling caches: {e}")
+            return False
+
+        if cache_list is None:
+            return False
+
+        return any(
+            self._cache_tree_has_pooling_cache(cache_obj) for cache_obj in cache_list
+        )
+
+    @staticmethod
+    def _cache_tree_has_pooling_cache(cache_obj: Any) -> bool:
+        """Return True if cache_obj contains PoolingCache (recursively)."""
+        sub_caches = getattr(cache_obj, "caches", None)
+        if isinstance(sub_caches, (list, tuple)):
+            return any(
+                Scheduler._cache_tree_has_pooling_cache(sub) for sub in sub_caches
+            )
+        return type(cache_obj).__name__ in ("PoolingCache", "BatchPoolingCache")
+
     # Target range for RotatingKVCache block size alignment.
     # Using a multiple of window_size within this range reduces SSD I/O
     # overhead (fewer, larger block files) while keeping cache restore
     # reprocessing reasonable.
     _ROTATING_BLOCK_SIZE_MIN = 512
     _ROTATING_BLOCK_SIZE_MAX = 1024
+
+    # Models with a PoolingCache (DeepSeek V4 family) get 2048 instead.
+    # Prefill chunks are clamped to the block boundary, and the native
+    # ratio-128 attention and MXFP4 block kernels only reach their measured
+    # gains at 2048-token chunks (+12-19% cold prefill vs 512 on M3 Ultra,
+    # cache-on matching cache-off). The cost is coarser warm-hit flooring:
+    # cached prefixes floor to 2048-token multiples instead of 512.
+    _POOLING_ROTATING_BLOCK_SIZE = 2048
 
     def _align_block_size_with_rotating_window(self) -> None:
         """
@@ -2387,6 +2423,10 @@ class Scheduler:
         many small files. Instead we pick the smallest multiple of
         window_size that falls within [_ROTATING_BLOCK_SIZE_MIN,
         _ROTATING_BLOCK_SIZE_MAX].
+
+        Models with a PoolingCache (DeepSeek V4 family) target
+        _POOLING_ROTATING_BLOCK_SIZE instead, since their prefill
+        kernels need 2048-token chunks to reach the measured gains.
         """
         if not self.config.paged_ssd_cache_dir:
             return
@@ -2408,6 +2448,8 @@ class Scheduler:
         # If window_size itself is already >= max, just use window_size.
         lo = self._ROTATING_BLOCK_SIZE_MIN
         hi = self._ROTATING_BLOCK_SIZE_MAX
+        if self._detect_pooling_cache():
+            lo = hi = self._POOLING_ROTATING_BLOCK_SIZE
 
         if window_size >= hi or window_size >= lo:
             target_block_size = window_size

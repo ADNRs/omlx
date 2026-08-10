@@ -2791,6 +2791,37 @@ class TestSchedulerRotatingBlockAlignment:
         # so it gets rounded up to 512 (smallest multiple of 128 >= 512).
         assert scheduler.config.paged_cache_block_size == 512
 
+    def test_pooling_cache_model_aligns_block_size_to_2048(self, mock_tokenizer):
+        RotatingStub = type("RotatingKVCache", (), {})
+        PoolingStub = type("PoolingCache", (), {})
+        CacheListStub = type("CacheList", (), {})
+
+        class PoolingModel:
+            def __init__(self):
+                self.config = MagicMock()
+                self.config.num_hidden_layers = 2
+
+            def make_cache(self):
+                rotating = RotatingStub()
+                rotating.max_size = 128
+                sparse = CacheListStub()
+                inner_rotating = RotatingStub()
+                inner_rotating.max_size = 128
+                sparse.caches = [inner_rotating, PoolingStub(), PoolingStub()]
+                return [rotating, sparse]
+
+        scheduler = Scheduler(
+            model=PoolingModel(),
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=256),
+        )
+        scheduler.config.paged_ssd_cache_dir = "/tmp/cache"
+        scheduler._align_block_size_with_rotating_window()
+
+        # PoolingCache models (DeepSeek V4 family) target 2048 so prefill
+        # chunks reach the regime where the native prefill kernels pay off.
+        assert scheduler.config.paged_cache_block_size == 2048
+
     def test_multiple_rotating_window_sizes_raise(self, mock_tokenizer):
         RotatingStub = type("RotatingKVCache", (), {})
 
