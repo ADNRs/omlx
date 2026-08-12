@@ -114,6 +114,40 @@ def test_the_real_ceiling_is_readable_on_this_machine():
     assert ceiling >= 0
 
 
+def test_a_plan_tier_cannot_admit_above_the_operators_own_ceiling(monkeypatch):
+    """The plan configures the deployment, not the ceiling of someone's Mac.
+
+    A worker capped at 8 GiB by its operator must admit at 8 GiB even when the
+    coordinator's plan carries tier "balanced" for every node.
+    """
+
+    from omlx.cluster import memory_guard
+
+    monkeypatch.setattr(
+        memory_guard, "_operator_memory_settings", lambda: ("custom", 8.0, True)
+    )
+
+    local = memory_guard.ceiling_breakdown()
+    planned = memory_guard.ceiling_breakdown("balanced")
+
+    assert local["hard_limit"] <= 8 * GIB
+    assert planned["hard_limit"] == local["hard_limit"]
+
+
+def test_a_disabled_local_guard_is_not_resurrected_by_a_plan_tier(monkeypatch):
+    """Guard off is an explicit opt-out of hard limits, not a value of zero."""
+
+    from omlx.cluster import memory_guard
+
+    monkeypatch.setattr(
+        memory_guard, "_operator_memory_settings", lambda: ("custom", 4.0, False)
+    )
+
+    planned = memory_guard.ceiling_breakdown("balanced")
+
+    assert planned["hard_limit"] > 4 * GIB
+
+
 # ---------------------------------------------------------------------------
 # The guard must track memory actually available, not just installed capacity.
 # A ceiling equal to total RAM admits a load that cannot possibly fit when

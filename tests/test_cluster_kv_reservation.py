@@ -13,6 +13,7 @@ from omlx.cluster.planner import (
     NodeBudget,
     PlanningError,
     _kv_bytes_per_token_per_layer,
+    _kv_cache_replicated_across_tp,
     plan_hybrid,
     plan_unequal_pipeline,
 )
@@ -20,7 +21,8 @@ from omlx.cluster.planner import (
 GIB = 1024**3
 
 
-def _model(layers=32, layer_gib=2, kv_per_token_per_layer=0, heads=48):
+def _model(layers=32, layer_gib=2, kv_per_token_per_layer=0, heads=48,
+           kv_replicated=False):
     return ModelLayout(
         source="test",
         fixed_weight_bytes=1 * GIB,
@@ -28,6 +30,7 @@ def _model(layers=32, layer_gib=2, kv_per_token_per_layer=0, heads=48):
         tensor_parallel_heads=heads,
         supports_tensor_parallel=True,
         kv_bytes_per_token_per_layer=kv_per_token_per_layer,
+        kv_replicated_across_tp=kv_replicated,
     )
 
 
@@ -96,6 +99,8 @@ def test_mla_models_are_not_over_counted():
 
     assert _kv_bytes_per_token_per_layer(mla) == (512 + 64) * 2
     assert _kv_bytes_per_token_per_layer(mla) < _kv_bytes_per_token_per_layer(uniform) / 10
+    assert _kv_cache_replicated_across_tp(mla) is True
+    assert _kv_cache_replicated_across_tp(uniform) is False
 
 
 def test_an_unreadable_config_reserves_nothing_rather_than_guessing():
@@ -224,3 +229,59 @@ def test_tensor_and_pipeline_reserve_the_same_kv_per_node():
     assert max(a.kv_cache_bytes for a in tensored.assignments) == max(
         a.kv_cache_bytes for a in pipelined.assignments
     )
+
+
+def test_an_mla_cache_is_reserved_whole_on_every_tp_member():
+    """The latent cache is not per-head: sharding divides heads, not it.
+
+    Under pipeline each node holds half the layers' caches. Under TP each
+    member holds every layer's cache whole — twice the pipeline reservation,
+    where standard attention reserves the same bytes either way.
+    """
+
+    model = _model(layers=32, layer_gib=1, kv_per_token_per_layer=1152,
+                   heads=64, kv_replicated=True)
+    pipelined = plan_hybrid(model, _nodes(2, 90), tensor_parallel_size=1,
+                            context_tokens=8192)
+    tensored = plan_hybrid(model, _nodes(2, 90), tensor_parallel_size=2,
+                           context_tokens=8192)
+
+    assert max(a.kv_cache_bytes for a in tensored.assignments) == 2 * max(
+        a.kv_cache_bytes for a in pipelined.assignments
+    )
+
+
+def test_a_replicated_cache_that_only_fits_divided_is_refused():
+    """The under-reservation this pins: budgets sized for 1/N of the cache.
+
+    With the flag off the same budgets plan cleanly, which is exactly the plan
+    that used to be produced for MLA models and then died loading.
+    """
+
+    def small_layers(replicated):
+        return ModelLayout(
+            source="test",
+            fixed_weight_bytes=1 * GIB,
+            layer_weight_bytes=(64 * 1024**2,) * 32,
+            tensor_parallel_heads=64,
+            supports_tensor_parallel=True,
+            # 16 GiB whole-model cache at 8192 tokens.
+            kv_bytes_per_token_per_layer=64 * 1024,
+            kv_replicated_across_tp=replicated,
+        )
+
+    fits_divided = small_layers(False)
+    replicated = small_layers(True)
+
+    assert plan_hybrid(fits_divided, _nodes(2, 14), tensor_parallel_size=2,
+                       context_tokens=8192)
+    with pytest.raises(PlanningError):
+        plan_hybrid(replicated, _nodes(2, 14), tensor_parallel_size=2,
+                    context_tokens=8192)
+
+
+def test_kv_replication_survives_the_wire():
+    """Peers exchange layouts as JSON; the flag must not be lost in transit."""
+
+    model = _model(kv_per_token_per_layer=1152, kv_replicated=True)
+    assert ModelLayout.from_dict(model.to_dict()).kv_replicated_across_tp is True

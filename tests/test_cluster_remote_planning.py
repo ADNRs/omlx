@@ -103,11 +103,16 @@ def test_a_complete_model_is_accepted(tmp_path):
 
 
 def test_a_draft_head_past_the_declared_depth_is_not_a_partial_model(tmp_path):
-    """MTP and EAGLE weights add layers the config never counted."""
+    """MTP and EAGLE weights add layers the config never counted.
+
+    The model is complete, so it must not be refused as a stage of itself —
+    and the extra head must not be partitioned either, because the runtime
+    model never instantiates it and a stage boundary over it fails to load.
+    """
 
     root = _model(tmp_path / "m", present_layers=range(9), declared_layers=8)
 
-    assert complete_model_layout(root).layer_count == 9
+    assert complete_model_layout(root).layer_count == 8
 
 
 def test_a_model_whose_config_omits_its_depth_is_still_readable(tmp_path):

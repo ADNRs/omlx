@@ -107,6 +107,9 @@ class ModelLayout:
     # proportion to the layers it holds, so a plan that fits the weights
     # still fits once a long prompt fills the cache.
     kv_bytes_per_token_per_layer: int = 0
+    # MLA models keep one latent cache per layer that every tensor-parallel
+    # member holds whole; sharding divides the heads, not this cache.
+    kv_replicated_across_tp: bool = False
     supports_tensor_parallel: bool = False
     # Whether mlx-lm can split this architecture into pipeline stages. False
     # means the model runs on one node or not at all, however well it fits.
@@ -176,6 +179,7 @@ class ModelLayout:
             "supports_tensor_parallel": self.supports_tensor_parallel,
             "supports_pipeline": self.supports_pipeline,
             "kv_bytes_per_token_per_layer": self.kv_bytes_per_token_per_layer,
+            "kv_replicated_across_tp": self.kv_replicated_across_tp,
         }
 
     @classmethod
@@ -213,6 +217,9 @@ class ModelLayout:
                 ),
                 kv_bytes_per_token_per_layer=int(
                     payload.get("kv_bytes_per_token_per_layer", 0)
+                ),
+                kv_replicated_across_tp=bool(
+                    payload.get("kv_replicated_across_tp", False)
                 ),
                 supports_tensor_parallel=bool(
                     payload.get("supports_tensor_parallel", False)
@@ -716,6 +723,21 @@ def _declares_pipeline(model_type: str, *, seen: frozenset[str] = frozenset()) -
     )
 
 
+def _kv_cache_replicated_across_tp(config: dict[str, Any]) -> bool:
+    """Whether every tensor-parallel member holds this model's full KV cache.
+
+    ``shard()`` splits attention heads, but an MLA latent cache is not
+    per-head: GLM/DeepSeek-style layers store one compressed latent plus RoPE
+    key that every member of the group needs whole. Dividing that reservation
+    by the TP degree under-reserved each rank by exactly that factor.
+    """
+
+    return (
+        _config_int(config, "kv_lora_rank", 0) > 0
+        and _config_int(config, "qk_rope_head_dim", 0) > 0
+    )
+
+
 def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
     """Resident KV-cache bytes each layer adds per token.
 
@@ -732,10 +754,10 @@ def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
     # Stored cache is fp16/bf16 even when weights are quantised.
     dtype_size = 2
 
-    kv_lora_rank = _config_int(config, "kv_lora_rank", 0)
-    rope_dim = _config_int(config, "qk_rope_head_dim", 0)
-    if kv_lora_rank > 0 and rope_dim > 0:
+    if _kv_cache_replicated_across_tp(config):
         # One KV head holding latent + RoPE, not expanded K/V tensors.
+        kv_lora_rank = _config_int(config, "kv_lora_rank", 0)
+        rope_dim = _config_int(config, "qk_rope_head_dim", 0)
         return (kv_lora_rank + rope_dim) * dtype_size
 
     heads = _config_int(config, "num_attention_heads", 0)
@@ -923,6 +945,22 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         raise PlanningError(
             "could not identify transformer layers in safetensors names"
         )
+    # Checkpoints may carry layers past the declared depth: DeepSeek/GLM-style
+    # multi-token-prediction heads live at index num_hidden_layers and up, and
+    # the runtime model never instantiates them. Counting them as decoder
+    # layers put a stage boundary over weights that do not exist at runtime,
+    # and the last stage failed activation with end_layer beyond the model.
+    declared_depth = _config_int(
+        _model_config(root), "num_hidden_layers", 0
+    )
+    if declared_depth > 0 and max(layer_sizes) >= declared_depth:
+        trimmed = {
+            index: size
+            for index, size in layer_sizes.items()
+            if index < declared_depth
+        }
+        if trimmed:
+            layer_sizes = trimmed
     maximum_layer = max(layer_sizes)
     if maximum_layer >= _MAX_PIPELINE_LAYERS:
         raise PlanningError(
@@ -947,6 +985,9 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         supports_tensor_parallel=_supports_tensor_parallel(_model_config(root)),
         supports_pipeline=_supports_pipeline(_model_config(root)),
         kv_bytes_per_token_per_layer=_kv_bytes_per_token_per_layer(
+            _model_config(root)
+        ),
+        kv_replicated_across_tp=_kv_cache_replicated_across_tp(
             _model_config(root)
         ),
     )
@@ -1505,13 +1546,16 @@ def _kv_bytes_for_stage(
     """KV bytes a node holds for its layers at the planned context length.
 
     KV is per layer, so a node reserves in proportion to the layers it carries.
-    Under tensor parallelism the heads of each layer are split across the group,
-    so each member holds its share.
+    Under tensor parallelism the heads of each layer are split across the
+    group, so each member holds its share — except an MLA latent cache, which
+    is not per-head and stays whole on every member.
     """
 
     if model.kv_bytes_per_token_per_layer <= 0 or context_tokens <= 0:
         return 0
     total = model.kv_bytes_per_token_per_layer * layer_count * context_tokens
+    if model.kv_replicated_across_tp:
+        return total
     return total // max(1, tensor_parallel_size)
 
 
@@ -1525,6 +1569,8 @@ def _kv_bytes_per_token_for_stage(
     if model.kv_bytes_per_token_per_layer <= 0:
         return 0
     per_token = model.kv_bytes_per_token_per_layer * layer_count
+    if model.kv_replicated_across_tp:
+        return per_token
     return per_token // max(1, tensor_parallel_size)
 
 
@@ -1722,8 +1768,12 @@ def plan_hybrid(
     # ``stage_budgets`` represent aggregate TP capacity after each member's
     # replicated fixed weights. A layer therefore contributes its full weights
     # plus its full-head KV bytes here; both are divided across TP members by
-    # the same degree when assignments are materialised below.
+    # the same degree when assignments are materialised below. A replicated
+    # MLA cache is the exception: every member pays it whole, so at the
+    # aggregate level one layer costs the group N caches.
     kv_bytes_per_layer = _kv_bytes_for_stage(model, 1, context_tokens)
+    if model.kv_replicated_across_tp:
+        kv_bytes_per_layer *= tensor_parallel_size
     try:
         ranges = _partition_layers(
             model.layer_weight_bytes,

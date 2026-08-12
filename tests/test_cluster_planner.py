@@ -93,6 +93,46 @@ def test_inspect_safetensors_layout_rejects_overlapping_offsets(tmp_path):
         inspect_safetensors_layout(tmp_path)
 
 
+def test_mtp_layers_past_the_declared_depth_are_not_decoder_layers(tmp_path):
+    """DeepSeek/GLM MTP heads live at index ``num_hidden_layers`` and up.
+
+    The runtime model never instantiates them, so counting them as decoder
+    layers put the last stage boundary past the model and activation failed
+    with ``end_layer`` beyond the loaded layers.
+    """
+
+    (tmp_path / "config.json").write_text(json.dumps({"num_hidden_layers": 2}))
+    _write_safetensors(
+        tmp_path / "model.safetensors",
+        [
+            ("model.embed_tokens.weight", 100),
+            ("model.layers.0.self_attn.q_proj.weight", 500),
+            ("model.layers.1.self_attn.q_proj.weight", 400),
+            ("model.layers.2.eh_proj.weight", 900),  # the MTP head
+        ],
+    )
+
+    layout = inspect_safetensors_layout(tmp_path)
+
+    assert layout.layer_count == 2
+    assert layout.layer_weight_bytes == (500, 400)
+
+
+def test_layers_past_an_undeclared_depth_are_kept(tmp_path):
+    """No config.json means no declared depth to trim against."""
+
+    _write_safetensors(
+        tmp_path / "model.safetensors",
+        [
+            ("model.layers.0.weight", 500),
+            ("model.layers.1.weight", 400),
+            ("model.layers.2.weight", 900),
+        ],
+    )
+
+    assert inspect_safetensors_layout(tmp_path).layer_count == 3
+
+
 def test_unequal_planner_gives_more_layers_to_larger_mac():
     model = synthetic_model_layout(
         total_weight_bytes=300 * GIB,

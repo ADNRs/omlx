@@ -171,6 +171,20 @@ def ceiling_breakdown(
         # through to "unmeasurable, load unguarded" would turn the strictest
         # setting in the product into the only one with no rank guard at all.
         breakdown["hard_limit"] = int(enforcer._get_static_ceiling())
+    # A plan's tier configures the deployment; it must not admit this Mac
+    # above what its own operator chose. When the caller names a different
+    # tier, the operator's settings still bind from below. A disabled local
+    # guard is an explicit opt-out of hard limits, not a value to clamp to,
+    # and a caller passing explicit overrides is taking full control.
+    if (
+        custom_ceiling_gb is None
+        and guard_enabled is None
+        and operator_enabled
+        and tier != operator_tier
+    ):
+        local = ceiling_breakdown(operator_tier)
+        if 0 < local.get("hard_limit", 0) < breakdown.get("hard_limit", 0):
+            return local
     return breakdown
 
 
