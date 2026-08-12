@@ -49,7 +49,6 @@ class TransportMatrix:
 
     transports: tuple[TransportInfo, ...]
     backend: str  # "ring", "jaccl", "jaccl-ring"
-    topology_dot: str | None = None
 
 
 def _import_mlx_config() -> Any:
@@ -375,28 +374,6 @@ def select_backend(transports: tuple[TransportInfo, ...]) -> str:
     return "ring"
 
 
-def transport_to_dot(transports: tuple[TransportInfo, ...]) -> str:
-    """Generate a DOT graph of the transport topology."""
-
-    lines = ["digraph transports {"]
-    for t in transports:
-        color = {
-            "thunderbolt": "blue",
-            "rdma": "green",
-            "ethernet": "gray",
-        }.get(t.kind, "black")
-        label = f"{t.kind}"
-        if t.link_speed_gbps:
-            label += f"\\n{t.link_speed_gbps} Gb/s"
-        if t.tb_version:
-            label += f"\\n{t.tb_version}"
-        lines.append(
-            f'  "{t.peer_node_id}" [color={color}, label="{label}"];'
-        )
-    lines.append("}")
-    return "\n".join(lines)
-
-
 def detect_cluster_transports(
     hosts: list[str] | tuple[str, ...],
     *,
@@ -409,17 +386,15 @@ def detect_cluster_transports(
         ssh_prefix: Optional prefix for SSH hostnames.
 
     Returns:
-        ``TransportMatrix`` with transports, backend, and topology DOT.
+        ``TransportMatrix`` with transports and the backend they allow.
     """
 
     transports = detect_transports(hosts, ssh_prefix=ssh_prefix)
     backend = select_backend(transports)
-    topology_dot = transport_to_dot(transports)
 
     return TransportMatrix(
         transports=transports,
         backend=backend,
-        topology_dot=topology_dot,
     )
 
 

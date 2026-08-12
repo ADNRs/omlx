@@ -73,10 +73,7 @@ def test_no_cluster_route_is_unreachable_from_the_dashboard():
     both worth knowing about.
     """
 
-    allowed_without_caller = {
-        # Keychain verification is available to the CLI; no dashboard surface yet.
-        "/admin/api/cluster/ssh-key/verify-keychain",
-    }
+    allowed_without_caller: set[str] = set()
     unreachable = _registered_routes() - _js_called_paths() - allowed_without_caller
     assert not unreachable, (
         f"cluster routes nothing calls: {sorted(unreachable)} — wire them up or "

@@ -1620,7 +1620,7 @@ def _tp_stage_budget(
     parallel. Every stage shares the same N here, so this does not skew the
     relative split — it only keeps the absolute predicted seconds honest. The
     per-layer all-reduce TP adds is *not* yet modelled, so predictions are
-    optimistic for TP stages; see C3.
+    optimistic for TP stages.
     """
 
     weakest = min(group, key=lambda node: node.usable_bytes)
@@ -1669,7 +1669,7 @@ def plan_hybrid(
     Combines contiguous pipeline stages with tensor-parallel weight sharding.
     The world is 2D: pipeline_stages * tensor_parallel_size == len(nodes).
 
-    Rank convention (see B1):
+    Rank convention:
         pipeline_stage = rank // tensor_parallel_size
         tp_rank        = rank %  tensor_parallel_size
 

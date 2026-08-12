@@ -528,24 +528,3 @@ def store_key_in_keychain(*, service: str = "omlx-cluster", account: str = "ssh-
         return False
 
 
-def verify_key_in_keychain(*, service: str = "omlx-cluster", account: str = "ssh-key") -> bool:
-    """Verify that the SSH key fingerprint is stored in macOS Keychain."""
-
-    security = shutil.which("security")
-    if security is None:
-        return False
-
-    try:
-        result = subprocess.run(
-            [security, "find-generic-password", "-s", service, "-a", account, "-w"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        try:
-            key_pair = get_or_create_ssh_key()
-            return result.stdout.strip() == key_pair.fingerprint
-        except RuntimeError:
-            return False
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return False

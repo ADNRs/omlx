@@ -1740,16 +1740,6 @@ async def cluster_store_key_in_keychain():
     return {"stored": success}
 
 
-@router.get("/ssh-key/verify-keychain")
-async def cluster_verify_key_in_keychain():
-    """Verify the SSH key fingerprint is in macOS Keychain."""
-
-    from .ssh_keys import verify_key_in_keychain
-
-    verified = await asyncio.to_thread(verify_key_in_keychain)
-    return {"verified": verified}
-
-
 @router.get("/transports")
 async def cluster_transports(hosts: str = Query(...)):
     """Detect available transports for the given cluster hosts.
@@ -1768,7 +1758,6 @@ async def cluster_transports(hosts: str = Query(...)):
         return {
             "transports": [t.__dict__ for t in matrix.transports],
             "backend": matrix.backend,
-            "topology_dot": matrix.topology_dot,
         }
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
