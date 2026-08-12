@@ -20,6 +20,34 @@ from omlx.exceptions import InsufficientMemoryError
 GIB = 1024**3
 
 
+def _deterministic_machine(monkeypatch):
+    """Pin every memory input so ceilings do not depend on the host.
+
+    The tier tests below assert tier semantics (reserves, reclaim ratios,
+    operator clamping). On a small-RAM CI runner the dynamic vm_stat
+    ceiling binds instead and fluctuates between calls, which is not what
+    they are about. Profile: 64 GiB RAM, 2 GiB oMLX footprint, 16/8/24 GiB
+    free/inactive/active, 48 GiB Metal cap.
+    """
+    import omlx.process_memory_enforcer as enforcer_module
+    import omlx.settings as settings_module
+    from omlx.process_memory_enforcer import ProcessMemoryEnforcer
+
+    monkeypatch.setattr(settings_module, "get_system_memory", lambda: 64 * GIB)
+    monkeypatch.setattr(enforcer_module, "get_phys_footprint", lambda: 2 * GIB)
+    monkeypatch.setattr(
+        enforcer_module,
+        "get_macos_vm_stats",
+        lambda: {"free": 16 * GIB, "inactive": 8 * GIB, "active": 24 * GIB},
+    )
+    monkeypatch.setattr(
+        ProcessMemoryEnforcer,
+        "_get_effective_metal_cap_bytes",
+        lambda self: 48 * GIB,
+    )
+
+
+
 def test_a_stage_that_fits_is_admitted():
     ceiling = check_rank_fits(50 * GIB, rank=0, ceiling_bytes=100 * GIB)
     assert ceiling == 100 * GIB
@@ -121,6 +149,8 @@ def test_a_plan_tier_cannot_admit_above_the_operators_own_ceiling(monkeypatch):
     coordinator's plan carries tier "balanced" for every node.
     """
 
+    _deterministic_machine(monkeypatch)
+
     from omlx.cluster import memory_guard
 
     monkeypatch.setattr(
@@ -136,6 +166,8 @@ def test_a_plan_tier_cannot_admit_above_the_operators_own_ceiling(monkeypatch):
 
 def test_a_disabled_local_guard_is_not_resurrected_by_a_plan_tier(monkeypatch):
     """Guard off is an explicit opt-out of hard limits, not a value of zero."""
+
+    _deterministic_machine(monkeypatch)
 
     from omlx.cluster import memory_guard
 
@@ -869,6 +901,8 @@ def test_a_custom_tier_with_no_ceiling_typed_in_is_still_guarded(monkeypatch):
 def test_the_tier_the_operator_chose_is_the_tier_that_is_measured(monkeypatch):
     """safe reclaims 20% of active pages, aggressive 80%. A rank used to get
     balanced's 50% whatever the operator had chosen."""
+
+    _deterministic_machine(monkeypatch)
 
     from omlx.cluster.memory_guard import ceiling_breakdown
 
