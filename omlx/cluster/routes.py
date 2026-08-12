@@ -808,7 +808,13 @@ async def cluster_fabric(hosts: str = Query(...)):
         raise HTTPException(
             status_code=400, detail="a distributed cluster needs at least two hosts"
         )
-    return await asyncio.to_thread(_resolve_fabric, host_list)
+    # A probe failure here is an unpaired or unreachable Mac, not a server
+    # fault. An unhandled raise became a scrubbed 500 that swallowed the SSH
+    # stderr the dashboard needs to explain pairing.
+    try:
+        return await asyncio.to_thread(_resolve_fabric, host_list)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @router.post("/autoconfigure")
@@ -1167,12 +1173,15 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     preflight_summary = describe_preflight(issues)
     if fabric_blocker:
         preflight_summary = f"Cluster link is not ready: {fabric_blocker}"
+    # Warning and blocker strings embed remote SSH stderr. Redact those and
+    # only those: preflight issue commands are pasteable fixes that need their
+    # user@host intact, and the activation block round-trips to /deployments.
     return {
         "backend": backend,
         "backend_reason": backend_reason,
         "fabric": fabric,
         "fabric_ready": fabric_ready,
-        "fabric_blocker": fabric_blocker,
+        "fabric_blocker": _redact_diagnostic(fabric_blocker),
         "tensor_parallel_size": choice.tensor_parallel_size,
         "pipeline_stages": choice.pipeline_stages,
         "summary": choice.reason,
@@ -1186,12 +1195,12 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         "performance_probe": performance_probe,
         "staging": staging,
         "strategies": STRATEGIES,
-        "preflight": preflight_summary,
+        "preflight": _redact_diagnostic(preflight_summary),
         # Structured as well as summarised: an issue that carries a command is
         # a fix the user can paste, and a sentence hides it.
         "preflight_issues": [asdict(issue) for issue in issues],
         "ready_to_activate": not issues and staging_ready and fabric_ready,
-        "warnings": warnings,
+        "warnings": _redact_diagnostic(warnings),
         "transports": [transport.__dict__ for transport in transports],
         "plan": plan_payload,
         # Ready to POST straight to /deployments once the user approves.
@@ -1805,7 +1814,11 @@ async def cluster_link_status(hosts: str = Query(...)):
 
     host_list = _validated_ssh_targets(hosts)
     status = await asyncio.to_thread(assess_link, host_list)
-    return status.to_dict()
+    payload = status.to_dict()
+    # The detail string embeds remote SSH stderr; the commands are pasteable
+    # fixes whose user@host must survive, so only detail is redacted.
+    payload["detail"] = _redact_diagnostic(payload["detail"])
+    return payload
 
 
 @router.post("/link-setup")

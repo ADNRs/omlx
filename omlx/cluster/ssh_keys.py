@@ -445,9 +445,11 @@ def exchange_keys_with_peer(
 def add_verified_peer_host_key(*, hostname: str) -> bool:
     """Fetch and add a peer's SSH host key to known_hosts.
 
-    Uses ssh-keyscan to retrieve the host key, which is then added
-    to known_hosts. This is safe because the peer's identity has
-    already been verified via the signed key exchange token.
+    Uses ssh-keyscan to retrieve the host key, which is then added to
+    known_hosts. The pairing token authenticates the peer's *user* key, not
+    its host key, so this is trust-on-first-use over the current network
+    path, same as the accept-new policy every cluster SSH call already uses.
+    It only saves the first real connection from doing that registration.
     """
 
     if is_host_known(hostname):

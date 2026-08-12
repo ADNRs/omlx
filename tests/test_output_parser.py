@@ -10,10 +10,7 @@ from types import SimpleNamespace
 
 from omlx.adapter.gemma4 import Gemma4OutputParserSession
 from omlx.adapter.harmony import load_harmony_gpt_oss_encoding
-from omlx.adapter.output_parser import (
-    detect_output_parser,
-    install_minimax_m3_tokenizer_protocol,
-)
+from omlx.adapter.output_parser import detect_output_parser
 
 
 class FakeDetokenizer:

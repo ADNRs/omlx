@@ -1215,6 +1215,65 @@ def test_the_fabric_rejects_a_shared_subnet_that_does_not_answer(monkeypatch):
     assert "did not answer" in body["backend_reason"]
 
 
+def test_the_fabric_reports_an_unpaired_mac_instead_of_a_scrubbed_500(monkeypatch):
+    """An SSH failure is the peer's state, not a server fault (#2423 tester A1).
+
+    The unhandled raise became a generic 500 whose body FastAPI scrubs, which
+    swallowed the permission-denied stderr the dashboard maps to pairing
+    guidance.
+    """
+
+    def _refuse(_hosts):
+        raise RuntimeError(
+            "reading interfaces on studio.local failed: "
+            "user@studio.local: Permission denied (publickey,password)."
+        )
+
+    monkeypatch.setattr(routes, "_resolve_fabric", _refuse)
+
+    response = _client().get(
+        "/admin/api/cluster/fabric", params={"hosts": "127.0.0.1,studio.local"}
+    )
+
+    assert response.status_code == 503
+    assert "Permission denied" in response.json()["detail"]
+
+
+def test_link_status_redacts_the_username_but_keeps_the_evidence(monkeypatch):
+    """Remote stderr leaves the admin API without the local account name."""
+
+    from omlx.cluster.transport import LinkStatus
+
+    monkeypatch.setattr(
+        routes,
+        "assess_link",
+        lambda _hosts: LinkStatus(
+            state="unreachable",
+            title="The other Mac rejected the login",
+            detail="user@studio.local: Permission denied (publickey).",
+            backend="ring",
+            ready=False,
+            commands=("ssh-copy-id -i ~/.ssh/omlx_cluster.pub user@studio.local",),
+        ),
+    )
+
+    body = (
+        _client()
+        .get(
+            "/admin/api/cluster/link-status",
+            params={"hosts": "127.0.0.1,studio.local"},
+        )
+        .json()
+    )
+
+    assert "<user>@studio.local" in body["detail"]
+    assert "Permission denied" in body["detail"]
+    # Pasteable fixes keep their real target untouched.
+    assert body["commands"] == [
+        "ssh-copy-id -i ~/.ssh/omlx_cluster.pub user@studio.local"
+    ]
+
+
 def test_the_fabric_falls_back_from_unreachable_rdma_to_verified_ethernet(
     monkeypatch,
 ):
