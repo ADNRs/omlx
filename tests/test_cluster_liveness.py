@@ -40,13 +40,18 @@ def _reaped_pid() -> int:
     return process.pid
 
 
-def _remote_reader(state_dir):
-    """Model the fixed SSH marker query without opening a real connection."""
+def _remote_reader(state_dir, *, peer_clock_offset=0.0):
+    """Model the fixed SSH marker query without opening a real connection.
+
+    ``peer_clock_offset`` shifts the reported peer clock relative to this
+    Mac's, standing in for an unsynchronized pair.
+    """
 
     def read(_target, path):
         marker = read_marker(state_dir / os.path.basename(path))
         live = marker_owner_is_live(marker) if marker is not None else None
-        return marker, live, ""
+        peer_now = datetime.now(UTC).timestamp() + peer_clock_offset
+        return marker, live, peer_now, ""
 
     return read
 
@@ -138,6 +143,89 @@ def test_marker_age_survives_a_missing_or_broken_timestamp():
         now=now.timestamp(),
     )
     assert 9 <= age <= 11
+
+
+def test_clock_skew_between_macs_does_not_kill_a_healthy_cluster(tmp_path):
+    """Ages are peer-clock only: a Thunderbolt pair has no NTP to agree on.
+
+    The peer's clock runs ten minutes behind this Mac. Its marker is five
+    seconds old by its own clock, which is the only clock that also stamped
+    ``updated_at``. Judging that marker against the local clock read 605
+    seconds and shut the deployment down.
+    """
+
+    _marker(tmp_path, "d", 0, age_seconds=0)
+    _marker(tmp_path, "d", 1, age_seconds=605)
+
+    health = check_peers(HOSTS, state_dir=str(tmp_path), deployment_id="d",
+                         probe=lambda t: True, require_heartbeat=True,
+                         remote_reader=_remote_reader(
+                             tmp_path, peer_clock_offset=-600.0))
+
+    remote = next(h for h in health if h.rank == 1)
+    assert remote.seconds_since_heartbeat == pytest.approx(5.0, abs=2.0)
+    assert remote.stale is False
+    assert all(h.healthy for h in health)
+
+
+def test_a_rank_that_is_stale_by_its_own_clock_is_still_caught(tmp_path):
+    """The skew fix must not blind the watchdog to genuine silence."""
+
+    _marker(tmp_path, "d", 0, age_seconds=0)
+    _marker(tmp_path, "d", 1, age_seconds=905)
+
+    health = check_peers(HOSTS, state_dir=str(tmp_path), deployment_id="d",
+                         probe=lambda t: True, require_heartbeat=True,
+                         remote_reader=_remote_reader(
+                             tmp_path, peer_clock_offset=-600.0))
+
+    remote = next(h for h in health if h.rank == 1)
+    assert remote.stale is True
+    assert "stopped reporting" in describe_failure(health)
+
+
+def test_the_injected_marker_script_reports_the_peer_clock(tmp_path):
+    """Run the exact script SSH would run, minus the SSH."""
+
+    from omlx.cluster.liveness import _REMOTE_MARKER_SCRIPT
+
+    _marker(tmp_path, "d", 0, age_seconds=3)
+    path = tmp_path / "d-rank-0.json"
+
+    result = subprocess.run(
+        [sys.executable, "-c", _REMOTE_MARKER_SCRIPT, str(path)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["marker"]["rank"] == 0
+    assert payload["process_live"] is True  # the marker carries this test's pid
+    age = payload["peer_now"] - datetime.fromisoformat(
+        payload["marker"]["updated_at"]
+    ).timestamp()
+    assert 2.0 <= age <= 8.0
+
+
+def test_a_marker_response_without_the_peer_clock_is_rejected(tmp_path):
+    """A payload the injected script cannot have produced is an error."""
+
+    from omlx.cluster.liveness import read_remote_marker
+
+    fake = subprocess.CompletedProcess(
+        args=[], returncode=0,
+        stdout=b'{"marker":{"rank":1},"process_live":true}', stderr=b"")
+
+    marker, live, peer_now, error = read_remote_marker(
+        "studio.local", "/tmp/x.json", runner=lambda *a, **k: fake
+    )
+
+    assert marker is None
+    assert live is None
+    assert peer_now is None
+    assert "peer clock" in error
 
 
 def test_the_watchdog_reports_once_and_stops(tmp_path):
@@ -405,7 +493,7 @@ def test_a_running_deployment_fails_closed_when_remote_heartbeat_is_missing(tmp_
         deployment_id="d",
         probe=lambda _target: True,
         require_heartbeat=True,
-        remote_reader=lambda _target, _path: (None, None, "not found"),
+        remote_reader=lambda _target, _path: (None, None, None, "not found"),
     )
 
     assert health[0].status == "missing"
@@ -426,7 +514,7 @@ def test_a_reachable_mac_with_a_dead_worker_is_not_healthy(tmp_path):
         deployment_id="d",
         probe=lambda _target: True,
         require_heartbeat=True,
-        remote_reader=lambda _target, _path: (marker, False, ""),
+        remote_reader=lambda _target, _path: (marker, False, datetime.now(UTC).timestamp(), ""),
     )
 
     assert health[0].reachable is True

@@ -134,7 +134,7 @@ def test_supervisor_prefers_rank_marker_over_mlx_cleanup_traceback(monkeypatch):
     monkeypatch.setattr(
         launch,
         "read_remote_marker",
-        lambda *_a, **_k: (None, None, ""),
+        lambda *_a, **_k: (None, None, None, ""),
     )
 
     detail = supervisor._exit_detail(0)

@@ -161,14 +161,35 @@ def read_marker(path: Path) -> dict[str, Any] | None:
         return None
 
 
+# Runs on the peer, but is authored here: the coordinator injects this script
+# on every query, so the payload producer and consumer are always the same
+# build. ``peer_now`` is the peer's own clock, read in the same process that
+# read the marker — ages computed against it never cross two Macs' wall
+# clocks, which is what made an unsynchronized pair look stale.
+_REMOTE_MARKER_SCRIPT = (
+    "import json,os,sys,time;"
+    "from pathlib import Path;"
+    "p=Path(sys.argv[1]).expanduser();"
+    "d=json.loads(p.read_text());"
+    "pid=d.get('pid');"
+    "live=None;"
+    "\nif isinstance(pid,int) and not isinstance(pid,bool) and pid>0:"
+    "\n try: os.kill(pid,0); live=True"
+    "\n except ProcessLookupError: live=False"
+    "\n except PermissionError: live=True"
+    "\nprint(json.dumps({'marker':d,'process_live':live,'peer_now':time.time()},"
+    "separators=(',',':')))"
+)
+
+
 def read_remote_marker(
     ssh_target: str,
     path: str,
     *,
     timeout: float = _DEFAULT_PROBE_TIMEOUT,
     runner: Callable[..., Any] = subprocess.run,
-) -> tuple[dict[str, Any] | None, bool | None, str]:
-    """Read one rank marker and its owner status on the Mac that owns it.
+) -> tuple[dict[str, Any] | None, bool | None, float | None, str]:
+    """Read one rank marker, its owner status and the peer's clock, over SSH.
 
     The command is fixed; only the SSH target and a shell-quoted path vary.
     Reading the marker through SSH keeps process health tied to the rank rather
@@ -176,25 +197,11 @@ def read_remote_marker(
     has removed its worker.
     """
 
-    script = (
-        "import json,os,sys;"
-        "from pathlib import Path;"
-        "p=Path(sys.argv[1]).expanduser();"
-        "d=json.loads(p.read_text());"
-        "pid=d.get('pid');"
-        "live=None;"
-        "\nif isinstance(pid,int) and not isinstance(pid,bool) and pid>0:"
-        "\n try: os.kill(pid,0); live=True"
-        "\n except ProcessLookupError: live=False"
-        "\n except PermissionError: live=True"
-        "\nprint(json.dumps({'marker':d,'process_live':live},"
-        "separators=(',',':')))"
-    )
     command = " ".join(
         (
             "python3",
             "-c",
-            shlex.quote(script),
+            shlex.quote(_REMOTE_MARKER_SCRIPT),
             shlex.quote(path),
         )
     )
@@ -211,28 +218,34 @@ def read_remote_marker(
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        return None, None, str(exc)
+        return None, None, None, str(exc)
     if getattr(result, "returncode", 1) != 0:
         error = getattr(result, "stderr", b"")
         if isinstance(error, bytes):
             error = error.decode(errors="replace")
-        return None, None, str(error).strip()
+        return None, None, None, str(error).strip()
     raw = getattr(result, "stdout", b"")
     if isinstance(raw, str):
         raw = raw.encode()
     if len(raw) > _MAX_REMOTE_MARKER_BYTES:
-        return None, None, "runtime marker response was too large"
+        return None, None, None, "runtime marker response was too large"
     try:
         payload = json.loads(raw.decode())
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        return None, None, f"runtime marker response was invalid: {exc}"
+        return None, None, None, f"runtime marker response was invalid: {exc}"
     marker = payload.get("marker")
     process_live = payload.get("process_live")
+    peer_now = payload.get("peer_now")
     if not isinstance(marker, dict):
-        return None, None, "runtime marker response did not contain a marker"
+        return None, None, None, "runtime marker response did not contain a marker"
     if process_live not in (True, False, None):
         process_live = None
-    return marker, process_live, ""
+    if isinstance(peer_now, bool) or not isinstance(peer_now, (int, float)):
+        # The script above always emits it; a payload without it is malformed,
+        # and quietly substituting the local clock would revive the cross-Mac
+        # comparison this field exists to remove.
+        return None, None, None, "runtime marker response did not carry the peer clock"
+    return marker, process_live, float(peer_now), ""
 
 
 def _pid_is_live(pid: int) -> bool:
@@ -299,7 +312,7 @@ def check_peers(
     now: float | None = None,
     probe: Callable[[str], bool] = probe_peer,
     remote_reader: Callable[
-        [str, str], tuple[dict[str, Any] | None, bool | None, str]
+        [str, str], tuple[dict[str, Any] | None, bool | None, float | None, str]
     ] = read_remote_marker,
     require_heartbeat: bool = False,
 ) -> tuple[PeerHealth, ...]:
@@ -309,6 +322,11 @@ def check_peers(
     callers leave ``require_heartbeat`` false and this is only an SSH
     reachability check. During a deployment it is true: local markers are read
     locally and remote markers are read on their owning Mac through SSH.
+
+    A remote marker's age is computed against the clock returned by the same
+    query, so both timestamps come from the peer. Comparing a peer's marker to
+    this Mac's clock made an unsynchronized but healthy pair read as stale,
+    and the watchdog then shut the deployment down.
 
     A marker whose writing process is gone is treated as absent rather than
     stale. It is the debris of a crashed run, not evidence about this one, and
@@ -323,16 +341,17 @@ def check_peers(
         marker: dict[str, Any] | None = None
         process_live: bool | None = None
         marker_error = ""
+        marker_clock = now
         if reachable and require_heartbeat and deployment_id:
             name = f"{deployment_id}-rank-{rank}.json"
             if ssh_target in _LOOPBACK_TARGETS:
                 marker = read_marker(local_root / name)
                 process_live = marker_owner_is_live(marker) if marker else None
             else:
-                marker, process_live, marker_error = remote_reader(
+                marker, process_live, marker_clock, marker_error = remote_reader(
                     ssh_target, str(remote_root / name)
                 )
-        age = marker_age_seconds(marker, now=now) if marker else None
+        age = marker_age_seconds(marker, now=marker_clock) if marker else None
         if not reachable:
             detail = f"{ssh_target} did not answer"
         elif require_heartbeat and process_live is False:

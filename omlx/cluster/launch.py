@@ -1175,7 +1175,7 @@ class DistributedJobSupervisor:
                 )
             else:
                 remote_root = self.state_dir.rstrip("/") or "."
-                marker, _, _ = read_remote_marker(
+                marker, _, _, _ = read_remote_marker(
                     host.ssh,
                     f"{remote_root}/{filename}",
                 )
