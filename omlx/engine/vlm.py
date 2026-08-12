@@ -1769,12 +1769,17 @@ class VLMBatchedEngine(BaseEngine):
         ):
             try:
                 from ..patches.qwen35_q4_mlp import (
+                    apply_muse_glimmer_q4_prefill_patch,
                     apply_qwen35_q4_mlp_patch,
                     apply_qwen35_q4_prefill_linear_patch,
                 )
 
                 apply_qwen35_q4_mlp_patch()
                 apply_qwen35_q4_prefill_linear_patch()
+                # Muse Glimmer rides the same native qmm tile (MLP plus the
+                # q/gate/o attention projections); no-op unless the muse
+                # compat patch installed the vendored module.
+                apply_muse_glimmer_q4_prefill_patch()
             except Exception:
                 logger.debug("Qwen q4 MLP prefill patch not applied", exc_info=True)
 
