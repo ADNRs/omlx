@@ -1300,6 +1300,26 @@
                 }
             },
 
+            // A probe that failed keeps failing until someone installs keys or
+            // plugs a cable back in. Retrying every ten seconds regardless
+            // spams both Macs' SSH logs; back off instead, and let a manual
+            // action or a completed pairing resume immediately.
+            clusterProbeBackoffActive() {
+                return Date.now() < Number(this._clusterProbeHoldUntilMs || 0);
+            },
+
+            resetClusterProbeBackoff() {
+                this._clusterProbeFailureCount = 0;
+                this._clusterProbeHoldUntilMs = 0;
+            },
+
+            _escalateClusterProbeBackoff() {
+                const failures = Number(this._clusterProbeFailureCount || 0) + 1;
+                this._clusterProbeFailureCount = failures;
+                const delay = Math.min(60000, 10000 * 2 ** (failures - 1));
+                this._clusterProbeHoldUntilMs = Date.now() + delay;
+            },
+
             async probeClusterPeer() {
                 if (this.clusterPeerProbeLoading) return;
                 const ssh = this.clusterPeerSsh.trim();
@@ -1331,6 +1351,7 @@
                     this.clusterError = '';
                     this.clusterConnectionError = '';
                     this.dismissClusterGuidance();
+                    this.resetClusterProbeBackoff();
                     this.clusterPeerProbe = result;
                     this.clusterPeerProbes = {
                         ...(this.clusterPeerProbes || {}),
@@ -1363,6 +1384,7 @@
                     const message = error?.message || 'Peer probe failed';
                     this.clusterError = message;
                     this.clusterConnectionError = message;
+                    this._escalateClusterProbeBackoff();
                 } finally {
                     this.clusterPeerProbeLoading = false;
                 }
@@ -1567,10 +1589,13 @@
                         this.clusterSelectedPeers = preferred;
                         this.clusterPeerSsh = preferred[0].ssh;
                         this.syncClusterNodesFromPeers();
-                        await this.probeClusterPeer();
-                        await this.loadClusterTransports();
+                        if (!this.clusterProbeBackoffActive()) {
+                            await this.probeClusterPeer();
+                            await this.loadClusterTransports();
+                        }
                     }
-                } else if (!this.clusterPeerProbe) {
+                } else if (!this.clusterPeerProbe
+                        && !this.clusterProbeBackoffActive()) {
                     await this.probeClusterPeer();
                     await this.loadClusterTransports();
                 }
@@ -1579,7 +1604,10 @@
                 // reload. Its budgets still need to be measured: keeping the
                 // old 8 GiB form defaults here made the workstation look as if
                 // it could safely donate almost all of its memory.
-                if (this.clusterWorkerPeers().length) {
+                // While the probe is backing off after failures, budgets would
+                // fail over the same SSH path, so they wait for the same hold.
+                if (this.clusterWorkerPeers().length
+                        && !this.clusterProbeBackoffActive()) {
                     await this.measureClusterBudgets();
                 }
 
@@ -1795,6 +1823,9 @@
                         this.clusterKeyExchangeResult = await response.json();
                         this.clusterPeerExchangeToken = '';
                         this.showNotification('SSH keys exchanged successfully', 'success');
+                        // Pairing just changed what a probe would find; retry
+                        // now rather than waiting out the failure hold.
+                        this.resetClusterProbeBackoff();
                         // Reload SSH key info
                         await this.loadClusterSshKey();
                     } else {
@@ -1833,6 +1864,8 @@
 
             async selectClusterDiscoveredPeer(peer) {
                 this.invalidateClusterPeer(true);
+                // A deliberate click outranks the automatic retry hold.
+                this.resetClusterProbeBackoff();
                 this.clusterSelectedPeers = [peer];
                 this.clusterPeerSsh = peer.ssh;
                 this.syncClusterNodesFromPeers();

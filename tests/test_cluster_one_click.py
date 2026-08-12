@@ -434,7 +434,7 @@ process.stdout.write(JSON.stringify({
 
 def test_peer_retry_keeps_the_existing_error_mounted_until_ssh_answers():
     result = _run_dashboard_helpers(
-        ("probeClusterPeer",),
+        ("probeClusterPeer", "_escalateClusterProbeBackoff"),
         """
 let errorDuringFetch = null;
 global.window = { location: { href: '' } };
@@ -472,7 +472,7 @@ component.clusterResponseError = async () => 'The other Mac rejected the login';
 
 def test_successful_peer_retry_clears_connection_error_and_guidance():
     result = _run_dashboard_helpers(
-        ("probeClusterPeer", "clusterDisplayedError"),
+        ("probeClusterPeer", "clusterDisplayedError", "resetClusterProbeBackoff"),
         """
 global.window = { location: { href: '' } };
 global.fetch = async () => ({
@@ -1522,7 +1522,7 @@ def test_first_run_adopts_omlx_peers_before_transport_has_been_measured():
     assert "peer.service === 'oMLX Distributed'" in source
     assert "omlxPeers.length" in source
     assert "automaticPeers" in source
-    assert "if (this.clusterWorkerPeers().length)" in source
+    assert "if (this.clusterWorkerPeers().length" in source
     assert source.count("await this.measureClusterBudgets()") == 1
     assert "await this.previewClusterWeightBalance()" in source
 
@@ -1671,3 +1671,97 @@ def test_one_click_prepares_thunderbolt_then_continues_to_activation():
         "hosts": ["127.0.0.1", "studio.local"]
     }
     assert result["activationResult"]["ok"] is True
+
+
+def test_probe_failures_back_off_instead_of_retrying_every_ten_seconds():
+    """SSH retries against an unpaired Mac escalate 10s -> 60s and hold there.
+
+    A success or a completed pairing clears the hold; the automatic refresh
+    loop consults ``clusterProbeBackoffActive`` before firing another probe.
+    """
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required to execute the dashboard orchestration")
+    methods = ",\n".join(
+        _method_source(name)
+        for name in (
+            "clusterProbeBackoffActive",
+            "resetClusterProbeBackoff",
+            "_escalateClusterProbeBackoff",
+            "probeClusterPeer",
+        )
+    )
+    script = f"""
+let nowMs = 1_000_000;
+Date.now = () => nowMs;
+global.window = {{ location: {{ href: '' }} }};
+let probeOk = false;
+global.fetch = async () => probeOk
+  ? {{ status: 200, ok: true, json: async () => ({{ status: {{ node: {{}} }} }}) }}
+  : {{ status: 503, ok: false }};
+const component = {{
+  {methods},
+  clusterPeerSsh: 'studio.local',
+  clusterLocalIp: '',
+  clusterPeerProbeLoading: false,
+  clusterPeerProbes: {{}},
+  clusterPlanNodes: [],
+  clusterError: '',
+  clusterConnectionError: '',
+  async clusterResponseError() {{ return 'Permission denied (publickey).'; }},
+  dismissClusterGuidance() {{}},
+  saveClusterKnownNodes() {{}},
+  async $nextTick() {{}},
+  invalidateClusterPlan() {{}},
+  async loadClusterFabric() {{}},
+}};
+(async () => {{
+  const holds = [];
+  for (let attempt = 0; attempt < 5; attempt += 1) {{
+    await component.probeClusterPeer();
+    holds.push(component._clusterProbeHoldUntilMs - nowMs);
+    nowMs = component._clusterProbeHoldUntilMs + 1;
+  }}
+  const activeBeforeExpiry = (() => {{
+    nowMs = component._clusterProbeHoldUntilMs - 1;
+    return component.clusterProbeBackoffActive();
+  }})();
+  const activeAfterExpiry = (() => {{
+    nowMs = component._clusterProbeHoldUntilMs + 1;
+    return component.clusterProbeBackoffActive();
+  }})();
+  probeOk = true;
+  await component.probeClusterPeer();
+  console.log(JSON.stringify({{
+    holds,
+    activeBeforeExpiry,
+    activeAfterExpiry,
+    failuresAfterSuccess: component._clusterProbeFailureCount,
+    activeAfterSuccess: component.clusterProbeBackoffActive(),
+  }}));
+}})();
+"""
+    completed = subprocess.run(
+        [node, "-e", script], capture_output=True, text=True, timeout=30
+    )
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout)
+
+    assert result["holds"] == [10000, 20000, 40000, 60000, 60000]
+    assert result["activeBeforeExpiry"] is True
+    assert result["activeAfterExpiry"] is False
+    assert result["failuresAfterSuccess"] == 0
+    assert result["activeAfterSuccess"] is False
+
+
+def test_the_automatic_refresh_paths_respect_the_probe_hold():
+    """The 10s loop and budget measurement consult the hold; clicks reset it."""
+
+    source = DASHBOARD_JS.read_text()
+
+    assert source.count("this.clusterProbeBackoffActive()") >= 3
+    select = _method_source("selectClusterDiscoveredPeer")
+    assert "resetClusterProbeBackoff()" in select
+    exchange = _method_source("exchangeKeysWithPeer")
+    assert "resetClusterProbeBackoff()" in exchange
