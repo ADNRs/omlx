@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+"""The distributed surface remains dark until explicitly enabled."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from types import SimpleNamespace
+
+from omlx.cluster.exposure import distributed_inference_enabled
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _settings(enabled: bool):
+    return SimpleNamespace(
+        server=SimpleNamespace(distributed_inference_enabled=enabled)
+    )
+
+
+def test_distributed_inference_is_disabled_without_settings():
+    assert distributed_inference_enabled(None) is False
+
+
+def test_distributed_inference_requires_explicit_opt_in():
+    assert distributed_inference_enabled(_settings(False)) is False
+    assert distributed_inference_enabled(_settings(True)) is True
+
+
+def test_server_uses_one_startup_snapshot_for_routes_and_bonjour():
+    source = (ROOT / "omlx/server.py").read_text()
+
+    assert (
+        "_server_state.distributed_inference_enabled = is_enabled(global_settings)"
+        in source
+    )
+    assert "if _server_state.distributed_inference_enabled:" in source
+    assert "_register_cluster_routes()" in source
+    assert "Depends(require_distributed_inference_enabled)" in source
+    assert "if (\n        distributed_inference_enabled()" in source

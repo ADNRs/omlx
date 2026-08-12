@@ -223,6 +223,7 @@ class GlobalSettingsRequest(BaseModel):
     auto_start_on_launch: bool | None = None
     burst_decode_mode: str | None = None  # "off" / "light" / "balanced" / "aggressive"
     preserve_mid_system_cache: bool | None = None
+    distributed_inference_enabled: bool | None = None
 
     # Model settings
     model_dirs: list[str] | None = None
@@ -3230,6 +3231,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
     )
     disk_info = get_ssd_disk_info(cache_dir)
+    server_state = _get_server_state() if _get_server_state is not None else None
 
     return {
         "base_path": str(global_settings.base_path),
@@ -3245,6 +3247,19 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
                 global_settings.server,
                 "preserve_mid_system_cache",
                 True,
+            ),
+            "distributed_inference_enabled": getattr(
+                global_settings.server,
+                "distributed_inference_enabled",
+                False,
+            ),
+            "distributed_inference_active": bool(
+                server_state is not None
+                and getattr(
+                    server_state,
+                    "distributed_inference_enabled",
+                    False,
+                )
             ),
         },
         "model": {
@@ -3478,6 +3493,12 @@ async def update_global_settings(
             request.preserve_mid_system_cache
         )
         runtime_applied.append("preserve_mid_system_cache")
+    if request.distributed_inference_enabled is not None:
+        # Route exposure and Bonjour publication are fixed at process startup,
+        # so this intentionally takes effect after the normal settings restart.
+        global_settings.server.distributed_inference_enabled = (
+            request.distributed_inference_enabled
+        )
 
     if request.server_aliases is not None:
         from ..utils.network import is_valid_alias

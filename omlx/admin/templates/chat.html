@@ -3519,6 +3519,7 @@
                     isStreaming: false,
                     streamingContent: '',
                     abortController: null,
+                    responseReader: null,
                     thinkingState: this.createThinkingState(),
                     streamingThinking: '',
                     streamingThinkingOpen: false,
@@ -3732,11 +3733,22 @@
                 };
             },
 
-            stopChatStreaming(chatId) {
-                const stream = this.getStreamSession(chatId, false);
-                if (stream?.abortController) {
-                    stream.abortController.abort();
+            cancelStreamTransport(stream) {
+                if (!stream) return;
+                const reader = stream.responseReader;
+                stream.responseReader = null;
+                if (reader) {
+                    // AbortController stops pending fetch work, but WebKit can
+                    // retain an already-open response body until its reader is
+                    // explicitly cancelled. That leaves distributed inference
+                    // decoding after the UI has stopped rendering.
+                    Promise.resolve(reader.cancel('Stopped by user')).catch(() => {});
                 }
+                stream.abortController?.abort();
+            },
+
+            stopChatStreaming(chatId) {
+                this.cancelStreamTransport(this.getStreamSession(chatId, false));
             },
 
             ensureStatsPollingForCurrentChat() {
@@ -3772,6 +3784,7 @@
                 stream.isStreaming = false;
                 stream.streamingContent = '';
                 stream.abortController = null;
+                stream.responseReader = null;
                 stream.thinkingState = this.createThinkingState();
                 stream.streamingThinking = '';
                 stream.streamingThinkingOpen = false;
@@ -3802,7 +3815,7 @@
 
             stopAllStreams() {
                 Object.values(this.streamSessions).forEach((stream) => {
-                    stream.abortController?.abort();
+                    this.cancelStreamTransport(stream);
                     this.resetStreamSession(stream);
                 });
             },
@@ -4553,10 +4566,21 @@
             const apiHeaders = this.getApiKey()
                 ? { 'Authorization': `Bearer ${this.getApiKey()}` }
                 : {};
-            // Fetch models, admin model list, server health, and integration settings in parallel
-            const [modelsResponse, adminModelsResponse, healthResponse, settingsResponse] = await Promise.all([
+            // Fetch models, admin model list, active cluster handles, server
+            // health, and integration settings in parallel.
+            const [
+                modelsResponse,
+                adminModelsResponse,
+                clusterDeploymentsResponse,
+                healthResponse,
+                settingsResponse,
+            ] = await Promise.all([
                 fetch('/v1/models', { headers: apiHeaders }),
                 fetch('/admin/api/models', { credentials: 'same-origin', headers: apiHeaders }),
+                fetch('/admin/api/cluster/deployments', {
+                    credentials: 'same-origin',
+                    headers: apiHeaders,
+                }),
                 fetch('/health'),
                 fetch('/admin/api/global-settings', { credentials: 'same-origin' })
             ]);
@@ -4586,6 +4610,20 @@
                     const alias = m.settings?.model_alias || m.model_alias;
                     if (alias) {
                         this.aliasToGateway[alias] = m.id;
+                    }
+                }
+            }
+            if (clusterDeploymentsResponse.ok) {
+                const clusterData = await clusterDeploymentsResponse.json();
+                const gatewayByPath = new Map(
+                    (this._adminModelsList || [])
+                        .filter(m => m.model_path)
+                        .map(m => [String(m.model_path), m.id])
+                );
+                for (const deployment of (clusterData.deployments || [])) {
+                    const gatewayId = gatewayByPath.get(String(deployment.model || ''));
+                    if (deployment.deployment_id && gatewayId) {
+                        this.aliasToGateway[deployment.deployment_id] = gatewayId;
                     }
                 }
             }
@@ -5000,6 +5038,18 @@
                         chat.title = this.untitledChatTitle();
                         migrated = true;
                     }
+                    const gatewayId = this.resolveGatewayModelId(chat.model);
+                    if (gatewayId && gatewayId !== chat.model) {
+                        if (
+                            chat.modelSettingsByModel?.[chat.model]
+                            && !chat.modelSettingsByModel[gatewayId]
+                        ) {
+                            chat.modelSettingsByModel[gatewayId] =
+                                chat.modelSettingsByModel[chat.model];
+                        }
+                        chat.model = gatewayId;
+                        migrated = true;
+                    }
                 }
                 if (migrated) {
                     this.saveChatHistory();
@@ -5136,8 +5186,9 @@
                 && this.promptProfiles.some(p => p.name === session.activeProfile)
                 ? session.activeProfile : null;
             if (session.model) {
-                // Resolve legacy alias → gateway id for backward compatibility
-                const gatewayId = this.aliasToGateway[session.model] || session.model;
+                // Resolve legacy aliases and private cluster deployment handles
+                // to the canonical model ID advertised by /v1/models.
+                const gatewayId = this.resolveGatewayModelId(session.model);
                 this.currentModel = gatewayId;
                 session.model = gatewayId;
                 if (!session.modelSettingsByModel) session.modelSettingsByModel = {};
@@ -5453,6 +5504,7 @@
             }
 
             const reader = response.body.getReader();
+            stream.responseReader = reader;
             const decoder = new TextDecoder();
             let buffer = '';
             const toolCallsMap = {}; // accumulate streaming tool_call chunks by index
@@ -6294,7 +6346,7 @@
     async deleteChat(chatId, { skipConfirm = false } = {}) {
         if (!skipConfirm && !confirm(window.t('chat.confirm_delete_chat'))) return;
 
-        this.getStreamSession(chatId, false)?.abortController?.abort();
+        this.cancelStreamTransport(this.getStreamSession(chatId, false));
         delete this.streamSessions[chatId];
         delete this.chatSessions[chatId];
 

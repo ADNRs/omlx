@@ -1973,6 +1973,21 @@ class VLMBatchedEngine(BaseEngine):
         if not chat_template:
             return
 
+        # MiniMax M3's template contains generic <tool_call> text in comments
+        # and examples, so upstream inference incorrectly selects json_tools.
+        # Use the same oMLX protocol adapter as distributed ranks.
+        from ..adapter.output_parser import (
+            install_minimax_m3_tokenizer_protocol,
+        )
+
+        if install_minimax_m3_tokenizer_protocol(
+            tokenizer,
+            self._model_name,
+            {"model_type": self.model_type} if self.model_type else None,
+        ):
+            logger.info("VLM tool calling enabled: parser=minimax_m3")
+            return
+
         # Prefer mlx_vlm.tool_parsers (superset; knows about Gemma4 etc.)
         try:
             from mlx_vlm.tool_parsers import (
