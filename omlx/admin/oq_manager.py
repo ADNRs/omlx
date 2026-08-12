@@ -23,7 +23,7 @@ try:
 except ImportError:
     HAS_MLX = False
 
-from ..model_discovery import _has_vision_subconfig
+from ..model_discovery import _decode_hf_cache_model_id, _has_vision_subconfig
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +134,21 @@ def _format_size(size_bytes: int) -> str:
         return f"{size_bytes / 1024**3:.1f} GB"
 
 
+def _safetensors_size(path: Path) -> int:
+    """Return the source weight size supported by the streaming quantizer."""
+    return sum(file.stat().st_size for file in path.glob("*.safetensors"))
+
+
+def _source_model_names(source: Path) -> tuple[str, str]:
+    """Return the display name and path-safe output base for a source model."""
+    if source.parent.name == "snapshots":
+        decoded = _decode_hf_cache_model_id(source.parent.parent)
+        if decoded is not None:
+            model_id, source_repo_id = decoded
+            return source_repo_id, model_id
+    return source.name, source.name
+
+
 class OQManager:
     """Manages oQ quantization tasks with async execution and progress tracking.
 
@@ -190,8 +205,11 @@ class OQManager:
                         hf_resolved = _resolve_hf_cache_entry(subdir)
                         if hf_resolved is not None:
                             candidates.append(
-                                (hf_resolved.snapshot_path, hf_resolved.model_id,
-                                 hf_resolved.source_repo_id)
+                                (
+                                    hf_resolved.snapshot_path,
+                                    hf_resolved.model_id,
+                                    hf_resolved.source_repo_id,
+                                )
                             )
                         else:
                             for child in sorted(subdir.iterdir()):
@@ -205,20 +223,15 @@ class OQManager:
                         try:
                             with open(path / "config.json") as f:
                                 config = json.load(f)
-                            size = sum(
-                                f.stat().st_size for f in path.glob("*.safetensors")
-                            )
-                            if size == 0:
-                                size = sum(f.stat().st_size for f in path.glob("*.bin"))
+                            size = _safetensors_size(path)
                             if size == 0:
                                 continue
                             # Skip models without model_type — MLX needs it to
                             # resolve the model class, so quantizing them would
                             # produce an unloadable checkpoint.
-                            mt = (
-                                config.get("model_type", "")
-                                or config.get("text_config", {}).get("model_type", "")
-                            )
+                            mt = config.get("model_type", "") or config.get(
+                                "text_config", {}
+                            ).get("model_type", "")
                             if not mt:
                                 continue
                             tc = config.get("text_config", {})
@@ -322,11 +335,17 @@ class OQManager:
             config = json.load(f)
         _validate_oq_dtype_for_model(config, dtype)
 
+        source_size = _safetensors_size(source)
+        if source_size == 0:
+            raise ValueError(f"No .safetensors files found in {model_path}")
+
+        model_name, output_base_name = _source_model_names(source)
+
         if preserve_mtp and not _checkpoint_has_mtp_weights(source):
             logger.warning(
                 "Preserve MTP requested for %s, but no mtp.* tensors were "
                 "found in the checkpoint; disabling MTP preservation",
-                source.name,
+                model_name,
             )
             preserve_mtp = False
 
@@ -351,13 +370,12 @@ class OQManager:
                     logger.warning(
                         "Recipient %s ships its own MTP head; it will be "
                         "stripped and replaced by the donor head from %s",
-                        source.name,
+                        model_name,
                         assistant.name,
                     )
 
-        model_name = source.name
         output_name = resolve_output_name(
-            model_name,
+            output_base_name,
             oq_level,
             dtype,
             preserve_mtp=preserve_mtp,
@@ -399,14 +417,10 @@ class OQManager:
                     self._output_dir
                     / ".oqe_imatrix"
                     / (
-                        f"{model_name}-{digest}-s{int(imatrix_num_samples)}"
+                        f"{output_base_name}-{digest}-s{int(imatrix_num_samples)}"
                         f"-l{int(imatrix_seq_length)}.npz"
                     )
                 )
-
-        source_size = sum(f.stat().st_size for f in source.glob("*.safetensors"))
-        if source_size == 0:
-            source_size = sum(f.stat().st_size for f in source.glob("*.bin"))
 
         task_id = str(uuid.uuid4())
         task = QuantTask(
