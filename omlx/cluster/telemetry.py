@@ -666,6 +666,8 @@ def install_server_telemetry(
         heartbeat_interval=heartbeat_interval,
     )
 
+    snapshot_ctx = threading.local()
+    snapshot_step = max(1, int(prefill_step_size))
     ssd_store = None
     if ssd_cache_dir:
         from .prompt_snapshot_cache import (
@@ -674,9 +676,9 @@ def install_server_telemetry(
             candidate_boundaries,
         )
 
-        ssd_store = SSDPromptSnapshotStore(ssd_cache_dir, max_entries=ssd_max_entries)
-    snapshot_ctx = threading.local()
-    snapshot_step = max(1, int(prefill_step_size))
+        ssd_store = SSDPromptSnapshotStore(
+            ssd_cache_dir, step=snapshot_step, max_entries=ssd_max_entries
+        )
     try:
         world_size = int(mx.distributed.init().size())
     except Exception:
@@ -698,7 +700,7 @@ def install_server_telemetry(
         # and the sequential generate_step rejects an empty prompt, so a full
         # hit must leave the last token unprocessed. The cap is computed from
         # the broadcast prompt length, so it is identical on every rank.
-        local = set(ssd_store.present_boundaries(model, tokens, snapshot_step))
+        local = set(ssd_store.present_boundaries(model, tokens))
         candidates = candidate_boundaries(len(tokens) - 1, snapshot_step)
         if not candidates:
             return 0
