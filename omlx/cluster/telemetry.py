@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import math
+import shutil
 import threading
 import time
 from collections.abc import Iterator
@@ -645,7 +646,9 @@ def install_server_telemetry(
     a chained progress callback) and restore from it on an in-memory miss, so a
     model whose per-layer state cannot be sliced still reuses a long prefix
     instead of recomputing it. The restore boundary is agreed across ranks so a
-    disk write that failed on one rank cannot desync the pipeline.
+    disk write that failed on one rank cannot desync the pipeline. The snapshot
+    directory is process-lifetime: the store starts it clean and this context's
+    teardown removes it.
     """
 
     import mlx.core as mx
@@ -994,3 +997,7 @@ def install_server_telemetry(
         mlx_server.LRUPromptCache = original_prompt_cache
         mlx_server.GenerationContext = original_generation_context
         mlx_server.stream_generate = original_stream_generate
+        if ssd_store is not None:
+            # Snapshots are process-lifetime; a hard crash skips this and the
+            # next store on the same directory reclaims the leftovers instead.
+            shutil.rmtree(ssd_store.directory, ignore_errors=True)

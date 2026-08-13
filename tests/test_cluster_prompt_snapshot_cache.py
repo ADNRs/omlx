@@ -186,6 +186,19 @@ def test_an_untouched_rotating_member_round_trips(tmp_path):
     assert mx.array_equal(restored[1].state[0], trailing.state[0])
 
 
+def test_a_new_store_reclaims_what_a_dead_process_left(tmp_path):
+    """Snapshots are process-lifetime: digest filenames cannot be re-indexed
+    without their token tuples, so a stale file would be invisible to hits yet
+    still hold disk. A new store starts by clearing its directory."""
+
+    (tmp_path / "deadbeef.safetensors").write_bytes(b"stale")
+    (tmp_path / ".partial.safetensors").write_bytes(b"orphaned temp")
+    store = SSDPromptSnapshotStore(tmp_path)
+
+    assert list(tmp_path.iterdir()) == []
+    assert store.put(MODEL, list(range(2048)), _kv())  # still fully usable
+
+
 def test_present_boundaries_reports_only_stored_prefixes(tmp_path):
     store = SSDPromptSnapshotStore(tmp_path)
     tokens = list(range(6144))

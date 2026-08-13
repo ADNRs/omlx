@@ -19,6 +19,12 @@ requests keep identical key sets without any coordination. Coordinating the
 *hit* across ranks (so a disk write that failed on one rank cannot desync the
 pipeline) is the caller's job and lives in the telemetry integration, which has
 the collective; this module stays pure and unit-testable.
+
+Snapshots are process-lifetime. The digest filenames cannot be re-indexed
+without their token tuples, and a file that is not in the index is invisible to
+hits yet still holds disk, so a new store starts by clearing its directory and
+the telemetry teardown removes it. A rank that restarts simply begins empty,
+which the boundary vote already handles.
 """
 
 from __future__ import annotations
@@ -284,6 +290,13 @@ class SSDPromptSnapshotStore:
         self._serialisable = True
         _register_snapshot_classes()
         self.directory.mkdir(parents=True, exist_ok=True)
+        # Snapshots are process-lifetime (see the module docstring): whatever a
+        # dead process left behind is unreachable, so reclaim it up front and
+        # keep the directory exactly as large as the live index says it is.
+        for stale in self.directory.iterdir():
+            if stale.is_file():
+                with suppress(OSError):
+                    stale.unlink()
 
     def __len__(self) -> int:
         with self._lock:

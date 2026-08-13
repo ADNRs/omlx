@@ -66,8 +66,8 @@ def test_prefill_boundaries_are_snapshotted_to_ssd(tmp_path, monkeypatch):
                 prompt_progress_callback=None,
             )
         )
+        snapshots = sorted(tmp_path.glob("*.safetensors"))
 
-    snapshots = sorted(tmp_path.glob("*.safetensors"))
     assert len(snapshots) == 2  # one at 4 tokens, one at 8
 
 
@@ -150,6 +150,26 @@ def test_the_patch_restores_stream_generate_on_exit(tmp_path, monkeypatch):
     assert mlx_server.stream_generate is _fake_stream_generate
 
 
+def test_teardown_removes_the_snapshot_directory(tmp_path, monkeypatch):
+    """Snapshots are process-lifetime: nothing may outlive the serving span."""
+
+    mlx_server, ctx = _install(tmp_path, monkeypatch)
+    with ctx:
+        cache = mlx_server.LRUPromptCache()
+        tokens = list(range(8))
+        cache.fetch_nearest_cache(MODEL, tokens)
+        list(
+            mlx_server.stream_generate(
+                model=None,
+                prompt=tokens,
+                prompt_cache=_kv(),
+                prompt_progress_callback=None,
+            )
+        )
+        assert sorted(tmp_path.glob("*.safetensors"))
+    assert not tmp_path.exists()
+
+
 class _FakeBaseBatchGenerator:
     """Report prefill progress at each step boundary, like BatchGenerator."""
 
@@ -201,8 +221,9 @@ def test_batched_prefill_snapshots_at_each_boundary(tmp_path, monkeypatch):
             prompt_responses, gen_responses = batch.next()
             if not prompt_responses and not gen_responses:
                 break
+        snapshots = sorted(tmp_path.glob("*.safetensors"))
 
-    assert len(sorted(tmp_path.glob("*.safetensors"))) == 3  # STEP, 2*STEP, 3*STEP
+    assert len(snapshots) == 3  # STEP, 2*STEP, 3*STEP
 
 
 def test_batched_capture_restores_on_a_later_batched_miss(tmp_path, monkeypatch):
