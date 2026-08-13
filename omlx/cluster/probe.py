@@ -529,6 +529,7 @@ def collect_cluster_status(
             accelerator.recommended_working_set_bytes or physical_memory_bytes
         )
         chip_name = accelerator.name
+    ceiling_measured = True
     try:
         # This is deliberately the same computation a distributed rank runs
         # immediately before loading. ``recommended_working_set_bytes`` is a
@@ -539,14 +540,19 @@ def collect_cluster_status(
         admission_ceiling_bytes = int(ceiling_breakdown().get("hard_limit", 0))
     except Exception:
         # Capability probing must remain available on a worker-only or partly
-        # upgraded install. A zero is explicit "not measured"; callers must
-        # not reinterpret it as installed RAM.
+        # upgraded install. The guard machinery is genuinely absent here, which
+        # is different from a measured zero and must fall back rather than
+        # advertise installed RAM.
         admission_ceiling_bytes = 0
-    if admission_ceiling_bytes <= 0 and accelerator.kind == "cuda":
-        # CUDA does not expose Metal's recommended working-set guard. Until a
-        # live free-memory probe is installed, retain ten percent for the OS,
-        # CUDA context, communication buffers, and load-time transients rather
-        # than advertising all installed unified memory as model capacity.
+        ceiling_measured = False
+    if not ceiling_measured and accelerator.kind == "cuda":
+        # CUDA does not expose Metal's recommended working-set guard. With no
+        # live free-memory probe at all, retain ten percent for the OS, CUDA
+        # context, communication buffers, and load-time transients rather than
+        # advertising all installed memory as model capacity. A *measured* zero
+        # (another process such as vLLM already owns the VRAM) is a real "no
+        # room right now" and must not be inflated back to installed size, or
+        # the planner would place a shard that OOMs on load.
         admission_ceiling_bytes = int(recommended_working_set_bytes * 0.90)
     timestamp = (now or (lambda: datetime.now(UTC)))()
     if timestamp.tzinfo is None:

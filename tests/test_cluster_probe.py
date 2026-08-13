@@ -214,24 +214,31 @@ def test_mlx_version_uses_core_module_version(monkeypatch):
     assert probe.hardware.get_mlx_version() == "0.32.0"
 
 
-def test_cuda_status_reports_connectx_and_safe_model_budget(monkeypatch):
-    _patch_hardware(monkeypatch)
-    monkeypatch.setattr(
-        probe,
-        "detect_accelerator_hardware",
-        lambda: probe.AcceleratorHardware(
-            kind="cuda",
-            vendor="nvidia",
-            memory_kind="unified",
-            name="NVIDIA GB10",
-            physical_memory_bytes=128 * 1024**3,
-            recommended_working_set_bytes=128 * 1024**3,
-            distributed_backends=("ring", "nccl"),
-        ),
+def _cuda_gb10(**overrides):
+    fields = dict(
+        kind="cuda",
+        vendor="nvidia",
+        memory_kind="unified",
+        name="NVIDIA GB10",
+        physical_memory_bytes=128 * 1024**3,
+        recommended_working_set_bytes=128 * 1024**3,
+        distributed_backends=("ring", "nccl"),
     )
+    fields.update(overrides)
+    return probe.AcceleratorHardware(**fields)
+
+
+def test_cuda_status_falls_back_to_safe_budget_when_the_guard_is_absent(monkeypatch):
+    """With no ceiling measurement at all, reserve ten percent of installed."""
+
+    _patch_hardware(monkeypatch)
+    monkeypatch.setattr(probe, "detect_accelerator_hardware", _cuda_gb10)
+
+    def _guard_unavailable(*_a, **_k):
+        raise RuntimeError("memory guard machinery is not installed")
+
     monkeypatch.setattr(
-        "omlx.cluster.memory_guard.ceiling_breakdown",
-        lambda *_a, **_k: {"hard_limit": 0},
+        "omlx.cluster.memory_guard.ceiling_breakdown", _guard_unavailable
     )
     runner = FakeRunner(
         {
@@ -254,6 +261,46 @@ def test_cuda_status_reports_connectx_and_safe_model_budget(monkeypatch):
     assert status.fabric_group_id is None
     assert status.admission_ceiling_bytes == int(128 * 1024**3 * 0.90)
     assert status.to_dict()["node"]["memory_kind"] == "unified"
+
+
+def test_cuda_measured_zero_free_is_not_inflated_to_installed_size(monkeypatch):
+    """A measured empty VRAM must stay zero, not be advertised as capacity.
+
+    ``_cuda_ceiling_breakdown`` returns ``hard_limit == 0`` when the live free
+    memory is zero, e.g. another service such as vLLM already owns the whole
+    GB10. Re-inflating that to ninety percent of installed memory made the
+    dashboard advertise room that is not there, and the planner would place a
+    shard that OOMs on load. The sibling ``probe_remote_admission_ceiling``
+    already fails closed on the same zero; this keeps the capability probe
+    consistent with it.
+    """
+
+    _patch_hardware(monkeypatch)
+    monkeypatch.setattr(probe, "detect_accelerator_hardware", _cuda_gb10)
+    monkeypatch.setattr(
+        "omlx.cluster.memory_guard.ceiling_breakdown",
+        lambda *_a, **_k: {"hard_limit": 0},
+    )
+
+    status = probe.collect_cluster_status(runner=FakeRunner({}))
+
+    assert status.accelerator == "cuda"
+    assert status.admission_ceiling_bytes == 0
+
+
+def test_cuda_measured_ceiling_is_used_verbatim(monkeypatch):
+    """A real measured ceiling is neither inflated nor floored."""
+
+    _patch_hardware(monkeypatch)
+    monkeypatch.setattr(probe, "detect_accelerator_hardware", _cuda_gb10)
+    monkeypatch.setattr(
+        "omlx.cluster.memory_guard.ceiling_breakdown",
+        lambda *_a, **_k: {"hard_limit": 40 * 1024**3},
+    )
+
+    status = probe.collect_cluster_status(runner=FakeRunner({}))
+
+    assert status.admission_ceiling_bytes == 40 * 1024**3
 
 
 def test_linux_cuda_probe_maps_connectx_device_to_network_interface(monkeypatch):
