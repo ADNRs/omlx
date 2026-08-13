@@ -146,6 +146,23 @@ def test_the_deepseek_layer_shape_round_trips(tmp_path):
     assert pool_small.prev_win_kv is not None
 
 
+def test_an_arrays_cache_with_an_unwritten_slot_round_trips(tmp_path):
+    """A recurrent cache may leave slots None until a layer first writes them;
+    the stand-in must carry the mixed written/unwritten layout exactly."""
+
+    store = SSDPromptSnapshotStore(tmp_path)
+    gdn = ArraysCache(size=2)
+    gdn[0] = mx.random.normal((1, 2, 4))  # slot 1 never written
+
+    assert store.put(MODEL, list(range(2048)), [gdn])
+    restored = store.load(MODEL, list(range(2048)), 2048)
+
+    assert restored is not None
+    assert type(restored[0]).__name__ == "ArraysCache"
+    assert mx.array_equal(restored[0][0], gdn[0])
+    assert restored[0][1] is None
+
+
 def test_an_empty_pooling_cache_still_round_trips(tmp_path):
     """A member with no state yet must not shift later caches in the file."""
 

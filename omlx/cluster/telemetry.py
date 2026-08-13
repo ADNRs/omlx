@@ -693,12 +693,18 @@ def install_server_telemetry(
         reaches it in lockstep.
         """
 
+        # Capped at len - 1: the pinned batched server cannot insert a request
+        # whose segments were all consumed (insert_segments indexes seq[-1])
+        # and the sequential generate_step rejects an empty prompt, so a full
+        # hit must leave the last token unprocessed. The cap is computed from
+        # the broadcast prompt length, so it is identical on every rank.
         local = set(ssd_store.present_boundaries(model, tokens, snapshot_step))
-        candidates = candidate_boundaries(len(tokens), snapshot_step)
+        candidates = candidate_boundaries(len(tokens) - 1, snapshot_step)
         if not candidates:
             return 0
         if world_size <= 1:
-            return max(local) if local else 0
+            usable = local.intersection(candidates)
+            return max(usable) if usable else 0
         vote = mx.array([1 if c in local else 0 for c in candidates], dtype=mx.int32)
         agreed = mx.distributed.all_sum(vote).tolist()
         return agreed_boundary(candidates, agreed, world_size)
@@ -822,6 +828,24 @@ def install_server_telemetry(
 
         def _lookup(self, model: Any, tokens: list[int]) -> Any:
             cache, rest = self._fetch_observed(model, tokens)
+            if cache is not None and not rest and tokens:
+                # MLX-LM's exact-hit branch returns an empty rest, unlike its
+                # shorter/longer branches which cap the prefix at len - 1. The
+                # pinned batched server dies inserting a fully consumed
+                # request (insert_segments indexes seq[-1]) and the sequential
+                # generate_step rejects an empty prompt, so hand back the last
+                # token: trimmed off the hit when the cache supports it,
+                # recomputed from scratch when it does not.
+                from mlx_lm.models.cache import (
+                    can_trim_prompt_cache,
+                    trim_prompt_cache,
+                )
+
+                if can_trim_prompt_cache(cache):
+                    trim_prompt_cache(cache, 1)
+                    rest = list(tokens[-1:])
+                else:
+                    cache, rest = None, list(tokens)
             # Record the full prompt so the boundary-snapshot callback can key
             # its writes; it runs later on this same generation thread.
             snapshot_ctx.model = model

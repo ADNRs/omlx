@@ -121,6 +121,60 @@ def test_the_fetch_path_alone_carries_the_ssd_tier(tmp_path, monkeypatch):
     assert rest == [8, 9, 10, 11]
 
 
+def test_an_aligned_full_hit_keeps_the_last_token_unprocessed(tmp_path, monkeypatch):
+    """The pinned batched server dies inserting a request whose segments were
+    all consumed, so a prompt that exactly matches its own snapshot must be
+    served from the next boundary down, never with an empty rest."""
+
+    mlx_server, ctx = _install(tmp_path, monkeypatch)
+    with ctx:
+        cache = mlx_server.LRUPromptCache()
+        exact = list(range(8))  # snapshots land at 4 and at 8 == len(prompt)
+        cache.fetch_nearest_cache(MODEL, exact)
+        list(
+            mlx_server.stream_generate(
+                model=None,
+                prompt=exact,
+                prompt_cache=_kv(),
+                prompt_progress_callback=None,
+            )
+        )
+        assert len(sorted(tmp_path.glob("*.safetensors"))) == 2
+
+        restored, rest = mlx_server.LRUPromptCache().fetch_nearest_cache(MODEL, exact)
+
+    assert restored is not None
+    assert rest == [4, 5, 6, 7]  # the 8-boundary is never offered to itself
+
+
+def test_a_stock_exact_hit_is_trimmed_to_leave_one_token(tmp_path, monkeypatch):
+    """MLX-LM's exact-hit branch returns an empty rest; the wrapped lookup
+    must hand the last token back, trimming the hit when the cache allows."""
+
+    from mlx_lm.models.cache import ArraysCache
+
+    mlx_server, ctx = _install(tmp_path, monkeypatch)
+    with ctx:
+        tokens = list(range(8))
+        cache = mlx_server.LRUPromptCache()
+        cache.insert_cache(MODEL, tokens, _kv(steps=8))
+        hit, rest = cache.fetch_nearest_cache(MODEL, tokens)
+        assert hit is not None
+        assert rest == [7]
+        assert hit[0].offset == 7
+
+        # A cache that cannot trim is dropped instead: full prefill beats a
+        # request the server cannot insert.
+        recurrent = ArraysCache(size=1)
+        recurrent[0] = mx.random.normal((1, 2, 4))
+        other = mlx_server.LRUPromptCache()
+        other.insert_cache(MODEL, tokens, [recurrent])
+        dropped, rest = other.fetch_nearest_cache(MODEL, tokens)
+
+    assert dropped is None
+    assert rest == tokens
+
+
 def test_an_unaligned_base_deposits_no_snapshot(tmp_path, monkeypatch):
     """Only aligned boundaries are reusable, so an off-grid base writes nothing."""
 
