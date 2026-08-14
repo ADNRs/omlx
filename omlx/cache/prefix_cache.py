@@ -91,6 +91,33 @@ logger = logging.getLogger(__name__)
 # Each entry is two 32-byte hashes; the cap only guards against unbounded
 # growth from many distinct conversation chains over a long-lived process.
 _TIP_LINEAGE_MAX_ENTRIES = 4096
+
+# Cap for the per-session set of dedup'd block hashes whose payloads were
+# already inspected for boundary-snapshot backfill (see
+# _maybe_backfill_dedup_block_payload). Cleared on overflow, like the tip
+# lineage map.
+_BACKFILL_CHECKED_MAX_ENTRIES = 4096
+
+
+def _wrap_cachelist_sub_marker(
+    sub_idx: int,
+    elements: list[Any],
+    sub_class_names: list[str],
+    storage_class_name: str | None = None,
+) -> tuple[Any, ...]:
+    """Wrap one CacheList sub-state for block storage.
+
+    Length-2 element lists round-trip as legacy ``(keys, values)`` so
+    existing callers (prefix cache reconstruct, tests) keep their shape.
+    Real N-tuple sub-states (PoolingCache, BatchKVCache) surface as
+    ``__nstate__`` markers.
+    """
+    if len(elements) == 2:
+        return (elements[0], elements[1])
+    name = storage_class_name
+    if name is None and sub_idx < len(sub_class_names):
+        name = sub_class_names[sub_idx]
+    return ("__nstate__", name, list(elements))
 _EXACT_PREFIX_TERMINAL_KEY = "specprefill-static-exact-v1"
 _POOLING_CACHE_SUB_CLASSES = frozenset({"PoolingCache", "BatchPoolingCache"})
 
@@ -206,6 +233,18 @@ class BlockAwarePrefixCache(CacheManager):
         # rotating payload (see _strip_rotating_payload); the immediate
         # previous tip is kept intact as the walk-back fallback.
         self._rotating_tip_lineage: dict[bytes, bytes] = {}
+
+        # Hashes this session stored as tip blocks. A lineage entry is only
+        # recorded when the block preceding the new blocks really was a tip:
+        # for a store that diverged from an existing chain, that block is a
+        # shared-prefix interior block (often a boundary-snapshot block) and
+        # stripping it would destroy partial-match walk-back restores.
+        self._store_tip_hashes: set[bytes] = set()
+
+        # Dedup'd block hashes whose payloads were conclusively inspected
+        # for boundary-snapshot backfill this session (real state found or
+        # rewrite saved). Each hash is inspected at most once per run.
+        self._backfill_checked_hashes: set[bytes] = set()
 
         # Callback for restoring cold blocks (deprecated in paged SSD-only mode)
         # Kept for API compatibility
@@ -919,6 +958,40 @@ class BlockAwarePrefixCache(CacheManager):
                                 global_start,
                             )
                             break
+                    # Dedup'd blocks are never rewritten, so a block first
+                    # stored without snapshot coverage keeps placeholder
+                    # non-sliceable payloads forever. When this store carries
+                    # a boundary snapshot for the block, repair the payload
+                    # so partial-match walk-back can restore here again.
+                    if (
+                        not split_gdn_layout
+                        and is_tensor_data
+                        and HAS_MLX
+                        and self.paged_ssd_cache is not None
+                        and has_boundary_snapshot
+                        and existing_block.block_hash is not None
+                        and existing_block.block_hash
+                        not in self._backfill_checked_hashes
+                    ):
+                        snapshot_cache_data = boundary_snapshots[global_end]
+                        backfilled = (
+                            snapshot_cache_data
+                            and self._maybe_backfill_dedup_block_payload(
+                                existing_block.block_hash,
+                                global_end,
+                                snapshot_cache_data,
+                                hot_cache_write_back=hot_cache_write_back,
+                            )
+                        )
+                        if backfilled:
+                            self._backfill_checked_hashes.add(
+                                existing_block.block_hash
+                            )
+                            if (
+                                len(self._backfill_checked_hashes)
+                                > _BACKFILL_CHECKED_MAX_ENTRIES
+                            ):
+                                self._backfill_checked_hashes.clear()
                     # Reuse existing block
                     self.paged_cache.increment_ref(existing_block.block_id)
                     block_table.block_ids.append(existing_block.block_id)
@@ -1179,26 +1252,42 @@ class BlockAwarePrefixCache(CacheManager):
         if (
             tip_block_saved
             and first_new_block_idx is not None
-            and 0 < first_new_block_idx < len(block_table.block_ids)
+            and first_new_block_idx < len(block_table.block_ids)
             and layer_cache_types
             and any(CacheTypeRegistry.is_rotating_family(t) for t in layer_cache_types)
         ):
-            prev_tip_id = block_table.block_ids[first_new_block_idx - 1]
             new_tip_id = block_table.block_ids[-1]
-            prev_tip = self.paged_cache.allocated_blocks.get(prev_tip_id)
             new_tip = self.paged_cache.allocated_blocks.get(new_tip_id)
-            if (
-                prev_tip is not None
-                and prev_tip.block_hash is not None
-                and new_tip is not None
-                and new_tip.block_hash is not None
-            ):
-                superseded = self._rotating_tip_lineage.pop(prev_tip.block_hash, None)
-                if superseded is not None:
-                    self._strip_rotating_payload(superseded)
-                self._rotating_tip_lineage[new_tip.block_hash] = prev_tip.block_hash
-                if len(self._rotating_tip_lineage) > _TIP_LINEAGE_MAX_ENTRIES:
-                    self._rotating_tip_lineage.clear()
+            prev_tip = None
+            if first_new_block_idx > 0:
+                prev_tip_id = block_table.block_ids[first_new_block_idx - 1]
+                prev_tip = self.paged_cache.allocated_blocks.get(prev_tip_id)
+            if new_tip is not None and new_tip.block_hash is not None:
+                # Only treat prev as a superseded tip when it actually was
+                # one. `first_new_block_idx - 1` is merely the last reused
+                # block of THIS store: on a store that diverged from an
+                # existing chain it is a shared-prefix interior block (often
+                # a boundary-snapshot block), and recording it here would get
+                # it stripped two stores later, permanently breaking
+                # partial-match walk-back restores.
+                if (
+                    prev_tip is not None
+                    and prev_tip.block_hash is not None
+                    and prev_tip.block_hash in self._store_tip_hashes
+                ):
+                    superseded = self._rotating_tip_lineage.pop(
+                        prev_tip.block_hash, None
+                    )
+                    if superseded is not None:
+                        self._strip_rotating_payload(superseded)
+                    self._rotating_tip_lineage[new_tip.block_hash] = (
+                        prev_tip.block_hash
+                    )
+                    if len(self._rotating_tip_lineage) > _TIP_LINEAGE_MAX_ENTRIES:
+                        self._rotating_tip_lineage.clear()
+                self._store_tip_hashes.add(new_tip.block_hash)
+                if len(self._store_tip_hashes) > _TIP_LINEAGE_MAX_ENTRIES:
+                    self._store_tip_hashes.clear()
 
         # Exact terminal blocks are discoverable only through
         # fetch_exact_prefix(); never expose them to general prefix matching.
@@ -1616,6 +1705,186 @@ class BlockAwarePrefixCache(CacheManager):
             )
             return False
 
+    def _cachelist_snapshot_sub_tensors(
+        self,
+        source_layer: dict[str, Any],
+        source_state: Any,
+        sub_class_names: list[str],
+    ) -> list[Any] | None:
+        """Build ``__cache_list__`` sub-tensors from an extracted layer dict.
+
+        Clones *all* sub-state elements (PoolingCache's third element
+        ``pooled`` must survive the round-trip) and wraps PoolingCache subs
+        that carry a delta range as ``PoolingCacheDelta`` storage entries.
+        Returns None when the state is not a usable list.
+        """
+        if not isinstance(source_state, list):
+            return None
+        pooling_delta_ranges = source_layer.get("pooling_delta_ranges", {})
+        sub_tensors: list[Any] = []
+        for sub_idx, sub_state in enumerate(source_state):
+            if not (isinstance(sub_state, (list, tuple)) and len(sub_state) >= 1):
+                continue
+            cloned = [
+                self._clone_tensor(elem) if hasattr(elem, "shape") else elem
+                for elem in sub_state
+            ]
+            delta_range = pooling_delta_ranges.get(str(sub_idx))
+            sub_class = (
+                sub_class_names[sub_idx] if sub_idx < len(sub_class_names) else None
+            )
+            if (
+                sub_class == "PoolingCache"
+                and isinstance(delta_range, (list, tuple))
+                and len(delta_range) == 2
+            ):
+                cloned.append(mx.array(delta_range, dtype=mx.int64))
+                sub_tensors.append(
+                    _wrap_cachelist_sub_marker(
+                        sub_idx,
+                        cloned,
+                        sub_class_names,
+                        POOLING_CACHE_DELTA_CLASS,
+                    )
+                )
+            else:
+                sub_tensors.append(
+                    _wrap_cachelist_sub_marker(sub_idx, cloned, sub_class_names)
+                )
+        return sub_tensors
+
+    def _maybe_backfill_dedup_block_payload(
+        self,
+        block_hash: bytes,
+        boundary_tc: int,
+        snapshot_cache_data: list[dict[str, Any]],
+        hot_cache_write_back: bool = True,
+    ) -> bool:
+        """Rewrite a dedup'd placeholder block with boundary-snapshot state.
+
+        Deduplicated blocks are never rewritten by store_cache, so a block
+        first stored without snapshot coverage (or stripped since) keeps
+        placeholder non-sliceable payloads forever — every partial prefix
+        match that ends inside such a region is rejected and the request
+        re-prefills from scratch. When the current store re-processed the
+        same tokens and carries a boundary snapshot for this block's
+        boundary, rewrite the placeholder layers with the same
+        snapshot-derived payload a fresh snapshot-covered block would get,
+        making walk-back restores at this boundary possible again.
+
+        Strip interaction: _strip_rotating_payload only targets blocks that
+        still hold real rotating state, and this method only replaces
+        placeholder layers, so the two never rewrite the same block in one
+        store. A previously stripped ex-tip may be deliberately re-backfilled
+        by a later covered store.
+
+        Returns True when the block needs no further inspection this session
+        (payload already real, unusable snapshot, or rewrite saved); False
+        on transient load/save failure so a later store retries.
+        """
+        if self.paged_ssd_cache is None or not HAS_MLX:
+            return True
+        try:
+            data, meta = self.paged_ssd_cache.load_block_with_metadata(block_hash)
+            if not data or not meta:
+                return False
+            types = meta.get("layer_cache_types") or []
+            new_data: list[Any] = []
+            replaced_indices: list[int] = []
+            for i, layer in enumerate(data):
+                type_name = types[i] if i < len(types) else "KVCache"
+                handler = CacheTypeRegistry.get_handler_by_class_name(type_name)
+                if handler.supports_block_slicing or not self._is_placeholder_state(
+                    layer
+                ):
+                    if type_name == "CacheList" and isinstance(layer, list):
+                        # load_block_with_metadata() exposes CacheList
+                        # payloads as their legacy list shape; restore the
+                        # storage marker before re-saving (same as strip).
+                        new_data.append(("__cache_list__", layer))
+                    else:
+                        new_data.append(layer)
+                    continue
+
+                snap_layer = (
+                    snapshot_cache_data[i]
+                    if i < len(snapshot_cache_data)
+                    else None
+                )
+                if not isinstance(snap_layer, dict) or "state" not in snap_layer:
+                    return True
+                snap_state = snap_layer["state"]
+                if CacheTypeRegistry.is_rotating_family(type_name):
+                    if not (
+                        isinstance(snap_state, (list, tuple))
+                        and len(snap_state) >= 2
+                    ):
+                        return True
+                    new_data.append(
+                        (
+                            self._clone_tensor(snap_state[0]),
+                            self._clone_tensor(snap_state[1]),
+                        )
+                    )
+                elif type_name == "CacheList":
+                    names = snap_layer.get("sub_class_names") or []
+                    if not names:
+                        snap_meta = snap_layer.get("meta_state")
+                        if (
+                            isinstance(snap_meta, (list, tuple))
+                            and len(snap_meta) >= 2
+                            and isinstance(snap_meta[0], (list, tuple))
+                        ):
+                            names = [str(n) for n in snap_meta[0]]
+                    subs = self._cachelist_snapshot_sub_tensors(
+                        snap_layer, snap_state, names
+                    )
+                    if subs is None:
+                        return True
+                    new_data.append(("__cache_list__", subs))
+                else:
+                    # Other non-sliceable layouts (ArraysCache family) keep
+                    # today's behavior; never persist a partially-filled
+                    # block.
+                    return True
+                replaced_indices.append(i)
+
+            if not replaced_indices:
+                return True
+
+            new_meta = list(meta.get("layer_meta_states") or [])
+            while len(new_meta) < len(data):
+                new_meta.append(())
+            for i in replaced_indices:
+                snap_meta_state = snapshot_cache_data[i].get("meta_state")
+                if snap_meta_state:
+                    new_meta[i] = snap_meta_state
+
+            self.paged_ssd_cache.forget_block(block_hash)
+            saved = self.paged_ssd_cache.save_block(
+                block_hash=block_hash,
+                cache_data=new_data,
+                token_count=int(meta.get("token_count") or self.block_size),
+                model_name=meta.get("model_name", self.paged_cache.model_name),
+                layer_cache_types=types or None,
+                layer_meta_states=new_meta,
+                hot_cache_write_back=hot_cache_write_back,
+            )
+            if not saved:
+                return False
+            logger.info(
+                "Backfilled dedup block %s at boundary %d (%d layer(s))",
+                block_hash.hex()[:16],
+                boundary_tc,
+                len(replaced_indices),
+            )
+            return True
+        except Exception as e:
+            logger.debug(
+                "Dedup block backfill failed for %s: %s", block_hash.hex()[:16], e
+            )
+            return False
+
     def _extract_block_tensor_slice(
         self,
         cache_data: list[dict[str, Any]],
@@ -1850,23 +2119,9 @@ class BlockAwarePrefixCache(CacheManager):
                         for ss in state
                     )
 
-                    def _sub_class_for(sub_idx):
-                        if sub_idx < len(sub_class_names):
-                            return sub_class_names[sub_idx]
-                        return None
-
                     def _wrap_sub_marker(sub_idx, elements, storage_class_name=None):
-                        # Length-2 element lists round-trip as legacy
-                        # ``(keys, values)`` so existing callers (prefix
-                        # cache reconstruct, tests) keep their shape. Real
-                        # N-tuple sub-states (PoolingCache, BatchKVCache)
-                        # surface as ``__nstate__`` markers.
-                        if len(elements) == 2:
-                            return (elements[0], elements[1])
-                        return (
-                            "__nstate__",
-                            storage_class_name or _sub_class_for(sub_idx),
-                            list(elements),
+                        return _wrap_cachelist_sub_marker(
+                            sub_idx, elements, sub_class_names, storage_class_name
                         )
 
                     def _slice_sub_elements(sub_state):
@@ -1995,46 +2250,10 @@ class BlockAwarePrefixCache(CacheManager):
                             else:
                                 source_layer = layer_state
                                 source_state = state
-                            pooling_delta_ranges = source_layer.get(
-                                "pooling_delta_ranges", {}
+                            sub_tensors = self._cachelist_snapshot_sub_tensors(
+                                source_layer, source_state, sub_class_names
                             )
-                            if isinstance(source_state, list):
-                                sub_tensors = []
-                                for sub_idx, sub_state in enumerate(source_state):
-                                    if (
-                                        isinstance(sub_state, (list, tuple))
-                                        and len(sub_state) >= 1
-                                    ):
-                                        cloned = [
-                                            (
-                                                self._clone_tensor(elem)
-                                                if hasattr(elem, "shape")
-                                                else elem
-                                            )
-                                            for elem in sub_state
-                                        ]
-                                        delta_range = pooling_delta_ranges.get(
-                                            str(sub_idx)
-                                        )
-                                        if (
-                                            _sub_class_for(sub_idx) == "PoolingCache"
-                                            and isinstance(delta_range, (list, tuple))
-                                            and len(delta_range) == 2
-                                        ):
-                                            cloned.append(
-                                                mx.array(delta_range, dtype=mx.int64)
-                                            )
-                                            sub_tensors.append(
-                                                _wrap_sub_marker(
-                                                    sub_idx,
-                                                    cloned,
-                                                    POOLING_CACHE_DELTA_CLASS,
-                                                )
-                                            )
-                                        else:
-                                            sub_tensors.append(
-                                                _wrap_sub_marker(sub_idx, cloned)
-                                            )
+                            if sub_tensors is not None:
                                 block_slices.append(("__cache_list__", sub_tensors))
                             else:
                                 block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
