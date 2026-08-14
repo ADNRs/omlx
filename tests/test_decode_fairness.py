@@ -171,8 +171,18 @@ class TestAdaptiveChunkCap:
     def test_cap_derives_from_measured_prefill_tps(self):
         s = _make_scheduler()
         s.running = {"r1": MagicMock()}
-        s._prefill_tps_best = 1000.0  # 500ms stall target -> 500 tokens
-        assert s._contended_prefill_cap() == 500
+        # 500ms stall target -> 500 tokens, floored to the 64-token grid.
+        s._prefill_tps_best = 1000.0
+        assert s._contended_prefill_cap() == 448
+
+    def test_cap_stays_on_64_grid(self):
+        s = _make_scheduler()
+        s.running = {"r1": MagicMock()}
+        # The DSv4 native indexer requires chunk length % 64 == 0; an
+        # arbitrary tps must never produce an unaligned cap (e.g. 297).
+        for tps in (594.0, 733.0, 999.0, 1601.0, 5000.0):
+            s._prefill_tps_best = tps
+            assert s._contended_prefill_cap() % 64 == 0
 
     def test_cap_floors_for_slow_prefill(self):
         s = _make_scheduler()
@@ -212,10 +222,10 @@ class TestAdaptiveChunkCap:
         s = _make_scheduler()
         s.running = {"r1": MagicMock()}
         s._prefill_tps_best = 1000.0
-        assert s._contended_prefill_cap() == 500
+        assert s._contended_prefill_cap() == 448
         # A contended (slower) measurement must not shrink the cap.
         s._prefill_tps_best = max(s._prefill_tps_best, 400.0)
-        assert s._contended_prefill_cap() == 500
+        assert s._contended_prefill_cap() == 448
 
 
 class TestConditionalChunkClear:

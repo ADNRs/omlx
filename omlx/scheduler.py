@@ -1409,6 +1409,11 @@ _CONTENDED_PREFILL_CHUNK = int(
     os.environ.get("OMLX_CONTENDED_PREFILL_CHUNK", "512")
 )
 _CONTENDED_CHUNK_FLOOR = 256  # below this, per-chunk overheads dominate
+# Contended chunks stay on the 64-token grid: the DSv4 native indexer only
+# engages when the chunk length is a multiple of 64 (deepseek_v4_model.py
+# L % 64 gate), and an arbitrary tps-derived cap (e.g. 297) would silently
+# route every contended chunk onto the ~4x-slower MLX fallback.
+_CONTENDED_CHUNK_GRID = 64
 _DECODE_ACTIVITY_TTL_S = 2.5
 
 
@@ -4623,6 +4628,7 @@ class Scheduler:
         tps = self._prefill_tps_best
         if tps and tps > 0.0:
             cap = int(_DECODE_STALL_TARGET_MS / 1000.0 * tps)
+            cap = (cap // _CONTENDED_CHUNK_GRID) * _CONTENDED_CHUNK_GRID
             return max(
                 _CONTENDED_CHUNK_FLOOR,
                 min(cap, self.config.prefill_step_size),
