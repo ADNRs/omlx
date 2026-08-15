@@ -121,7 +121,6 @@ def test_scheduler_gdn_and_ssd_observability_is_mapped_to_model_row(tmp_path):
                     "state_dequantizations": 48,
                     "encode_failures": 1,
                     "decode_failures": 3,
-        "capability_fallbacks": 5,
                     "capability_fallbacks": 5,
                     "legacy_fp32_fallbacks": 2,
                     "sidecar_count": 84,

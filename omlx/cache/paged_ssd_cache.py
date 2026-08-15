@@ -4855,16 +4855,6 @@ class PagedSSDCacheManager(CacheManager):
                 **self._stats,
             }
 
-    @property
-    def gdn_sidecar_count(self) -> int:
-        """Number of durable recurrent checkpoint files in the SSD tier."""
-        return self._gdn_sidecar_index.count
-
-    @property
-    def gdn_sidecar_size_bytes(self) -> int:
-        """Tracked durable recurrent checkpoint bytes."""
-        return self._gdn_sidecar_index.total_size
-
     def close(self) -> None:
         """Close the SSD cache manager, flushing hot cache and pending writes."""
         logger.info("Shutting down PagedSSDCacheManager...")
