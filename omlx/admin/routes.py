@@ -4793,6 +4793,7 @@ def _build_runtime_cache_observability(
             "hot_cache_hits",
             "hot_cache_evictions",
             "hot_cache_promotions",
+            "hot_cache_promotion_failures",
         )
 
         model_payload = {
