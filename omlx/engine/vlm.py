@@ -3133,6 +3133,7 @@ class VLMBatchedEngine(BaseEngine):
         # SpecPrefill: forward per-request overrides to the engine, mirroring
         # stream_generate so the non-streaming path is not silently ignored.
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
+        tools = kwargs.pop("tools", None)
 
         output = await self._engine.generate(
             prompt=prompt,
@@ -3142,12 +3143,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_image_hash=vlm_image_hash,
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
-            # Thread tools through to the Request. Without them the protocol
-            # parser session (e.g. Muse Glimmer's ATEM adapter) is created
-            # schema-less, and JSON text written into string-typed parameters
-            # gets decoded into objects (observed: Write's `content` arrived
-            # as an object and failed input validation downstream).
-            tools=kwargs.get("tools"),
+            tools=tools,
             **specprefill_kwargs,
         )
 
@@ -3248,6 +3244,7 @@ class VLMBatchedEngine(BaseEngine):
 
         # SpecPrefill: pass per-request overrides
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
+        tools = kwargs.pop("tools", None)
 
         engine = self._engine
         request_id = await engine.add_request(
@@ -3259,8 +3256,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
-            # Thread tools through to the Request (see the comment in generate())
-            tools=kwargs.get("tools"),
+            tools=tools,
             **specprefill_kwargs,
         )
 
@@ -3368,8 +3364,6 @@ class VLMBatchedEngine(BaseEngine):
             vlm_image_hash=image_hash,
             vlm_cache_key_start=image_cache_key_start,
             vlm_cache_key_ranges=image_cache_key_ranges,
-            # Pass tools not only into the prompt template but also to the
-            # Request, so the protocol parser session gets the schemas
             tools=tools,
             **kwargs,
         )
@@ -3590,8 +3584,6 @@ class VLMBatchedEngine(BaseEngine):
             vlm_image_hash=image_hash,
             vlm_cache_key_start=image_cache_key_start,
             vlm_cache_key_ranges=image_cache_key_ranges,
-            # Pass tools not only into the prompt template but also to the
-            # Request, so the protocol parser session gets the schemas
             tools=tools,
             **kwargs,
         ):
