@@ -11,12 +11,16 @@ from omlx.utils.install import get_cli_command_prefix
 
 CLAUDE_CODE_MIN_CONTEXT_WINDOW = 48 * 1024
 
-# Third-party opt-outs that, like CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, also
-# gate the feature-flag evaluation cross-session messaging depends on. Checked
-# rather than overridden: if the user already set one of these themselves, we
-# respect that choice instead of silently re-enabling Anthropic-bound traffic.
-_CROSS_SESSION_BLOCKING_VARS = (
+# Claude Code treats these flags as enabled whenever their value is non-empty,
+# including values such as "0" and "false".
+_CROSS_SESSION_NONEMPTY_BLOCKING_VARS = (
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
     "DISABLE_TELEMETRY",
+)
+
+# These flags use normal boolean semantics, so explicit false values do not
+# disable feature-flag fetching.
+_CROSS_SESSION_BOOLEAN_BLOCKING_VARS = (
     "DO_NOT_TRACK",
     "DISABLE_GROWTHBOOK",
 )
@@ -24,6 +28,20 @@ _CROSS_SESSION_BLOCKING_VARS = (
 
 def _env_flag_set(env: dict[str, str], name: str) -> bool:
     return env.get(name, "").strip().lower() not in ("", "0", "false", "no")
+
+
+def _cross_session_blockers(env: dict[str, str]) -> list[str]:
+    blocking = [
+        name
+        for name in _CROSS_SESSION_NONEMPTY_BLOCKING_VARS
+        if env.get(name, "") != ""
+    ]
+    blocking.extend(
+        name
+        for name in _CROSS_SESSION_BOOLEAN_BLOCKING_VARS
+        if _env_flag_set(env, name)
+    )
+    return blocking
 
 
 def claude_code_model_disabled_reason(model_info: dict) -> str | None:
@@ -95,9 +113,7 @@ class ClaudeCodeIntegration(Integration):
             env["DISABLE_FEEDBACK_COMMAND"] = "1"
             env["CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"] = "1"
 
-            blocking = [
-                var for var in _CROSS_SESSION_BLOCKING_VARS if _env_flag_set(env, var)
-            ]
+            blocking = _cross_session_blockers(env)
             if blocking:
                 print(
                     f"Warning: {', '.join(blocking)} is set in your environment; "

@@ -1640,7 +1640,22 @@ class TestClaudeCodeIntegration:
         assert env["DISABLE_FEEDBACK_COMMAND"] == "1"
         assert env["CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"] == "1"
 
-    def test_launch_cross_session_warns_when_user_env_blocks_messaging(self, capsys):
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        (
+            ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+            ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "0"),
+            ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "false"),
+            ("DISABLE_TELEMETRY", "1"),
+            ("DISABLE_TELEMETRY", "0"),
+            ("DISABLE_TELEMETRY", "false"),
+            ("DO_NOT_TRACK", "1"),
+            ("DISABLE_GROWTHBOOK", "true"),
+        ),
+    )
+    def test_launch_cross_session_warns_when_user_env_blocks_messaging(
+        self, capsys, name, value
+    ):
         cc = ClaudeCodeIntegration()
         captured = {}
 
@@ -1650,7 +1665,7 @@ class TestClaudeCodeIntegration:
         with (
             patch(
                 "omlx.integrations.claude.os.environ",
-                {"PATH": "/usr/bin", "DO_NOT_TRACK": "1"},
+                {"PATH": "/usr/bin", name: value},
             ),
             patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
             patch.object(
@@ -1662,10 +1677,48 @@ class TestClaudeCodeIntegration:
             )
 
         # The user's own opt-out is preserved, not silently overridden.
-        assert captured["env"]["DO_NOT_TRACK"] == "1"
+        assert captured["env"][name] == value
         output = capsys.readouterr().out
-        assert "DO_NOT_TRACK" in output
+        assert name in output
         assert "cross-session messaging will remain unavailable" in output
+
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        (
+            ("DO_NOT_TRACK", "0"),
+            ("DO_NOT_TRACK", "false"),
+            ("DISABLE_GROWTHBOOK", "0"),
+            ("DISABLE_GROWTHBOOK", "false"),
+        ),
+    )
+    def test_launch_cross_session_accepts_false_boolean_opt_outs(
+        self, capsys, name, value
+    ):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch(
+                "omlx.integrations.claude.os.environ",
+                {"PATH": "/usr/bin", name: value},
+            ),
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(
+                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
+            ),
+        ):
+            cc.launch(
+                ctx(port=8000, api_key="key", model="qwen3.5", cross_session=True)
+            )
+
+        assert captured["env"][name] == value
+        assert (
+            "cross-session messaging will remain unavailable"
+            not in capsys.readouterr().out
+        )
 
     def test_launch_sets_distinct_claude_tier_models(self):
         cc = ClaudeCodeIntegration()
