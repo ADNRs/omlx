@@ -198,6 +198,70 @@ def test_qwen35_q8_route_uses_bit_specific_min_tokens():
     )
 
 
+@pytest.mark.parametrize(
+    (
+        "group_size",
+        "nax_available",
+        "nax_qmm_kernels_built",
+        "allow_gs128",
+        "expected",
+    ),
+    [
+        (64, True, True, False, True),
+        (128, False, False, False, True),
+        (128, False, True, False, True),
+        (128, True, False, False, False),
+        (128, True, True, False, False),
+        (128, True, False, True, True),
+        (128, True, True, True, True),
+    ],
+)
+def test_qwen35_qmm_routing_uses_stock_nax_availability(
+    monkeypatch,
+    group_size,
+    nax_available,
+    nax_qmm_kernels_built,
+    allow_gs128,
+    expected,
+):
+    import omlx.patches.qwen35_q4_mlp as q4patch
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    linear = nn.QuantizedLinear(
+        256,
+        128,
+        bias=False,
+        group_size=group_size,
+        bits=4,
+    )
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    linear.biases = linear.biases.astype(mx.bfloat16)
+
+    monkeypatch.setattr(q4patch, "_qmm_supports_group_size", lambda _gs: True)
+    monkeypatch.setattr(q4patch, "_native_qmm_for_bits", lambda _bits: object())
+    monkeypatch.setattr(q4patch, "is_nax_available", lambda: nax_available)
+    monkeypatch.setattr(
+        fast,
+        "nax_qmm_kernels_built",
+        lambda: nax_qmm_kernels_built,
+    )
+    if allow_gs128:
+        monkeypatch.setenv("OMLX_QWEN35_Q4_MLP_ALLOW_GS128", "1")
+    else:
+        monkeypatch.delenv("OMLX_QWEN35_Q4_MLP_ALLOW_GS128", raising=False)
+
+    assert (
+        q4patch._is_supported_affine_linear_shape(
+            linear,
+            mx.bfloat16,
+            ndim=3,
+            seq_len=2048,
+            input_dim=256,
+        )
+        is expected
+    )
+
+
 def test_qwen35_q4_mlp_patch_prechecks_down_proj_before_gate_up(monkeypatch):
     fast = _require_q4_kernel()
     import mlx_lm.models.qwen3_5 as qwen35

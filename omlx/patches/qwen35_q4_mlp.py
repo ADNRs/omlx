@@ -19,6 +19,8 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.activations import swiglu
 
+from omlx.custom_kernels.nax import is_nax_available
+
 logger = logging.getLogger(__name__)
 
 _PATCHED = False
@@ -51,28 +53,6 @@ def _has_native_qmm() -> bool:
     return _native_qmm_for_bits(4) is not None
 
 
-def _nax_qmm_is_group_size_64_only() -> bool:
-    """True when the NAX (tensor-unit) qmm path is present but gated to gs=64.
-
-    The native kernel only beats ``nn.QuantizedLinear`` when it can use NAX,
-    and the extension gates that on ``group_size == 64``::
-
-        // csrc/qwen35_prefill.cpp
-        bool nax = use_nax && group_size == 64 && is_nax_available() && ...
-
-    So on NAX hardware a group_size=128 call silently demotes to the plain
-    Metal path, which is slower than the MLX default it replaced.
-    """
-    try:
-        from omlx.custom_kernels.qwen35_prefill import fast
-    except Exception:
-        return False
-    try:
-        return bool(fast.is_nax_available()) and bool(fast.nax_qmm_kernels_built())
-    except Exception:
-        return False
-
-
 def _is_supported_affine_linear_shape(
     linear: Any,
     dtype: mx.Dtype,
@@ -92,14 +72,11 @@ def _is_supported_affine_linear_shape(
     if not _qmm_supports_group_size(int(group_size)):
         return False
     if (
-        int(group_size) == 128
-        and os.environ.get("OMLX_QWEN35_Q4_MLP_ALLOW_GS128", "0") != "1"
-        and _nax_qmm_is_group_size_64_only()
+        group_size == 128
+        and os.environ.get("OMLX_QWEN35_Q4_MLP_ALLOW_GS128") != "1"
+        and is_nax_available()
     ):
-        # Measured on M5 Max / oMLX 0.6.0.dev1: routing group_size=128 through
-        # the native kernel costs ~4x versus nn.QuantizedLinear, because NAX is
-        # unavailable at that group size. Set OMLX_QWEN35_Q4_MLP_ALLOW_GS128=1
-        # to route anyway.
+        # The custom gs128 tile cannot use NAX; stock MLX can on M5 hardware.
         return False
     bits = getattr(linear, "bits", None)
     if bits not in _SUPPORTED_QMM_BITS or getattr(linear, "mode", None) != "affine":
@@ -113,11 +90,7 @@ def _is_supported_affine_linear_shape(
     biases = getattr(linear, "biases", None)
     if weight is None or scales is None or biases is None:
         return False
-    if (
-        weight.dtype != mx.uint32
-        or scales.dtype != dtype
-        or biases.dtype != dtype
-    ):
+    if weight.dtype != mx.uint32 or scales.dtype != dtype or biases.dtype != dtype:
         return False
     if weight.ndim != 2 or scales.ndim != 2 or biases.ndim != 2:
         return False
@@ -127,7 +100,10 @@ def _is_supported_affine_linear_shape(
         return False
     if scales.shape != biases.shape:
         return False
-    return scales.shape[0] == weight.shape[0] and scales.shape[1] == input_dim // group_size
+    return (
+        scales.shape[0] == weight.shape[0]
+        and scales.shape[1] == input_dim // group_size
+    )
 
 
 def _is_supported_affine_linear(linear: Any, x: mx.array) -> bool:
