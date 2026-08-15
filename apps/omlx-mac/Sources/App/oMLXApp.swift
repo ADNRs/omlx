@@ -8,8 +8,8 @@
 //     status-item's "Admin Panel" command (or the Welcome wizard on first
 //     run, which lives in its own manual NSWindow controller).
 //   • `.handlesExternalEvents(matching: ["main"])` lets AppDelegate trigger
-//     the window the FIRST time via `NSWorkspace.shared.open(omlxapp://main)`
-//     when no NSWindow instance has been created yet. Subsequent shows
+//     the window the FIRST time by sending `omlxapp://main` to this exact app
+//     bundle when no NSWindow instance has been created yet. Subsequent shows
 //     just `makeKeyAndOrderFront` the cached window.
 //   • Dock-icon toggle (regular when visible, accessory when closed) is
 //     handled by AppDelegate via NSWindow notification observers — not in
