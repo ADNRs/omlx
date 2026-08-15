@@ -15,9 +15,27 @@
 //     handled by AppDelegate via NSWindow notification observers — not in
 //     this file — so the welcome flow shares the same dock-icon logic.
 
+import Darwin
 import SwiftUI
 
 @main
+enum OMLXEntryPoint {
+    static func main() {
+        do {
+            if let request = try UpdateInstaller.workerRequest(
+                from: CommandLine.arguments
+            ) {
+                exit(UpdateInstaller.runWorker(request))
+            }
+        } catch {
+            NSLog("oMLX: invalid updater worker invocation: %@", error.localizedDescription)
+            exit(EXIT_FAILURE)
+        }
+
+        OMLXApp.main()
+    }
+}
+
 struct OMLXApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
