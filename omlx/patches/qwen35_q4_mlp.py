@@ -633,7 +633,7 @@ def _make_patched_muse_attention(
         # Mirrors the vendored muse_glimmer Attention.__call__ body with the
         # projections routed through the native qmm tile. The vendor file
         # lives in this repo (patches/mlx_vlm_muse_glimmer_compat), so body
-        # drift is caught by the bit-exact parity test, not a pin bump.
+        # drift is caught by wrapper parity and native BF16 tolerance tests.
         from mlx_vlm.models.muse_glimmer import language as muse_language
 
         batch, length, _ = x.shape
@@ -647,7 +647,11 @@ def _make_patched_muse_attention(
             batch, length, self.n_kv_heads, self.head_dim
         )
 
-        queries = (self.qk_norm(queries) * self.qk_scale_factor).transpose(0, 2, 1, 3)
+        queries = self.qk_norm(queries)
+        queries = (queries.astype(mx.float32) * self.qk_scale_factor).astype(
+            queries.dtype
+        )
+        queries = queries.transpose(0, 2, 1, 3)
         keys = self.qk_norm(keys).transpose(0, 2, 1, 3)
         values = values.transpose(0, 2, 1, 3)
 
@@ -679,9 +683,10 @@ def apply_muse_glimmer_q4_prefill_patch() -> bool:
 
     Muse prefill is ~87% quantized-GEMM-bound (MLP 6656->19968->6656 plus
     the q/gate/o attention projections); the native tile measured 6.4-6.9%
-    faster than mx.quantized_matmul at every muse shape, bit-exact. Covers
-    the MLP via the shared class patch and the attention projections via a
-    mirrored forward. Decode and short sequences fall through unchanged.
+    faster than mx.quantized_matmul at every muse shape, with only BF16
+    reduction-order drift. Covers the MLP via the shared class patch and the
+    attention projections via a mirrored forward. Decode and short sequences
+    fall through unchanged.
     """
     global _MUSE_PATCHED
     if _MUSE_PATCHED:
