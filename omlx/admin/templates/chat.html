@@ -2539,7 +2539,7 @@
             sidebarOpen: window.innerWidth >= 768,
             showLeftToggle: window.innerWidth < 768,
             showChatSettingsModal: false,
-            enhancedReadability: localStorage.getItem('omlx-enhanced-readability') === 'on',
+            enhancedReadability: localStorage.getItem(ENHANCED_READABILITY_KEY) === 'on',
             theme: localStorage.getItem(THEME_STORAGE_KEY) || 'auto',
             allowSvg: localStorage.getItem(ALLOW_SVG_STORAGE_KEY) === 'true',
             chatSettings: (() => {

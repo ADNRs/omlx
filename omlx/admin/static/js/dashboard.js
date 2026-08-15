@@ -71,6 +71,8 @@
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models']);
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
     const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy', 'context']);
+    const THEME_STORAGE_KEY = 'omlx-chat-theme';
+    const ENHANCED_READABILITY_KEY = 'omlx-enhanced-readability';
 
     // Default sort for the settings and manager model tables. Also the target
     // state for the "reset sort" action.
@@ -80,9 +82,10 @@
     function dashboard() {
         return {
             // Theme
-            theme: localStorage.getItem('omlx-chat-theme') || 'auto',
+            theme: localStorage.getItem(THEME_STORAGE_KEY) || 'auto',
             activeTheme: 'light', // Will be updated by applyTheme
             systemThemeListener: null,
+            enhancedReadability: localStorage.getItem(ENHANCED_READABILITY_KEY) === 'on',
 
             // Mobile menu
             mobileMenuOpen: false,
@@ -10145,8 +10148,18 @@
             // Theme select
             setTheme(theme) {
                 this.theme = theme;
-                localStorage.setItem('omlx-chat-theme', this.theme);
+                localStorage.setItem(THEME_STORAGE_KEY, this.theme);
                 this.applyTheme();
+            },
+
+            setEnhancedReadability(enabled) {
+                this.enhancedReadability = enabled;
+                localStorage.setItem(ENHANCED_READABILITY_KEY, enabled ? 'on' : 'off');
+                if (enabled) {
+                    document.documentElement.setAttribute('data-enhanced-readability', '');
+                } else {
+                    document.documentElement.removeAttribute('data-enhanced-readability');
+                }
             },
 
             applyTheme() {
