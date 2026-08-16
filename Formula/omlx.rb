@@ -15,7 +15,7 @@ class Omlx < Formula
 
   depends_on "rust" => :build
   depends_on arch: :arm64
-  depends_on :macos
+  depends_on macos: :sequoia
   depends_on "python@3.11"
 
   # macOS 27 beta's `strip` corrupts dynamic offsets in Mach-O libraries
