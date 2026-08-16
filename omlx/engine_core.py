@@ -713,7 +713,7 @@ class EngineCore:
             )
         request_ids = [
             rid
-            for rid in self._output_collectors.keys()
+            for rid in self._output_collectors
             if rid not in self._finished_at and rid not in pending_aborts
         ]
         ceiling = 0

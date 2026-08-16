@@ -1207,6 +1207,34 @@ class TestEngineCoreAbortAllRequests:
                 engine.close()
 
     @pytest.mark.asyncio
+    async def test_abort_all_requests_skips_requests_already_aborted(
+        self, mock_model, mock_tokenizer
+    ):
+        """Repeated bulk aborts do not report progress or duplicate errors."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            try:
+                await engine.start()
+                engine.scheduler.has_requests = lambda: False
+                request_id = await engine.add_request(prompt="Hello")
+
+                first_count = await engine.abort_all_requests()
+                second_count = await engine.abort_all_requests()
+
+                assert (first_count, second_count) == (1, 0)
+                collector = engine._output_collectors[request_id]
+                output = collector.get_nowait()
+                assert output is not None
+                assert output.new_text.count("[Error:") == 1
+                assert collector.get_nowait() is None
+            finally:
+                await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
     async def test_abort_all_requests_names_tripped_watermark(
         self, mock_model, mock_tokenizer
     ):
