@@ -3404,13 +3404,26 @@
                 if (this.clusterPeerProbeLoading
                     || this.clusterFabricLoading
                     || this.clusterLinkStatusLoading
-                    || !this.clusterPeerProbe?.runtime_compatible) {
+                    || !this.clusterPeerProbe) {
                     return {
                         key: 'checking',
                         label: 'Checking the connection…',
                         detail: 'oMLX is confirming every worker and the fastest shared links.',
                         tone: 'blue',
                         busy: true,
+                    };
+                }
+                if (this.clusterPeerProbe.runtime_compatible !== true) {
+                    const mismatches = Array.isArray(
+                        this.clusterPeerProbe.runtime_mismatches
+                    ) ? this.clusterPeerProbe.runtime_mismatches.filter(Boolean) : [];
+                    return {
+                        key: 'runtime-mismatch',
+                        label: 'Worker runtime mismatch',
+                        detail: mismatches.join(' · ')
+                            || 'The worker runtime differs from this Mac.',
+                        tone: 'red',
+                        busy: false,
                     };
                 }
                 if (this.clusterCatalogueLoading && !selected) {

@@ -131,6 +131,45 @@ def test_probe_still_reports_package_mismatches_alongside_the_interpreter(monkey
     ]
 
 
+def test_probe_ignores_stale_local_omlx_metadata(monkeypatch):
+    real_version = launch.importlib.metadata.version
+
+    def stale_metadata(name):
+        if name == "omlx":
+            return "0.0.0-stale"
+        return real_version(name)
+
+    monkeypatch.setattr(launch.importlib.metadata, "version", stale_metadata)
+    payload = _status(platform.python_version())
+
+    from omlx._version import __version__
+
+    payload["runtime"]["omlx_version"] = __version__
+
+    def runner(argv, **_kwargs):
+        return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+
+    result = probe_remote_host("studio", python_executable=PEER_PYTHON, runner=runner)
+
+    assert result["runtime_compatible"] is True
+    assert result["runtime_mismatches"] == []
+
+
+def test_probe_still_rejects_a_genuine_omlx_source_version_difference():
+    payload = _status(platform.python_version())
+    payload["runtime"]["omlx_version"] = "0.0.0-other"
+
+    def runner(argv, **_kwargs):
+        return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+
+    result = probe_remote_host("studio", python_executable=PEER_PYTHON, runner=runner)
+
+    assert result["runtime_compatible"] is False
+    assert result["runtime_mismatches"] == [
+        f"omlx local={_local_runtime_versions()['omlx']} remote=0.0.0-other"
+    ]
+
+
 # --- preflight_remote_hosts -------------------------------------------------
 
 
@@ -223,6 +262,12 @@ def test_preflight_asks_the_rank_for_its_interpreter_version():
     assert "platform" in launch._PREFLIGHT_SCRIPT
     assert "python_version()" in launch._PREFLIGHT_SCRIPT
     assert "v['python']" in launch._PREFLIGHT_SCRIPT
+
+
+def test_preflight_reads_omlx_source_version_before_installed_metadata():
+    script = launch._PREFLIGHT_SCRIPT
+
+    assert script.index("if name == 'omlx':") < script.index("return m.version(name)")
 
 
 # --- the parity rule itself -------------------------------------------------

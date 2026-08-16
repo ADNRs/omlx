@@ -408,19 +408,22 @@ def test_remote_preflight_uses_prompt_free_noninteractive_ssh():
     assert kwargs["check"] is False
 
 
-def test_local_runtime_version_falls_back_to_source_package(monkeypatch):
+def test_local_runtime_version_ignores_stale_installed_metadata(monkeypatch):
     real_version = launch.importlib.metadata.version
+    metadata_lookups = []
 
-    def source_only(name):
+    def stale_metadata(name):
+        metadata_lookups.append(name)
         if name == "omlx":
-            raise launch.importlib.metadata.PackageNotFoundError(name)
+            return "0.0.0-stale"
         return real_version(name)
 
-    monkeypatch.setattr(launch.importlib.metadata, "version", source_only)
+    monkeypatch.setattr(launch.importlib.metadata, "version", stale_metadata)
 
     from omlx._version import __version__
 
     assert launch._local_runtime_versions()["omlx"] == __version__
+    assert "omlx" not in metadata_lookups
 
 
 def test_remote_memory_probe_is_fast_and_uses_prompt_free_ssh():

@@ -227,6 +227,72 @@ const component = {{
     return json.loads(result.stdout)
 
 
+def test_cluster_quick_status_distinguishes_runtime_mismatch_from_loading():
+    result = _run_dashboard_helpers(
+        ("clusterQuickStatus",),
+        """
+component.clusterSelectedModel = () => null;
+component.clusterPrimaryDeployment = () => null;
+component.clusterLiveJobs = () => [];
+component.clusterAutoconfigureError = '';
+component.clusterError = '';
+component.clusterDeploymentsError = '';
+component.clusterDeactivatingId = '';
+component.clusterActivationLoading = false;
+component.clusterAutoconfigureLoading = false;
+component.clusterLinkSetupLoading = false;
+component.clusterPeerSsh = 'studio.local';
+component.clusterFabricLoading = false;
+component.clusterLinkStatusLoading = false;
+component.clusterCatalogueLoading = false;
+const states = {};
+
+component.clusterPeerProbeLoading = false;
+component.clusterPeerProbe = null;
+states.firstProbe = component.clusterQuickStatus();
+
+component.clusterPeerProbeLoading = true;
+component.clusterPeerProbe = { runtime_compatible: true };
+states.reprobe = component.clusterQuickStatus();
+
+component.clusterPeerProbeLoading = false;
+component.clusterPeerProbe = {
+  runtime_compatible: false,
+  runtime_mismatches: [
+    'omlx local=0.6.0 remote=0.5.4',
+    'mlx local=0.32.0 remote=0.31.0',
+  ],
+};
+states.mismatch = component.clusterQuickStatus();
+
+component.clusterPeerProbe = {
+  runtime_compatible: true,
+  runtime_warnings: ['python minor differs: local=3.11 remote=3.12'],
+};
+states.warning = component.clusterQuickStatus();
+
+process.stdout.write(JSON.stringify(states));
+""",
+    )
+
+    assert result["firstProbe"]["key"] == "checking"
+    assert result["firstProbe"]["busy"] is True
+    assert result["reprobe"]["key"] == "checking"
+    assert result["reprobe"]["busy"] is True
+    assert result["mismatch"] == {
+        "key": "runtime-mismatch",
+        "label": "Worker runtime mismatch",
+        "detail": (
+            "omlx local=0.6.0 remote=0.5.4 · "
+            "mlx local=0.32.0 remote=0.31.0"
+        ),
+        "tone": "red",
+        "busy": False,
+    }
+    assert result["warning"]["key"] == "model"
+    assert result["warning"]["tone"] == "amber"
+
+
 def test_manual_memory_allowance_survives_automatic_budget_refresh():
     result = _run_dashboard_helpers(
         (

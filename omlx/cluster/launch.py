@@ -167,13 +167,13 @@ def _available_launch_ports(
 
 
 def _package_version(name: str) -> str:
+    if name == "omlx":
+        from omlx._version import __version__
+
+        return __version__
     try:
         return importlib.metadata.version(name)
     except importlib.metadata.PackageNotFoundError:
-        if name == "omlx":
-            from omlx._version import __version__
-
-            return __version__
         return "unknown"
 
 
@@ -1345,12 +1345,12 @@ _PREFLIGHT_SCRIPT = (
     "import mlx_lm.server\n"
     "import omlx.adapter.output_parser\n"
     "def package_version(name):\n"
+    "    if name == 'omlx':\n"
+    "        from omlx._version import __version__\n"
+    "        return __version__\n"
     "    try:\n"
     "        return m.version(name)\n"
     "    except m.PackageNotFoundError:\n"
-    "        if name == 'omlx':\n"
-    "            from omlx._version import __version__\n"
-    "            return __version__\n"
     "        return 'unknown'\n"
     "x=pathlib.Path(sys.argv[1]).expanduser()\n"
     "v={n:package_version(n) for n in ('omlx','mlx','mlx-lm')}\n"
