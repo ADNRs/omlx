@@ -201,13 +201,11 @@ def _interpreter_parity(
 
     Returns ``(blocking, warning)``, at most one of which is set.
 
-    ``mlx`` and ``mlx-lm`` wheels are ABI-tagged per Python minor version, so a
-    major.minor split is a real incompatibility and fails the gate — the
-    packaged app bundles CPython 3.11 while a source or uv install commonly
-    runs 3.12, and that pair used to read as "runtime match".  A patch-level
-    difference is not an ABI boundary, so it launches; it is still reported,
-    because an operator chasing odd behaviour should not have to discover the
-    interpreters differ by hand.
+    Python ABI tags govern which wheel each rank can load locally; Python
+    objects do not cross the MLX transport boundary.  A minor-version split is
+    therefore reported but does not block ranks whose package and protocol
+    versions otherwise match.  Missing, malformed, or different-major reports
+    remain blocking because they do not establish a compatible runtime.
     """
 
     remote_text = remote.strip() if isinstance(remote, str) else ""
@@ -215,8 +213,12 @@ def _interpreter_parity(
         return (f"python local={local} remote=missing", None)
     local_minor = _python_minor(local)
     remote_minor = _python_minor(remote_text)
-    if remote_minor is None or local_minor != remote_minor:
+    if remote_minor is None or local_minor is None:
         return (f"python local={local} remote={remote_text}", None)
+    if local_minor[0] != remote_minor[0]:
+        return (f"python local={local} remote={remote_text}", None)
+    if local_minor != remote_minor:
+        return (None, f"python minor differs: local={local} remote={remote_text}")
     if local != remote_text:
         return (None, f"python patch differs: local={local} remote={remote_text}")
     return (None, None)
@@ -1353,8 +1355,9 @@ _PREFLIGHT_SCRIPT = (
     "x=pathlib.Path(sys.argv[1]).expanduser()\n"
     "v={n:package_version(n) for n in ('omlx','mlx','mlx-lm')}\n"
     "v['cluster-protocol']=p\n"
-    # The interpreter this rank will actually run under. mlx wheels are
-    # ABI-tagged per minor version, so this is part of the runtime gate (#2695).
+    # Report the interpreter this rank will actually run under. Package and
+    # protocol parity decide compatibility; Python minor differences are
+    # surfaced as diagnostics because each rank loads its own matching wheel.
     "v['python']=platform.python_version()\n"
     "v['admission-ceiling-bytes']=int("
     "ceiling_breakdown(sys.argv[4]).get('hard_limit',0))\n"

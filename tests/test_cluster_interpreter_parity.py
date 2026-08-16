@@ -1,16 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Ranks must run the same Python interpreter, not just the same packages (#2695).
+"""Report interpreter differences alongside package parity checks (#2695).
 
 The runtime gate compared omlx/mlx/mlx-lm and the cluster protocol, but never
 the interpreter underneath them.  ``runtime.python_version`` was collected and
-carried all the way into the status payload, and nothing read it.  The packaged
-app bundles CPython 3.11 while a source or uv install commonly runs 3.12, and
-mlx wheels are ABI-tagged per minor version — so that pair was being declared a
-"runtime match".
+carried all the way into the status payload, and nothing read it.
 
-Policy: a major.minor split is a hard mismatch; a patch-only split launches but
-is reported, so an operator debugging odd behaviour can see the interpreters
-are not identical.
+Policy: missing, malformed, or different-major reports are hard mismatches.
+Minor and patch differences launch but remain visible to an operator debugging
+unexpected behaviour.
 """
 
 import json
@@ -19,6 +16,7 @@ import platform
 import subprocess
 
 import pytest
+from test_cluster_launch import _deployment
 
 from omlx.cluster import launch
 from omlx.cluster.launch import (
@@ -28,8 +26,6 @@ from omlx.cluster.launch import (
     probe_remote_host,
 )
 from omlx.cluster.models import CLUSTER_PROTOCOL_VERSION
-
-from test_cluster_launch import _deployment
 
 PEER_PYTHON = "/opt/omlx/bin/python"
 
@@ -64,17 +60,20 @@ def _probe(python_version: str | None) -> dict:
 # --- probe_remote_host ------------------------------------------------------
 
 
-def test_probe_refuses_a_peer_on_a_different_python_minor(monkeypatch):
-    """The packaged app is 3.11; a source venv is 3.12. Never a runtime match."""
-
+def test_probe_accepts_a_different_python_minor_but_reports_it(monkeypatch):
     monkeypatch.setattr(platform, "python_version", lambda: "3.11.9")
 
     result = _probe("3.12.13")
 
-    assert result["runtime_compatible"] is False
-    assert result["ok"] is False
-    assert result["runtime_mismatches"] == ["python local=3.11.9 remote=3.12.13"]
-    assert result.get("runtime_warnings", []) == []
+    assert result["runtime_compatible"] is True
+    assert result["ok"] is True
+    assert result["runtime_mismatches"] == []
+    assert result["runtime_warnings"] == [
+        "python minor differs: local=3.11.9 remote=3.12.13"
+    ]
+    assert result["status"]["warnings"] == [
+        "python minor differs: local=3.11.9 remote=3.12.13"
+    ]
 
 
 def test_probe_accepts_a_patch_difference_but_still_reports_it(monkeypatch):
@@ -127,7 +126,9 @@ def test_probe_still_reports_package_mismatches_alongside_the_interpreter(monkey
 
     assert result["runtime_compatible"] is False
     assert any(entry.startswith("mlx local=") for entry in result["runtime_mismatches"])
-    assert "python local=3.11.9 remote=3.12.13" in result["runtime_mismatches"]
+    assert result["runtime_warnings"] == [
+        "python minor differs: local=3.11.9 remote=3.12.13"
+    ]
 
 
 # --- preflight_remote_hosts -------------------------------------------------
@@ -167,20 +168,21 @@ def _preflight_runner(python_version: str | None):
     return runner
 
 
-def test_preflight_refuses_a_rank_on_a_different_python_minor(
+def test_preflight_allows_a_different_python_minor_and_records_it(
     monkeypatch, stub_admission
 ):
     monkeypatch.setattr(platform, "python_version", lambda: "3.11.9")
 
-    with pytest.raises(
-        DistributedLaunchError,
-        match=r"runtime mismatch on studio: python local=3\.11\.9 remote=3\.12\.13",
-    ):
-        preflight_remote_hosts(
-            _deployment(),
-            python_executable=PEER_PYTHON,
-            runner=_preflight_runner("3.12.13"),
-        )
+    results = preflight_remote_hosts(
+        _deployment(),
+        python_executable=PEER_PYTHON,
+        runner=_preflight_runner("3.12.13"),
+    )
+
+    assert results[0]["runtime_warnings"] == []
+    assert results[1]["runtime_warnings"] == [
+        "python minor differs: local=3.11.9 remote=3.12.13"
+    ]
 
 
 def test_preflight_allows_a_patch_difference_and_records_it(
@@ -230,14 +232,33 @@ def test_preflight_asks_the_rank_for_its_interpreter_version():
     ("local", "remote", "blocking", "warning"),
     [
         ("3.12.13", "3.12.13", None, None),
-        ("3.12.13", "3.12.14", None, "python patch differs: local=3.12.13 remote=3.12.14"),
-        ("3.11.9", "3.12.13", "python local=3.11.9 remote=3.12.13", None),
-        ("3.12.13", "3.11.9", "python local=3.12.13 remote=3.11.9", None),
+        (
+            "3.12.13",
+            "3.12.14",
+            None,
+            "python patch differs: local=3.12.13 remote=3.12.14",
+        ),
+        (
+            "3.11.9",
+            "3.12.13",
+            None,
+            "python minor differs: local=3.11.9 remote=3.12.13",
+        ),
+        (
+            "3.12.13",
+            "3.11.9",
+            None,
+            "python minor differs: local=3.12.13 remote=3.11.9",
+        ),
         ("3.12.13", "4.0.0", "python local=3.12.13 remote=4.0.0", None),
         ("3.12.13", "", "python local=3.12.13 remote=missing", None),
         # A free-threaded or otherwise suffixed build is still 3.13.
-        ("3.13.1", "3.13.1+freethreaded", None,
-         "python patch differs: local=3.13.1 remote=3.13.1+freethreaded"),
+        (
+            "3.13.1",
+            "3.13.1+freethreaded",
+            None,
+            "python patch differs: local=3.13.1 remote=3.13.1+freethreaded",
+        ),
         # Not a version at all: refuse rather than guess.
         ("3.12.13", "banana", "python local=3.12.13 remote=banana", None),
     ],
