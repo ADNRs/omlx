@@ -56,6 +56,9 @@
         'reasoning_effort',
         'preserve_thinking',
     ]);
+    const REASONING_EFFORT_PRESETS = new Set([
+        'low', 'medium', 'high', 'xhigh', 'max',
+    ]);
     const VLM_MTP_DRAFTER_CONFIG_MODEL_TYPES = new Set([
         'gemma4_assistant',
         'gemma4_unified_assistant',
@@ -6605,7 +6608,8 @@
                         if (e.force) forced.push('enable_thinking');
                     } else if (e.type === 'reasoning_effort') {
                         if (isDiffusion) continue;
-                        const effort = this.coerceKwargValue(e.value);
+                        const rawEffort = e.custom ? e.customValue : e.value;
+                        const effort = this.coerceKwargValue(rawEffort);
                         if (String(effort).trim() !== '') {
                             ctk.reasoning_effort = effort;
                             if (e.force) forced.push('reasoning_effort');
@@ -6875,13 +6879,14 @@
             },
 
             // Coerce a raw kwarg string from the panel into its JSON type:
-            // 'true'/'false' -> boolean, numeric strings -> number. Free-form
-            // reasoning effort relies on this so numeric models (Inkling
-            // 0.1-0.99) keep numbers instead of degrading to strings.
+            // 'true'/'false' -> boolean, finite numeric strings -> number.
             coerceKwargValue(v) {
                 if (v === 'true') return true;
                 if (v === 'false') return false;
-                if (String(v).trim() !== '' && !isNaN(Number(v))) return Number(v);
+                if (String(v).trim() !== '') {
+                    const numeric = Number(v);
+                    if (Number.isFinite(numeric)) return numeric;
+                }
                 return v;
             },
 
@@ -6899,11 +6904,17 @@
                             value: String(value),
                             force: forced.has('enable_thinking'),
                         });
+                    } else if (key === 'reasoning_effort') {
+                        const isPreset = typeof value === 'string'
+                            && REASONING_EFFORT_PRESETS.has(value);
+                        entries.push({
+                            type: 'reasoning_effort',
+                            value: isPreset ? value : 'low',
+                            custom: !isPreset,
+                            customValue: isPreset ? '' : String(value),
+                            force: forced.has('reasoning_effort'),
+                        });
                     } else {
-                        // reasoning_effort deliberately loads here as a plain
-                        // custom entry: stored values are the source of truth
-                        // and must never be captured/relabeled by the typed
-                        // add-option (which exists only to seed new entries).
                         entries.push({
                             type: 'custom',
                             key,
@@ -7441,7 +7452,10 @@
                                     if (entry.force) forcedCtKwargs.push('enable_thinking');
                                 } else if (entry.type === 'reasoning_effort') {
                                     if (isDiffusion) continue;
-                                    const effort = this.coerceKwargValue(entry.value);
+                                    const rawEffort = entry.custom
+                                        ? entry.customValue
+                                        : entry.value;
+                                    const effort = this.coerceKwargValue(rawEffort);
                                     if (String(effort).trim() !== '') {
                                         chatTemplateKwargs.reasoning_effort = effort;
                                         if (entry.force) forcedCtKwargs.push('reasoning_effort');

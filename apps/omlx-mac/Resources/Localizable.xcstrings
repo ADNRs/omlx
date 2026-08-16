@@ -19583,6 +19583,30 @@
         }
       }
     },
+    "settings.advanced.chat_template.reasoning_effort.custom" : {
+      "comment" : "Checkbox label that enables a custom reasoning_effort value",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Custom"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Пользовательское"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "自定义"
+          }
+        }
+      }
+    },
     "settings.advanced.chat_template.remove" : {
       "comment" : "Tooltip on the trash/xmark button that deletes a chat-template kwarg row",
       "extractionState" : "manual",

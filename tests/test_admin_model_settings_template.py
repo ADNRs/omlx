@@ -10,6 +10,11 @@ def _model_settings_template() -> str:
     ).read_text()
 
 
+def _dashboard_script() -> str:
+    root = Path(__file__).resolve().parents[1]
+    return (root / "omlx/admin/static/js/dashboard.js").read_text()
+
+
 def _section(html: str, start_marker: str, end_marker: str) -> str:
     return html.split(start_marker, 1)[1].split(end_marker, 1)[0]
 
@@ -43,34 +48,31 @@ def test_vlm_mtp_still_conflicts_with_turboquant():
     assert "modelSettings.turboquant_kv_enabled" in vlm_mtp
 
 
-def test_reasoning_effort_is_freeform_input_with_suggestions():
-    """The effort entry must be free-form: models disagree on the vocabulary
-    (Qwen3.8 "xhigh", Inkling numeric 0.1-0.99), so a fixed <select> silently
-    degrades unknown values to its first option on panel reload."""
+def test_reasoning_effort_has_presets_and_custom_input():
+    """Common strings stay convenient while model-specific values remain usable."""
     html = _model_settings_template()
 
-    # The effort input block is the SECOND template with this marker (the
-    # first renders the entry label); enable_thinking's <select> sits between.
     marker = "<template x-if=\"entry.type === 'reasoning_effort'\">"
     section = html.split(marker, 2)[2].split(
-        "<template x-if=\"entry.type !== 'custom'\">", 1
+        "<template x-if=\"entry.type === 'enable_thinking'\">", 1
     )[0]
 
-    assert '<input type="text"' in section
-    assert 'list="reasoning-effort-options"' in section
-    assert "<select" not in section
+    assert 'x-show="!entry.custom"' in section
+    assert 'x-show="entry.custom"' in section
+    assert 'x-model="entry.customValue"' in section
+    assert 'x-model="entry.custom"' in section
+    assert 'x-model="entry.force"' in section
+    assert 'class="flex items-center gap-3"' in section
+    assert 'placeholder="0.9"' in section
+    assert "<datalist" not in section
 
-    datalist = _section(
-        html, '<datalist id="reasoning-effort-options">', "</datalist>"
-    )
     order = ["low", "medium", "high", "xhigh", "max"]
-    positions = [datalist.index(f'value="{value}"') for value in order]
+    positions = [section.index(f'value="{value}"') for value in order]
     assert positions == sorted(positions)
 
 
 def test_reasoning_effort_add_guard_covers_custom_entries():
-    """Stored reasoning_effort reloads as a custom entry, so the add-dropdown
-    guard must hide the typed option when either shape owns the key."""
+    """A generic custom row cannot duplicate the dedicated effort key."""
     html = _model_settings_template()
 
     guard = (
@@ -78,3 +80,17 @@ def test_reasoning_effort_add_guard_covers_custom_entries():
         "(e.type === 'custom' && e.key && e.key.trim() === 'reasoning_effort')"
     )
     assert guard in html
+
+
+def test_reasoning_effort_reload_restores_preset_or_custom_editor():
+    """Stored values must never fall through to a generic custom kwarg row."""
+    script = _dashboard_script()
+
+    branch = script.split("} else if (key === 'reasoning_effort') {", 1)[1].split(
+        "} else {", 1
+    )[0]
+    assert "REASONING_EFFORT_PRESETS.has(value)" in branch
+    assert "type: 'reasoning_effort'" in branch
+    assert "value: isPreset ? value : 'low'" in branch
+    assert "custom: !isPreset" in branch
+    assert "customValue: isPreset ? '' : String(value)" in branch
