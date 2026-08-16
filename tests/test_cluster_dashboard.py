@@ -360,7 +360,10 @@ def test_cluster_nodes_show_dynamic_hardware_identity_for_every_peer():
     assert "async loadClusterPeerHardware()" in javascript
     assert "await this.loadClusterPeerHardware()" in javascript
     assert "result.bootstrap_required" in javascript
-    assert "worker runtime is not installed yet" in javascript
+    # #2680: the banner must repeat what the probe measured, not assert
+    # "not installed" over a runtime it was merely unable to check.
+    assert "result.runtime_mismatches" in javascript
+    assert "its oMLX worker runtime is not installed yet" in javascript
     assert "probe?.ssh_reachable" in javascript
     assert "this.clusterPeerProbes?.[ssh]" in javascript
     assert "hardware.chip_name" in javascript

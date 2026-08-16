@@ -1603,9 +1603,16 @@
                     const status = result.status || {};
                     const node = status.node || {};
                     if (result.bootstrap_required) {
+                        // Repeat what the probe measured. This used to assert
+                        // "not installed" for every bootstrap_required result,
+                        // including peers whose runtime it merely could not
+                        // check — which is what surfaced the wrong guidance in
+                        // #2680.
+                        const measured = (result.runtime_mismatches || [])
+                            .find((entry) => Boolean(entry));
                         this.clusterConnectionError =
-                            `${node.hostname || ssh} is online, but its oMLX `
-                            + 'worker runtime is not installed yet.';
+                            `${node.hostname || ssh} is online, but `
+                            + (measured || 'its oMLX worker runtime is not installed yet.');
                         this.explainClusterError(this.clusterConnectionError);
                     }
                     if (this.clusterPlanNodes[1]) {
