@@ -697,7 +697,25 @@ class EngineCore:
         """
         from .utils.proc_memory import get_phys_footprint
 
-        request_ids = list(self._output_collectors.keys())
+        # Only abort requests not already finished or pending abort. The
+        # enforcer calls this once per poll (1s) while pressure persists; a
+        # deferred abort can take many seconds to drain (it executes at the
+        # next step()/chunk boundary), so without this filter the same
+        # request is re-aborted every poll: duplicate [Error: ...] frames
+        # reach streaming clients and the returned count reports stale
+        # aborts as fresh progress, hiding a stuck scheduler from the
+        # enforcer's escalation logic.
+        pending_aborts: set[str] = set()
+        sched_for_filter = self.scheduler
+        if sched_for_filter is not None:
+            pending_aborts = set(
+                getattr(sched_for_filter, "_pending_abort_ids", None) or ()
+            )
+        request_ids = [
+            rid
+            for rid in self._output_collectors.keys()
+            if rid not in self._finished_at and rid not in pending_aborts
+        ]
         ceiling = 0
         watermark = 0
         sched = self.scheduler
