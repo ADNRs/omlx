@@ -1235,6 +1235,39 @@ class TestEngineCoreAbortAllRequests:
                 engine.close()
 
     @pytest.mark.asyncio
+    async def test_abort_all_requests_uses_explicit_unload_reason(
+        self, mock_model, mock_tokenizer
+    ):
+        """Manual unload must not report a fake memory-pressure failure."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            try:
+                await engine.start()
+                engine.scheduler.has_requests = lambda: False
+                request_id = await engine.add_request(prompt="Hello")
+
+                count = await engine.abort_all_requests(
+                    reason="Request aborted because the model is being unloaded",
+                    error_code="model_unloading",
+                )
+
+                assert count == 1
+                output = engine._output_collectors[request_id].get_nowait()
+                assert output.error == (
+                    "Request aborted because the model is being unloaded"
+                )
+                assert output.error_code == "model_unloading"
+                assert output.error_metadata == {
+                    "request_id": request_id,
+                    "limit_bytes": None,
+                }
+            finally:
+                await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
     async def test_abort_all_requests_names_tripped_watermark(
         self, mock_model, mock_tokenizer
     ):

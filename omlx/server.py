@@ -1241,19 +1241,31 @@ class _LLMEngineLease:
             await get_engine_pool().release_engine(self.model_id)
 
     def abort_requested(self) -> bool:
+        return self.abort_reason() is not None
+
+    def abort_reason(self) -> str | None:
         if self.model_id is None or self.released:
-            return False
+            return None
         pool = _server_state.engine_pool
         if pool is None:
-            return False
+            return None
+        get_reason = getattr(pool, "get_abort_requested_reason", None)
+        if callable(get_reason):
+            return get_reason(self.model_id)
         is_abort_requested = getattr(pool, "is_abort_requested", None)
         if not callable(is_abort_requested):
-            return False
-        return bool(is_abort_requested(self.model_id))
+            return None
+        return "hard memory pressure" if is_abort_requested(self.model_id) else None
 
 
 async def _raise_if_llm_lease_abort_requested(lease: _LLMEngineLease) -> None:
-    if lease.abort_requested():
+    reason = lease.abort_reason()
+    if reason == "manual admin unload":
+        raise HTTPException(
+            status_code=409,
+            detail="Request aborted because this model is being unloaded.",
+        )
+    if reason is not None:
         raise HTTPException(
             status_code=507,
             detail=(

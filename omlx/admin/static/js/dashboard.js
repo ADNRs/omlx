@@ -6586,8 +6586,9 @@
                         method: 'POST',
                     });
                     if (response.ok) {
+                        const data = await response.json();
                         const model = this.models.find(m => m.id === modelId);
-                        if (model) model.loaded = false;
+                        if (model && data.status === 'ok') model.loaded = false;
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
