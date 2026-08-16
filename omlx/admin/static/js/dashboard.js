@@ -1608,8 +1608,21 @@
                         this.explainClusterError(this.clusterConnectionError);
                     }
                     if (this.clusterPlanNodes[1]) {
-                        this.clusterPlanNodes[1].ssh = ssh;
-                        this.clusterPlanNodes[1].node_id = node.hostname || this.clusterPlanNodes[1].node_id;
+                        const planned = this.clusterPlanNodes[1];
+                        const previousId = String(planned.ssh || '').trim() === ssh
+                            ? planned.node_id
+                            : '';
+                        const deployedId = (this.clusterDeployments?.[0]?.hosts || [])
+                            .find(host => host.ssh === ssh)?.node_id;
+                        const sshHostname = ssh.split('@').pop();
+                        planned.ssh = ssh;
+                        planned.node_id = this.clusterNodeId(
+                            deployedId,
+                            previousId,
+                            node.hostname,
+                            sshHostname,
+                            'worker-1',
+                        );
                         const exactCapacity = Number(
                             node.admission_ceiling_bytes
                             || node.recommended_working_set_bytes
@@ -1733,7 +1746,17 @@
                         .filter(node => String(node.ssh || '').trim())
                         .map(node => [String(node.ssh).trim(), node])
                 );
-                const localName = this.clusterStatus?.node?.hostname || 'this-mac';
+                const deployedBySsh = new Map(
+                    (this.clusterDeployments?.[0]?.hosts || [])
+                        .filter(host => String(host.ssh || '').trim())
+                        .map(host => [String(host.ssh).trim(), host])
+                );
+                const localName = this.clusterNodeId(
+                    deployedBySsh.get('127.0.0.1')?.node_id,
+                    existingBySsh.get('127.0.0.1')?.node_id,
+                    this.clusterStatus?.node?.hostname,
+                    'this-mac',
+                );
                 const local = existingBySsh.get('127.0.0.1')
                     || existing.get(localName)
                     || this.clusterPlanNodes?.[0]
@@ -1765,18 +1788,25 @@
                         this.clusterStatus?.runtime?.python_executable || '',
                 }];
                 this.clusterWorkerPeers().forEach((peer, index) => {
-                    const nodeId = this.clusterFriendlyMacName(
-                        peer.name || peer.ssh,
+                    const previousBySsh = existingBySsh.get(peer.ssh);
+                    const hardware = this.clusterPeerProbes?.[peer.ssh]?.status?.node || {};
+                    const sshHostname = String(peer.ssh || '').trim().split('@').pop();
+                    const nodeId = this.clusterNodeId(
+                        deployedBySsh.get(peer.ssh)?.node_id,
+                        peer.node_id,
+                        previousBySsh?.node_id,
+                        peer.name,
+                        hardware.hostname,
+                        sshHostname,
                         `worker-${index + 1}`,
                     );
                     const namedPrevious = existing.get(nodeId);
-                    const previous = existingBySsh.get(peer.ssh)
+                    const previous = previousBySsh
                         || (
                             namedPrevious && !String(namedPrevious.ssh || '').trim()
                                 ? namedPrevious
                                 : {}
                         );
-                    const hardware = this.clusterPeerProbes?.[peer.ssh]?.status?.node || {};
                     const peerRuntime = this.clusterPeerProbes?.[peer.ssh]?.status?.runtime || {};
                     const exactCapacityBytes = Number(
                         hardware.admission_ceiling_bytes
@@ -3538,6 +3568,15 @@
                 await this.startCluster();
             },
 
+            clusterNodeId(...candidates) {
+                const pattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+                for (const candidate of candidates) {
+                    const value = String(candidate || '').trim();
+                    if (pattern.test(value)) return value;
+                }
+                return '';
+            },
+
             clusterFriendlyMacName(name, fallback = 'Mac') {
                 let value = String(name || '').trim().replace(/\.local$/i, '');
                 value = value.replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
@@ -5170,7 +5209,10 @@
                     || this.clusterStatus.node.recommended_working_set_bytes
                     || 0
                 );
-                this.clusterPlanNodes[index].node_id = this.clusterStatus.node.hostname;
+                this.clusterPlanNodes[index].node_id = this.clusterNodeId(
+                    this.clusterStatus.node.hostname,
+                    'this-mac',
+                );
                 this.clusterPlanNodes[index].capacity_gib = Number(
                     (exactCapacity / gib).toFixed(2)
                 );
