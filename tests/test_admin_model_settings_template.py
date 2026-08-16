@@ -117,8 +117,9 @@ def test_model_settings_feature_labels_use_i18n_keys():
     assert ">DFlash</span>" not in status_html
 
 
-def test_model_settings_feature_i18n_keys_exist_in_english_and_chinese():
+def test_model_settings_feature_i18n_keys_exist_in_every_locale():
     root = Path(__file__).resolve().parents[1]
+    i18n_dir = root / "omlx/admin/i18n"
     keys = {
         "modal.model_settings.reasoning_parser",
         "modal.model_settings.specprefill",
@@ -126,9 +127,7 @@ def test_model_settings_feature_i18n_keys_exist_in_english_and_chinese():
         "status.active_models.dflash_label",
     }
 
-    for language in ("en", "zh"):
-        translations = json.loads(
-            (root / f"omlx/admin/i18n/{language}.json").read_text()
-        )
+    for locale_path in sorted(i18n_dir.glob("*.json")):
+        translations = json.loads(locale_path.read_text())
         missing_keys = keys - translations.keys()
-        assert not missing_keys, f"{language}.json is missing {sorted(missing_keys)}"
+        assert not missing_keys, f"{locale_path.name} is missing {sorted(missing_keys)}"
