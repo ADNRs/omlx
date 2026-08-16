@@ -6897,7 +6897,8 @@
         if (!container) return;
         const target = container.querySelector(`.message-fade-in[data-msg-index="${index}"]`);
         if (target && target.offsetParent !== null) {
-            target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+            target.scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: 'start' });
         }
     },
 
@@ -7677,8 +7678,8 @@
                 // scrolls don't animate and fight a user scrolling away; the scroll
                 // listener distinguishes this downward auto-follow from a user
                 // scrolling up by direction. Smooth only for explicit "jump to
-                // latest" (force=true).
-                behavior: force ? 'smooth' : 'auto'
+                // latest" (force=true). Honor reduce-motion by never animating.
+                behavior: (force && !matchMedia('(prefers-reduced-motion: reduce)').matches) ? 'smooth' : 'auto'
             });
         });
     },

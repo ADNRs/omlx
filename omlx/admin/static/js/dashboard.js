@@ -1028,8 +1028,9 @@
                 this.clusterShowPeerAdvanced = true;
                 if (!this.clusterSshKey) await this.loadClusterSshKey();
                 await this.$nextTick();
+                const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
                 document.querySelector('[data-cluster-ssh-setup]')?.scrollIntoView({
-                    behavior: 'smooth',
+                    behavior: reduced ? 'auto' : 'smooth',
                     block: 'center',
                 });
             },
