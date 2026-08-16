@@ -37,7 +37,11 @@ from ..model_profiles import EXCLUDED_FROM_PROFILES
 from ..model_settings import merge_chat_template_kwargs
 from ..settings import BURST_DECODE_MODES, SubKeyEntry, burst_decode_env
 from ..utils.release_check import normalize_update_channel, select_latest_release
-from ..websearch import DDGS_TEXT_BACKENDS, run_web_search_test
+from ..websearch import (
+    DDGS_TEXT_BACKENDS,
+    DEFAULT_MAX_RESULTS,
+    run_web_search_test,
+)
 from ..websearch import SUPPORTED_PROVIDERS as SUPPORTED_WEB_SEARCH_PROVIDERS
 from .auth import (
     REMEMBER_ME_MAX_AGE,
@@ -4319,6 +4323,7 @@ class WebSearchTestRequest(BaseModel):
     brave_api_key: str = ""
     searxng_url: str = ""
     ddgs_backends: str = ""
+    max_results: int = Field(default=DEFAULT_MAX_RESULTS, ge=1, le=10)
 
 
 @router.post("/api/web-search/test")
@@ -4338,6 +4343,7 @@ async def test_web_search(
         brave_api_key=request.brave_api_key,
         searxng_url=request.searxng_url,
         ddgs_backends=request.ddgs_backends,
+        max_results=request.max_results,
     )
 
 

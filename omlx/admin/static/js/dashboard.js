@@ -8097,6 +8097,7 @@
                             brave_api_key: this.globalSettings.integrations.web_search_brave_api_key || '',
                             searxng_url: this.globalSettings.integrations.web_search_searxng_url || '',
                             ddgs_backends: this.globalSettings.integrations.web_search_ddgs_backends || '',
+                            max_results: this.globalSettings.integrations.web_search_max_results,
                         }),
                     });
                     const payload = await response.json();
