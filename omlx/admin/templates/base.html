@@ -66,8 +66,9 @@
             display: inline-block;
         }
 
-        /* Language-specific font stack */
+        /* Global UI tokens */
         :root {
+            --focus-ring-color: #171717;
             {% if current_lang == 'ko' %}
             --font-sans: 'Noto Sans KR', 'Inter', system-ui, sans-serif;
             {% elif current_lang == 'zh' %}
@@ -79,6 +80,10 @@
             {% else %}
             --font-sans: 'Inter', system-ui, sans-serif;
             {% endif %}
+        }
+
+        [data-theme="dark"] {
+            --focus-ring-color: #efefef;
         }
 
         body {
@@ -113,9 +118,7 @@
            contrast boost). Visible on :focus-visible only, so mouse users see
            no extra chrome while keyboard users always see where focus is. */
         :focus-visible {
-            /* Fallback (#171717) covers pages that do not define --text-primary
-               (e.g. the login page) so keyboard focus stays visible everywhere. */
-            outline: 1px solid var(--text-primary, #171717) !important;
+            outline: 2px solid var(--focus-ring-color) !important;
             outline-offset: 2px;
         }
 
