@@ -6605,17 +6605,16 @@
                         if (e.force) forced.push('enable_thinking');
                     } else if (e.type === 'reasoning_effort') {
                         if (isDiffusion) continue;
-                        ctk.reasoning_effort = e.value;
-                        if (e.force) forced.push('reasoning_effort');
+                        const effort = this.coerceKwargValue(e.value);
+                        if (String(effort).trim() !== '') {
+                            ctk.reasoning_effort = effort;
+                            if (e.force) forced.push('reasoning_effort');
+                        }
                     } else if (e.type === 'custom' && e.key && e.key.trim()) {
                         if (isDiffusion && this.isDiffusionUnsupportedCtKwarg(e.key.trim())) {
                             continue;
                         }
-                        let v = e.value;
-                        if (v === 'true') v = true;
-                        else if (v === 'false') v = false;
-                        else if (!isNaN(Number(v)) && String(v).trim() !== '') v = Number(v);
-                        ctk[e.key.trim()] = v;
+                        ctk[e.key.trim()] = this.coerceKwargValue(e.value);
                         if (e.force) forced.push(e.key.trim());
                     }
                 }
@@ -6875,6 +6874,17 @@
                     || !!ms.guided_grammar_enabled;
             },
 
+            // Coerce a raw kwarg string from the panel into its JSON type:
+            // 'true'/'false' -> boolean, numeric strings -> number. Free-form
+            // reasoning effort relies on this so numeric models (Inkling
+            // 0.1-0.99) keep numbers instead of degrading to strings.
+            coerceKwargValue(v) {
+                if (v === 'true') return true;
+                if (v === 'false') return false;
+                if (String(v).trim() !== '' && !isNaN(Number(v))) return Number(v);
+                return v;
+            },
+
             buildCtKwargEntries(chatTemplateKwargs, forcedCtKwargs, isDiffusion = false) {
                 const ctk = chatTemplateKwargs || {};
                 const forced = new Set(forcedCtKwargs || []);
@@ -6889,13 +6899,11 @@
                             value: String(value),
                             force: forced.has('enable_thinking'),
                         });
-                    } else if (key === 'reasoning_effort') {
-                        entries.push({
-                            type: 'reasoning_effort',
-                            value: String(value),
-                            force: forced.has('reasoning_effort'),
-                        });
                     } else {
+                        // reasoning_effort deliberately loads here as a plain
+                        // custom entry: stored values are the source of truth
+                        // and must never be captured/relabeled by the typed
+                        // add-option (which exists only to seed new entries).
                         entries.push({
                             type: 'custom',
                             key,
@@ -7433,13 +7441,13 @@
                                     if (entry.force) forcedCtKwargs.push('enable_thinking');
                                 } else if (entry.type === 'reasoning_effort') {
                                     if (isDiffusion) continue;
-                                    chatTemplateKwargs.reasoning_effort = entry.value;
-                                    if (entry.force) forcedCtKwargs.push('reasoning_effort');
+                                    const effort = this.coerceKwargValue(entry.value);
+                                    if (String(effort).trim() !== '') {
+                                        chatTemplateKwargs.reasoning_effort = effort;
+                                        if (entry.force) forcedCtKwargs.push('reasoning_effort');
+                                    }
                                 } else if (entry.type === 'custom' && entry.key && entry.key.trim()) {
-                                    let val = entry.value;
-                                    if (val === 'true') val = true;
-                                    else if (val === 'false') val = false;
-                                    else if (!isNaN(Number(val)) && val.trim() !== '') val = Number(val);
+                                    const val = this.coerceKwargValue(entry.value);
                                     const key = entry.key.trim();
                                     if (isDiffusion && this.isDiffusionUnsupportedCtKwarg(key)) {
                                         continue;
