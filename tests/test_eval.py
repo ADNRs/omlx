@@ -255,6 +255,30 @@ class TestHumanEval:
         passed, error = _execute_with_tests(code, test, "add")
         assert passed is False
 
+    def test_close_only_thinking_draft_does_not_pollute_answer(self):
+        from omlx.eval.humaneval import HumanEvalBenchmark
+
+        benchmark = HumanEvalBenchmark()
+        item = {
+            "prompt": "def add(a, b):\n    ",
+            "test": "def check(candidate):\n    assert candidate(1, 2) == 3",
+            "entry_point": "add",
+        }
+        response = (
+            "I should draft an implementation.\n"
+            "def draft(a, b):\n"
+            "    this is not valid Python\n"
+            "</think>\n"
+            "def add(a, b):\n"
+            "    return a + b"
+        )
+
+        visible = benchmark._strip_think_tags(response)
+        code = benchmark.extract_answer(visible, item)
+
+        assert code == "def add(a, b):\n    return a + b"
+        assert benchmark.check_answer(code, item) is True
+
 
 # --- Think Tag Stripping Tests ---
 
@@ -268,6 +292,12 @@ class TestStripThinkTags:
     def test_strip_empty_think(self):
         from omlx.eval.base import BaseBenchmark
         assert BaseBenchmark._strip_think_tags("<think></think>B") == "B"
+
+    def test_strip_think_block_with_open_tag_in_prompt(self):
+        from omlx.eval.base import BaseBenchmark
+
+        text = "reasoning draft\n</think>\nfinal answer"
+        assert BaseBenchmark._strip_think_tags(text) == "final answer"
 
     def test_no_think_tags(self):
         from omlx.eval.base import BaseBenchmark
