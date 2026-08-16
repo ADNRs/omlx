@@ -9,6 +9,7 @@ end-to-end merge behaviour is covered in
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import omlx.server as server
 from omlx.settings import GlobalSettings, MCPSettings
@@ -16,6 +17,7 @@ from omlx.settings import GlobalSettings, MCPSettings
 ROOT = Path(__file__).resolve().parents[1]
 I18N_DIR = ROOT / "omlx/admin/i18n"
 SETTINGS_TEMPLATE = ROOT / "omlx/admin/templates/dashboard/_settings.html"
+DASHBOARD_JS = ROOT / "omlx/admin/static/js/dashboard.js"
 
 REQUIRED_I18N_KEYS = {
     "settings.mcp.expose_tools",
@@ -52,7 +54,7 @@ class TestMcpToolsExposedHelper:
         monkeypatch.setattr(
             server._server_state,
             "global_settings",
-            GlobalSettings(mcp=MCPSettings()),
+            SimpleNamespace(mcp=SimpleNamespace()),
         )
         assert server.mcp_tools_exposed() is True
 
@@ -65,6 +67,10 @@ class TestDashboardToggleMarkup:
         assert "globalSettings.mcp.expose_tools" in html
         assert "settings.mcp.expose_tools" in html
         assert "settings.mcp.expose_tools_hint" in html
+
+    def test_dashboard_state_defaults_expose_tools_true(self):
+        javascript = DASHBOARD_JS.read_text(encoding="utf-8")
+        assert "mcp: { config_path: '', expose_tools: true }" in javascript
 
 
 class TestI18nKeys:
@@ -119,6 +125,7 @@ class TestAdminApiExposeTools:
         )
         assert result["success"] is True
         assert gs.mcp.expose_tools is False
+        assert "mcp_expose_tools" in result["runtime_applied"]
 
         # Persisted to disk, so a server restart keeps the toggle off.
         restored = GlobalSettings.load(base_path=tmp_path)
@@ -140,3 +147,4 @@ class TestAdminApiExposeTools:
         )
         assert result["success"] is True
         assert gs.mcp.expose_tools is True
+        assert "mcp_expose_tools" not in result["runtime_applied"]

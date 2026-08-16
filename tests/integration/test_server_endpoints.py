@@ -1941,7 +1941,7 @@ class _RecordingMCPManager:
 
     def get_merged_tools(self, user_tools=None):
         self.calls.append(user_tools)
-        return [
+        mcp_tools = [
             {
                 "type": "function",
                 "function": {
@@ -1956,6 +1956,7 @@ class _RecordingMCPManager:
                 },
             }
         ]
+        return mcp_tools + (user_tools or [])
 
     def get_all_tools_openai(self):
         return [
@@ -1993,6 +1994,20 @@ class TestMCPExposeToolsToggle:
                     "properties": {
                         "query": {"type": "string"},
                     },
+                },
+            },
+        }
+    ]
+
+    USER_RESPONSE_TOOLS = [
+        {
+            "type": "function",
+            "name": "user_search",
+            "description": "Search from request tools",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
                 },
             },
         }
@@ -2038,14 +2053,7 @@ class TestMCPExposeToolsToggle:
         expect_mcp_merge,
     ):
         """OpenAI-compatible /v1/chat/completions honours the toggle."""
-        from omlx.server import _server_state
-
-        recorded_count_tools = []
         recorded_chat_kwargs = []
-
-        def count_chat_tokens(messages, tools=None, **kwargs):
-            recorded_count_tools.append(tools)
-            return 1
 
         async def chat(messages, **kwargs):
             recorded_chat_kwargs.append(kwargs)
@@ -2058,7 +2066,6 @@ class TestMCPExposeToolsToggle:
 
         manager = _RecordingMCPManager()
         restore = self._install(expose_tools, manager)
-        mock_llm_engine.count_chat_tokens = count_chat_tokens
         mock_llm_engine.chat = chat
 
         payload = {
@@ -2103,8 +2110,6 @@ class TestMCPExposeToolsToggle:
         expect_mcp_merge,
     ):
         """Anthropic-compatible /v1/messages honours the toggle."""
-        from omlx.server import _server_state
-
         recorded_chat_kwargs = []
 
         async def chat(messages, **kwargs):
@@ -2151,6 +2156,60 @@ class TestMCPExposeToolsToggle:
         else:
             assert "mcp_search" not in names
             assert "get_weather" in names
+
+    @pytest.mark.parametrize(
+        ("expose_tools", "expect_mcp_merge"),
+        [
+            (True, True),
+            (False, False),
+        ],
+    )
+    def test_responses_expose_tools_controls_mcp_merge(
+        self,
+        client,
+        mock_llm_engine,
+        expose_tools,
+        expect_mcp_merge,
+    ):
+        """OpenAI-compatible /v1/responses honours the toggle."""
+        recorded_chat_kwargs = []
+
+        async def chat(messages, **kwargs):
+            recorded_chat_kwargs.append(kwargs)
+            return MockGenerationOutput(
+                text="Plain response.",
+                prompt_tokens=1,
+                completion_tokens=1,
+                finish_reason="stop",
+            )
+
+        manager = _RecordingMCPManager()
+        restore = self._install(expose_tools, manager)
+        mock_llm_engine.chat = chat
+
+        payload = {
+            "model": "test-model",
+            "input": "Hello",
+            "tools": self.USER_RESPONSE_TOOLS,
+            "store": False,
+        }
+
+        try:
+            response = client.post("/v1/responses", json=payload)
+        finally:
+            restore()
+
+        assert response.status_code == 200
+        assert recorded_chat_kwargs
+        names = self._tool_names(recorded_chat_kwargs)
+        assert "user_search" in names
+
+        if expect_mcp_merge:
+            assert manager.calls
+            assert "mcp_search" in names
+        else:
+            assert manager.calls == []
+            assert "mcp_search" not in names
 
 
 class TestErrorHandling:
