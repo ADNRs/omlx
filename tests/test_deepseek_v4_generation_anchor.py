@@ -9,10 +9,9 @@ all and the model free-ran as document continuation until max_tokens:
   2. a trailing system message after the last user turn (workspace notes).
 """
 
-import pytest
-
 from omlx.patches.deepseek_v4.chat_template_v4 import (
     ASSISTANT_SP_TOKEN,
+    DS_TASK_SP_TOKENS,
     apply_chat_template,
     thinking_end_token,
     thinking_start_token,
@@ -41,6 +40,9 @@ USER_FINAL = [
     {"role": "user", "content": "Hello."},
 ]
 
+TITLE_TASK = [{"role": "user", "content": "Summarize this.", "task": "title"}]
+ACTION_TASK = [{"role": "user", "content": "Choose an action.", "task": "action"}]
+
 
 def test_system_only_conversation_gets_anchor():
     out = apply_chat_template(SYSTEM_ONLY, add_generation_prompt=True)
@@ -64,6 +66,18 @@ def test_user_final_rendering_unchanged():
     out = apply_chat_template(USER_FINAL, add_generation_prompt=True)
     assert out.endswith(THINK_ANCHOR)
     # Exactly one anchor: the guard must not double-append.
+    assert out.count(THINK_ANCHOR) == 1
+
+
+def test_title_task_transition_not_followed_by_generation_anchor():
+    out = apply_chat_template(TITLE_TASK, add_generation_prompt=True)
+    assert out.endswith(DS_TASK_SP_TOKENS["title"])
+    assert not out.endswith(THINK_ANCHOR)
+
+
+def test_action_task_transition_not_followed_by_second_generation_anchor():
+    out = apply_chat_template(ACTION_TASK, add_generation_prompt=True)
+    assert out.endswith(DS_TASK_SP_TOKENS["action"])
     assert out.count(THINK_ANCHOR) == 1
 
 

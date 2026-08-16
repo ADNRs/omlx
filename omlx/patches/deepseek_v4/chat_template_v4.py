@@ -866,7 +866,9 @@ def apply_chat_template(
     if not add_generation_prompt:
         out = out.removesuffix(ASSISTANT_SP_TOKEN + thinking_start_token)
         out = out.removesuffix(ASSISTANT_SP_TOKEN + thinking_end_token)
-    elif not out.endswith(
+    elif not (
+        prepared_messages and prepared_messages[-1].get("task") is not None
+    ) and not out.endswith(
         (
             ASSISTANT_SP_TOKEN + thinking_start_token,
             ASSISTANT_SP_TOKEN + thinking_end_token,
