@@ -1522,6 +1522,51 @@ def _register_model(
         logger.error(f"Failed to discover model {model_id}: {e}")
 
 
+def model_display_name(
+    model_id: str,
+    model_path: str | Path | None,
+    model_dirs: list[Path],
+    *,
+    source_repo_id: str | None = None,
+) -> str:
+    """Return the org-qualified display name for a discovered model.
+
+    Prefers the HF repo id when one is known, then falls back to the
+    org/leaf relative path under a configured model dir (the organized
+    two-level layout), then to the bare model id. This is what the models
+    UI shows and what benchmark uploads publish, so two releases with the
+    same leaf directory name stay distinguishable.
+    """
+    repo_id = (source_repo_id or "").strip()
+    if "/" in repo_id:
+        return repo_id
+
+    if not model_path:
+        return model_id
+
+    path_text = str(model_path)
+    if "://" in path_text:
+        return model_id
+
+    try:
+        path = Path(path_text).expanduser().resolve()
+    except (OSError, RuntimeError):
+        path = Path(path_text).expanduser()
+
+    for model_dir in model_dirs:
+        try:
+            rel = path.relative_to(model_dir.expanduser().resolve())
+        except (OSError, RuntimeError, ValueError):
+            continue
+
+        parts = rel.parts
+        if len(parts) >= 2:
+            return f"{parts[0]}/{parts[1]}"
+        return model_id
+
+    return model_id
+
+
 def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
     """
     Scan model directory with two-level discovery.
