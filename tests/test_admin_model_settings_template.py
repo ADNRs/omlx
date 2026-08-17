@@ -131,3 +131,43 @@ def test_model_settings_feature_i18n_keys_exist_in_every_locale():
         translations = json.loads(locale_path.read_text())
         missing_keys = keys - translations.keys()
         assert not missing_keys, f"{locale_path.name} is missing {sorted(missing_keys)}"
+
+
+def test_qwen_ane_model_specific_controls_are_fully_wired():
+    html = _model_settings_template()
+    script = _dashboard_script()
+    fields = {
+        "qwen35_ane_prefill_enabled",
+        "qwen35_ane_prefill_sequence_length",
+        "qwen35_ane_prefill_fraction",
+        "qwen35_ane_prefill_max_layers",
+        "qwen35_ane_prefill_dual_ane",
+        "qwen35_ane_prefill_gdn",
+        "qwen35_ane_prefill_gdn_fraction",
+        "qwen35_ane_prefill_gdn_max_layers",
+    }
+
+    assert 'x-if="isQwen35AnePrefillModel(selectedModel)"' in html
+    for field in fields:
+        assert f"modelSettings.{field}" in html
+        assert f"{field}:" in script
+
+    assert 'x-model.number="modelSettings.qwen35_ane_prefill_fraction"' in html
+    assert 'x-model.number="modelSettings.qwen35_ane_prefill_gdn_fraction"' in html
+    assert '<option :value="0.53">53% —' in html
+    assert '<option :value="0.5">50% —' in html
+
+
+def test_qwen_ane_web_defaults_match_measured_profile():
+    script = _dashboard_script()
+    state = script.split("buildModelSettingsState(model, settings) {", 1)[1].split(
+        "_resetPresetApplicableFields()", 1
+    )[0]
+
+    assert "qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048" in state
+    assert "qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? 0.53" in state
+    assert "qwen35_ane_prefill_max_layers: s.qwen35_ane_prefill_max_layers || 64" in state
+    assert "qwen35_ane_prefill_dual_ane: s.qwen35_ane_prefill_dual_ane !== false" in state
+    assert "qwen35_ane_prefill_gdn: s.qwen35_ane_prefill_gdn !== false" in state
+    assert "qwen35_ane_prefill_gdn_fraction: s.qwen35_ane_prefill_gdn_fraction ?? 0.5" in state
+    assert "qwen35_ane_prefill_gdn_max_layers: s.qwen35_ane_prefill_gdn_max_layers ?? 48" in state

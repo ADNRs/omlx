@@ -15,6 +15,7 @@ from omlx.admin.benchmark import (
     BenchmarkContextProfile,
     BenchmarkRequest,
     BenchmarkRun,
+    BenchmarkWarmupMode,
     _compute_single_metrics,
     _derive_feature_flags,
     _detect_experimental_features,
@@ -112,6 +113,26 @@ class TestBenchmarkRequest:
     def test_context_profile_defaults_to_python_code(self):
         req = BenchmarkRequest(model_id="test-model", prompt_lengths=[1024])
         assert req.context_profile is BenchmarkContextProfile.CODE_PYTHON
+
+    def test_warmup_mode_defaults_to_quick(self):
+        req = BenchmarkRequest(model_id="test-model", prompt_lengths=[1024])
+        assert req.warmup_mode is BenchmarkWarmupMode.QUICK
+
+    def test_ane_warmup_mode_is_accepted(self):
+        req = BenchmarkRequest(
+            model_id="test-model",
+            prompt_lengths=[1024],
+            warmup_mode="ane_2048",
+        )
+        assert req.warmup_mode is BenchmarkWarmupMode.ANE_2048
+
+    def test_unknown_warmup_mode_is_rejected(self):
+        with pytest.raises(ValueError, match="warmup_mode"):
+            BenchmarkRequest(
+                model_id="test-model",
+                prompt_lengths=[1024],
+                warmup_mode="unknown",
+            )
 
     @pytest.mark.parametrize("profile", list(BenchmarkContextProfile))
     def test_all_context_profiles_are_accepted(self, profile):
@@ -868,6 +889,49 @@ class TestBenchmarkEngineSelection:
 
         assert run.status == "completed"
         assert engine.calls[0]["max_tokens"] == 128
+
+    @pytest.mark.asyncio
+    async def test_ane_warmup_executes_a_full_2048_token_prefill(self):
+        class LongTokenizer:
+            def encode(self, text):
+                return list(range(10000))
+
+        class RecordingEngine(_FakeBenchEngine):
+            tokenizer = LongTokenizer()
+
+            def __init__(self):
+                self.calls = []
+
+            async def stream_generate(self, **kwargs):
+                self.calls.append(kwargs)
+                yield SimpleNamespace(
+                    completion_tokens=1,
+                    prompt_tokens=len(kwargs["prompt"]),
+                    cached_tokens=0,
+                    new_text="x",
+                    finished=True,
+                    finish_reason="length",
+                )
+
+        engine = RecordingEngine()
+        run = BenchmarkRun(
+            bench_id="bench-ane-warmup",
+            request=BenchmarkRequest(
+                model_id="test-model",
+                prompt_lengths=[1024],
+                generation_length=1,
+                warmup_mode="ane_2048",
+            ),
+        )
+
+        with patch("omlx.admin.benchmark._upload_to_omlx_ai", AsyncMock()):
+            await run_benchmark(run, _FakeBenchEnginePool(engine=engine))
+
+        assert run.status == "completed"
+        # stream_generate reserves the final token for first decode, leaving
+        # exactly 2,048 tokens for the ANE-eligible prefill invocation.
+        assert len(engine.calls[0]["prompt"]) == 2049
+        assert len(engine.calls[1]["prompt"]) == 1024
 
 
 # =============================================================================
