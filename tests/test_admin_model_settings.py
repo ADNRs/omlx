@@ -152,6 +152,21 @@ async def test_qwen_ane_prefill_change_unloads_a_loaded_engine():
 
 
 @pytest.mark.asyncio
+async def test_qwen_ane_prefill_accepts_qwen38_config_type():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_8"
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(qwen35_ane_prefill_enabled=True),
+    )
+
+    assert settings.qwen35_ane_prefill_enabled is True
+
+
+@pytest.mark.asyncio
 async def test_qwen_ane_prefill_rejects_invalid_block_size():
     pool, entry = _failed_pool()
     entry.config_model_type = "qwen3_5"
@@ -171,7 +186,7 @@ async def test_qwen_ane_prefill_rejects_other_model_families():
     pool, entry = _failed_pool()
     entry.config_model_type = "gemma4"
 
-    with pytest.raises(admin_routes.HTTPException, match="Qwen3.5/3.6"):
+    with pytest.raises(admin_routes.HTTPException, match="Qwen3.5/3.6/3.8"):
         await _update_settings(
             pool,
             ModelSettings(),

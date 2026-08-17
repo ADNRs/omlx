@@ -107,6 +107,9 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         vm.model = makeModel(id: "qwen", configModelType: "qwen3-6")
         XCTAssertTrue(vm.isQwen35AnePrefillModel)
 
+        vm.model = makeModel(id: "qwen", configModelType: "qwen3_8")
+        XCTAssertTrue(vm.isQwen35AnePrefillModel)
+
         vm.model = makeModel(id: "other", configModelType: "gemma4")
         XCTAssertFalse(vm.isQwen35AnePrefillModel)
     }

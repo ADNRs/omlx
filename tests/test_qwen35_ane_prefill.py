@@ -1,4 +1,5 @@
 import weakref
+from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -7,6 +8,35 @@ import pytest
 
 import omlx.patches.qwen35_ane_prefill as ane_patch
 from omlx.custom_kernels.qwen35_prefill import fast
+
+
+def test_ane_compile_bindings_release_the_python_gil():
+    bindings = (
+        Path(__file__).resolve().parents[1]
+        / "omlx/custom_kernels/qwen35_prefill/csrc/bindings.cpp"
+    ).read_text(encoding="utf-8")
+    blocks = bindings.split("  m.def(")
+    guard = "nb::call_guard<nb::gil_scoped_release>()"
+
+    for name in (
+        "qwen35_ane_compile_linear",
+        "qwen35_ane_compile_linear_bank",
+        "qwen35_ane_compile_fp16_linear",
+        "qwen35_ane_compile_swiglu_down",
+    ):
+        block = next(part for part in blocks if f'"{name}"' in part)
+        assert guard in block
+
+
+@pytest.fixture(autouse=True)
+def _restore_lm_gdn_backend():
+    import omlx.patches.qwen35_q4_mlp as q4_patch
+
+    previous = q4_patch._LM_GDN_PREFILL_BACKEND
+    try:
+        yield
+    finally:
+        q4_patch.register_qwen35_lm_gdn_prefill_backend(previous)
 
 
 class _MLP(nn.Module):
@@ -36,6 +66,42 @@ class _GDN(nn.Module):
         self.in_proj_z = nn.QuantizedLinear(128, 128, bias=False, group_size=64, bits=5)
         self.in_proj_b = nn.QuantizedLinear(128, 48, bias=False, group_size=64, bits=5)
         self.in_proj_a = nn.QuantizedLinear(128, 48, bias=False, group_size=64, bits=5)
+
+
+class _OQ4eMLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate_proj = nn.QuantizedLinear(128, 256, bias=False, group_size=64, bits=4)
+        self.up_proj = nn.QuantizedLinear(128, 256, bias=False, group_size=64, bits=4)
+        self.down_proj = nn.QuantizedLinear(256, 128, bias=False, group_size=64, bits=5)
+
+
+class _OQ4eGDN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.in_proj_qkv = nn.QuantizedLinear(
+            128, 256, bias=False, group_size=64, bits=4
+        )
+        self.in_proj_z = nn.QuantizedLinear(128, 128, bias=False, group_size=64, bits=5)
+        self.in_proj_b = nn.QuantizedLinear(128, 48, bias=False, group_size=64, bits=4)
+        self.in_proj_a = nn.QuantizedLinear(128, 48, bias=False, group_size=64, bits=4)
+
+
+@pytest.mark.parametrize("sequence_length", [2048, 4096])
+def test_configure_scheduler_uses_the_compiled_ane_shape(sequence_length):
+    scheduler = SimpleNamespace(
+        config=SimpleNamespace(prefill_step_size=2048),
+        _qwen35_prefill_floor=4096,
+    )
+
+    configured = ane_patch.configure_qwen35_ane_prefill_scheduler(
+        scheduler,
+        sequence_length,
+    )
+
+    assert configured is True
+    assert scheduler.config.prefill_step_size == sequence_length
+    assert scheduler._qwen35_prefill_floor == 0
 
 
 def test_install_dispatch_adds_gdn_projection_compatibility_hook(monkeypatch):
@@ -277,6 +343,26 @@ def test_compile_pair_splits_one_prompt_across_two_ane_instances(monkeypatch):
     assert state.gpu_outputs == 128
 
 
+def test_prepare_pair_accepts_oq4e_group64_with_q5_down():
+    mlp = _OQ4eMLP()
+    for linear in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        linear.scales = linear.scales.astype(mx.bfloat16)
+        linear.biases = linear.biases.astype(mx.bfloat16)
+
+    prepared = ane_patch._prepare_pair_for_bank(
+        mlp,
+        ane_patch._AnePrefillConfig(2048, 0.5, 8, dual_ane=True),
+    )
+
+    assert prepared is not None
+    state, dense0, dense1 = prepared
+    assert state.group_size == 64
+    assert state.weight.shape == (256, 16)
+    assert state.scales.shape == (256, 2)
+    assert dense0.shape == (128, 128)
+    assert dense1.shape == (128, 128)
+
+
 def test_compile_gdn_combines_z_then_qkv_and_keeps_q5_suffix(monkeypatch):
     gdn = _GDN()
     for linear in (
@@ -311,6 +397,32 @@ def test_compile_gdn_combines_z_then_qkv_and_keeps_q5_suffix(monkeypatch):
     assert state.scales.shape == (192, 2)
     assert state.bits == 5
     assert state.group_size == 64
+
+
+def test_prepare_gdn_accepts_oq4e_mixed_q4_q5_quantization():
+    gdn = _OQ4eGDN()
+    for linear in (
+        gdn.in_proj_qkv,
+        gdn.in_proj_z,
+        gdn.in_proj_b,
+        gdn.in_proj_a,
+    ):
+        linear.scales = linear.scales.astype(mx.bfloat16)
+        linear.biases = linear.biases.astype(mx.bfloat16)
+
+    prepared = ane_patch._prepare_gdn_for_bank(
+        gdn,
+        ane_patch._AneGDNConfig(2048, 0.75, 8, dual_ane=True),
+    )
+
+    assert prepared is not None
+    state, dense0, dense1 = prepared
+    assert state.bits == 4
+    assert state.group_size == 64
+    assert state.weight.shape == (128, 16)
+    assert state.scales.shape == (128, 2)
+    assert dense0.shape == (128, 128)
+    assert dense1.shape == (128, 128)
 
 
 def test_gdn_backend_restores_projection_order_and_keeps_b_a_exact(monkeypatch):

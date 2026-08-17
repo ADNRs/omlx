@@ -125,6 +125,18 @@ def test_model_settings_feature_i18n_keys_exist_in_every_locale():
         "modal.model_settings.specprefill",
         "modal.model_settings.dflash",
         "status.active_models.dflash_label",
+        "modal.model_settings.qwen_ane",
+        "modal.model_settings.qwen_ane_hint",
+        "modal.model_settings.qwen_ane_prompt_block",
+        "modal.model_settings.qwen_ane_mlp_fraction",
+        "modal.model_settings.qwen_ane_mlp_layers",
+        "modal.model_settings.qwen_ane_dual",
+        "modal.model_settings.qwen_ane_dual_hint",
+        "modal.model_settings.qwen_ane_gdn",
+        "modal.model_settings.qwen_ane_gdn_hint",
+        "modal.model_settings.qwen_ane_gdn_fraction",
+        "modal.model_settings.qwen_ane_gdn_layers",
+        "modal.model_settings.qwen_ane_measured",
     }
 
     for locale_path in sorted(i18n_dir.glob("*.json")):
@@ -148,6 +160,7 @@ def test_qwen_ane_model_specific_controls_are_fully_wired():
     }
 
     assert 'x-if="isQwen35AnePrefillModel(selectedModel)"' in html
+    assert "'qwen3_5', 'qwen3_6', 'qwen3_8'" in script
     for field in fields:
         assert f"modelSettings.{field}" in html
         assert f"{field}:" in script

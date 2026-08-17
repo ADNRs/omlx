@@ -1672,7 +1672,7 @@ array qwen35_ane_q4_swiglu_t(
       gpu_weight.ndim() != 2 || gpu_scales.ndim() != 2 ||
       gpu_biases.shape() != gpu_scales.shape() || !row_contiguous(gpu_weight) ||
       !row_contiguous(gpu_scales) || !row_contiguous(gpu_biases) ||
-      group_size != 128 || variant != 8) {
+      (group_size != 64 && group_size != 128) || variant != 8) {
     throw std::invalid_argument(
         "Unsupported ANE hybrid q4 SwiGLU configuration.");
   }
@@ -1682,8 +1682,9 @@ array qwen35_ane_q4_swiglu_t(
   const int ane_n = ane_model->output_dim();
   if (K != ane_model->input_dim() || M != ane_model->sequence_length() ||
       ane_n <= 0 || ane_n % 2 != 0 || gpu_n <= 0 || gpu_n % 128 != 0 ||
-      K % 128 != 0 || gpu_weight.shape(1) * 8 != K ||
-      gpu_scales.shape(0) != gpu_n || gpu_scales.shape(1) != K / 128) {
+      K % group_size != 0 || gpu_weight.shape(1) * 8 != K ||
+      gpu_scales.shape(0) != gpu_n ||
+      gpu_scales.shape(1) != K / group_size) {
     throw std::invalid_argument("ANE hybrid q4 SwiGLU shape mismatch.");
   }
   Shape shape = x.shape();
@@ -1748,7 +1749,7 @@ array qwen35_ane_dual_q4_swiglu_t(
       gpu_weight.ndim() != 2 || gpu_scales.ndim() != 2 ||
       gpu_biases.shape() != gpu_scales.shape() || !row_contiguous(gpu_weight) ||
       !row_contiguous(gpu_scales) || !row_contiguous(gpu_biases) ||
-      group_size != 128 || variant != 8) {
+      (group_size != 64 && group_size != 128) || variant != 8) {
     throw std::invalid_argument("Unsupported dual ANE q4 SwiGLU configuration.");
   }
   const int K = static_cast<int>(x.shape(-1));
@@ -1760,9 +1761,9 @@ array qwen35_ane_dual_q4_swiglu_t(
       K != ane_model1->input_dim() || M != ane_model0->sequence_length() ||
       M != ane_model1->sequence_length() || ane0_n <= 0 || ane1_n <= 0 ||
       ane0_n % 2 != 0 || ane1_n % 2 != 0 || gpu_n <= 0 ||
-      gpu_n % 128 != 0 || K % 128 != 0 ||
+      gpu_n % 128 != 0 || K % group_size != 0 ||
       gpu_weight.shape(1) * 8 != K || gpu_scales.shape(0) != gpu_n ||
-      gpu_scales.shape(1) != K / 128) {
+      gpu_scales.shape(1) != K / group_size) {
     throw std::invalid_argument("Dual ANE hybrid q4 SwiGLU shape mismatch.");
   }
   Shape shape = x.shape();

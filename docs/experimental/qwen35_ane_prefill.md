@@ -1,7 +1,7 @@
-# Qwen3.5 ANE/GPU Prefill (Experimental)
+# Qwen3.5/3.6/3.8 ANE/GPU Prefill (Experimental)
 
 This source-build experiment uses private AppleNeuralEngine APIs to split one
-fixed-shape Qwen3.5/3.6 prompt across both ANEs and the GPU. Two INT8 programs,
+fixed-shape Qwen3.5/3.6/3.8 prompt across both ANEs and the GPU. Two INT8 programs,
 pinned to physical ANE instances 1 and 2, compute disjoint output-channel
 slices while Metal computes the remaining quantized channels. It is disabled
 by default.
@@ -19,9 +19,12 @@ logits remain on GPU.
 - The dual path is intended for M3 Ultra, where the two dies expose physical
   ANE instances 1 and 2.
 - The oMLX native custom kernels must be built (`OMLX_WITH_CUSTOM_KERNEL=1`).
-- Dense Qwen3.5/3.6 affine q4 linears with group size 128.
-- Optional GDN acceleration additionally requires affine q5 projections with
-  group size 64, as used by the measured Qwen3.5 model.
+- Dense Qwen3.5/3.6/3.8 affine q4 gate/up linears with group size 64 or 128.
+  The down projection may use compatible affine q2/q4/q5/q6/q8 weights and
+  remains on the GPU.
+- Optional GDN acceleration accepts affine q4/q5 projections with group size
+  64 or 128. Mixed q4/q5 layouts are supported when the ANE prefix covers the
+  full z projection, leaving a homogeneous qkv suffix on the GPU.
 - An MLP prefill call whose flattened token count exactly matches the fixed
   configured sequence length. Decode, target verification, short chunks, and
   unsupported layers automatically use the existing path.
@@ -31,7 +34,7 @@ logits remain on GPU.
   pays the compilation cost. Programs are cached for the model's lifetime.
 
 The implementation uses undocumented APIs and can stop working after a macOS
-update. It also requantizes the selected q4 weights to per-output-channel INT8,
+update. It also requantizes the selected weights to per-output-channel INT8,
 so it is an approximate acceleration path rather than bit-exact inference.
 
 ## Per-model settings
@@ -58,11 +61,18 @@ stopping at 60 dual MLPs. Extensions predating procedure banks retain the
 compiled fixed-shape banks and should be benchmarked before use.
 
 The macOS app exposes the same controls under **Models → model settings →
-Advanced → Experimental → Qwen ANE Prefill** for detected Qwen3.5/3.6
+Advanced → Experimental → Qwen ANE Prefill** for detected Qwen3.5/3.6/3.8
 models. Enabling or changing a control reloads a resident model when the
 working profile is applied. The editor starts from the measured 2,048-token,
 53% MLP / 50% GDN, dual-ANE, 64/48-layer configuration above; the feature
 itself stays off until explicitly enabled.
+
+When the feature is active, oMLX aligns the scheduler's prompt chunk size with
+the configured fixed ANE shape. This also overrides the wider Qwen prefill
+floor used on high-memory systems. A 4,096-token ANE shape is supported, but a
+4K benchmark request prefills only 4,095 tokens because the final token is
+reserved for generation kickoff. The default remains 2,048 so 4K prompts still
+route one full chunk through ANE.
 
 The throughput-benchmark screen also offers a **Full · 2,048** warm-up. The
 scheduler reserves the last prompt token for the first decode step, so this
@@ -96,6 +106,28 @@ The combined GPU suffix is retained alongside the original gate/up tensors so
 decode and every fallback remain unchanged. The dual path also owns two input
 and two output surfaces per accelerated layer. This deliberately spends memory
 to avoid per-request weight preparation and to keep both ANEs ready.
+
+## Qwen3.8-27B-oQ4e validation
+
+The group-size-64 and mixed q4/q5 path was validated on an M3 Ultra with
+`Qwen3.8-27B-oQ4e-mtp`, a 128-token generation tail, and a 2,048-token ANE
+prompt block. The 4K row is a matched current-revision recheck. Its gain ranged
+from 1.7% to 3.4% across matched fixed prompts because only one 2,048-token ANE
+chunk runs before the 2,047-token GPU tail. The 16K and 32K GPU baselines are
+the mean of two deterministic runs; their ANE/GPU values are single
+scheduler-aligned rechecks.
+
+| Prompt | GPU PP | ANE/GPU PP | PP change | TTFT change | End-to-end change |
+|---:|---:|---:|---:|---:|---:|
+| 4K | 445.2 tok/s | 460.4 tok/s | +3.4% | -3.3% | -2.3% |
+| 16K | 439.1 tok/s | 517.0 tok/s | +17.8% | -15.1% | -13.6% |
+| 32K | 408.9 tok/s | 486.0 tok/s | +18.9% | -15.9% | -15.0% |
+
+The 16K and 32K output hashes matched the GPU path exactly. The 4K output was
+stable across ANE rechecks but differed from GPU, which is consistent with the
+approximate INT8 ANE prefix. Peak memory increased by about 4.15 GB, and eager
+load time increased from 3.35 to about 27-29 seconds on the test system.
+Token-generation throughput was unchanged because decode remains on the GPU.
 
 ## M3 Ultra reference result
 

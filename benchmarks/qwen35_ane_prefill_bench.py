@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark Qwen3.5 GPU, single-ANE, and dual-ANE prefill paths."""
+"""Benchmark Qwen3.5-family GPU, single-ANE, and dual-ANE prefill paths."""
 
 from __future__ import annotations
 

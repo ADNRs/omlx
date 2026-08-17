@@ -948,6 +948,7 @@ class TestExperimentalFeatureDetection:
             turboquant_kv_enabled=True,
             mtp_enabled=True,
             vlm_mtp_enabled=True,
+            qwen35_ane_prefill_enabled=True,
         )
 
         assert _detect_experimental_features(settings) == [
@@ -956,6 +957,7 @@ class TestExperimentalFeatureDetection:
             "turboquant",
             "mtp",
             "vlm_mtp",
+            "qwen35_ane_prefill",
         ]
 
     def test_missing_flags_are_treated_as_disabled(self):
@@ -980,6 +982,12 @@ class TestDeriveFeatureFlags:
         settings = SimpleNamespace(turboquant_kv_enabled=True, turboquant_kv_bits=4)
         assert _derive_feature_flags(settings) == [
             {"key": "turboquant_kv_4bit", "label": "TurboQuant KV 4-bit"}
+        ]
+
+    def test_qwen_ane_prefill_is_reported_as_acceleration(self):
+        settings = SimpleNamespace(qwen35_ane_prefill_enabled=True)
+        assert _derive_feature_flags(settings) == [
+            {"key": "qwen35_ane_prefill", "label": "Qwen ANE Prefill"}
         ]
 
     def test_fractional_bit_width_stays_key_safe(self):
@@ -1026,12 +1034,28 @@ class TestFilterUploadedSettings:
                 mtp_num_draft_tokens=3,
                 index_cache_freq=4,
                 guided_grammar_enabled=True,
+                qwen35_ane_prefill_enabled=True,
+                qwen35_ane_prefill_sequence_length=2048,
+                qwen35_ane_prefill_fraction=0.53,
+                qwen35_ane_prefill_max_layers=64,
+                qwen35_ane_prefill_dual_ane=True,
+                qwen35_ane_prefill_gdn=True,
+                qwen35_ane_prefill_gdn_fraction=0.5,
+                qwen35_ane_prefill_gdn_max_layers=48,
             )
         )
         assert out["turboquant_kv_bits"] == 4
         assert out["mtp_num_draft_tokens"] == 3
         assert out["index_cache_freq"] == 4
         assert out["guided_grammar_enabled"] is True
+        assert out["qwen35_ane_prefill_enabled"] is True
+        assert out["qwen35_ane_prefill_sequence_length"] == 2048
+        assert out["qwen35_ane_prefill_fraction"] == 0.53
+        assert out["qwen35_ane_prefill_max_layers"] == 64
+        assert out["qwen35_ane_prefill_dual_ane"] is True
+        assert out["qwen35_ane_prefill_gdn"] is True
+        assert out["qwen35_ane_prefill_gdn_fraction"] == 0.5
+        assert out["qwen35_ane_prefill_gdn_max_layers"] == 48
 
     def test_free_text_and_organization_fields_are_dropped(self):
         out = _filter_uploaded_settings(
@@ -1107,6 +1131,7 @@ class TestFilterUploadedSettings:
             "turboquant_kv_enabled": True,
             "mtp_enabled": True,
             "vlm_mtp_enabled": False,
+            "qwen35_ane_prefill_enabled": False,
         }
         # Everything else is gone.
         assert "temperature" not in out

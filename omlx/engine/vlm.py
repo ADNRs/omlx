@@ -1874,16 +1874,23 @@ class VLMBatchedEngine(BaseEngine):
 
         if getattr(self._model_settings, "qwen35_ane_prefill_enabled", False):
             try:
-                from ..patches.qwen35_ane_prefill import enable_qwen35_ane_prefill
+                from ..patches.qwen35_ane_prefill import (
+                    configure_qwen35_ane_prefill_scheduler,
+                    enable_qwen35_ane_prefill,
+                )
+
+                requested_ane_sequence_length = int(
+                    getattr(
+                        self._model_settings,
+                        "qwen35_ane_prefill_sequence_length",
+                        2048,
+                    )
+                )
 
                 def _enable_ane_prefill():
                     return enable_qwen35_ane_prefill(
                         self._vlm_model,
-                        sequence_length=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_sequence_length",
-                            2048,
-                        ),
+                        sequence_length=requested_ane_sequence_length,
                         fraction=getattr(
                             self._model_settings,
                             "qwen35_ane_prefill_fraction",
@@ -1916,10 +1923,17 @@ class VLMBatchedEngine(BaseEngine):
                         ),
                     )
 
-                await loop.run_in_executor(
+                ane_count = await loop.run_in_executor(
                     get_mlx_executor(),
                     _enable_ane_prefill,
                 )
+                if ane_count or getattr(
+                    self._vlm_model, "_omlx_ane_gdn_prefill_count", 0
+                ):
+                    configure_qwen35_ane_prefill_scheduler(
+                        scheduler,
+                        requested_ane_sequence_length,
+                    )
             except Exception:
                 logger.warning("Qwen ANE prefill not enabled", exc_info=True)
 

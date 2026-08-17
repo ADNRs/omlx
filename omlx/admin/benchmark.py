@@ -236,6 +236,12 @@ _FEATURE_FLAG_SPECS = (
     ),
     _FeatureFlagSpec("mtp_enabled", "mtp", "lightning_mtp", "Lightning MTP"),
     _FeatureFlagSpec("vlm_mtp_enabled", "vlm_mtp", "vlm_mtp", "VLM MTP"),
+    _FeatureFlagSpec(
+        "qwen35_ane_prefill_enabled",
+        "qwen35_ane_prefill",
+        "qwen35_ane_prefill",
+        "Qwen ANE Prefill",
+    ),
 )
 
 
@@ -346,6 +352,14 @@ _UPLOADED_SETTING_FIELDS = (
     "vlm_mtp_enabled",
     "vlm_mtp_draft_model",
     "vlm_mtp_draft_block_size",
+    "qwen35_ane_prefill_enabled",
+    "qwen35_ane_prefill_sequence_length",
+    "qwen35_ane_prefill_fraction",
+    "qwen35_ane_prefill_max_layers",
+    "qwen35_ane_prefill_dual_ane",
+    "qwen35_ane_prefill_gdn",
+    "qwen35_ane_prefill_gdn_fraction",
+    "qwen35_ane_prefill_gdn_max_layers",
 )
 
 _PATH_VALUED_SETTING_FIELDS = frozenset(

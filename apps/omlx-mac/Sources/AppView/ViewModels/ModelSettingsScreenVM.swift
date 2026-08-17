@@ -274,7 +274,7 @@ final class ModelSettingsScreenVM {
     var turboquantKvEnabled: Bool = false
     var turboquantKvBits: String = "4"
 
-    // Experimental: private Qwen3.5/3.6 ANE/GPU fixed-shape prefill.
+    // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill.
     // These defaults are the measured M3 Ultra optimum for the 2,048-token
     // benchmark path. The feature itself remains opt-in.
     var qwen35AnePrefillEnabled: Bool = false
@@ -803,7 +803,9 @@ final class ModelSettingsScreenVM {
     var isQwen35AnePrefillModel: Bool {
         guard let rawType = model?.configModelType else { return false }
         let type = rawType.lowercased().replacingOccurrences(of: "-", with: "_")
-        return type.hasPrefix("qwen3_5") || type.hasPrefix("qwen3_6")
+        return type.hasPrefix("qwen3_5")
+            || type.hasPrefix("qwen3_6")
+            || type.hasPrefix("qwen3_8")
     }
 
     /// MTP can't co-exist with DFlash or TurboQuant KV. The toggle uses
