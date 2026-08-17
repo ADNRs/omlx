@@ -112,7 +112,7 @@ class BatchedEngine(BaseEngine):
     @property
     def model_type(self) -> str | None:
         """Get the model type from config (e.g., 'gpt_oss', 'llama', 'qwen2')."""
-        if self._model is None:
+        if getattr(self, "_model", None) is None:
             return None
         # Try different ways to access model_type
         try:
