@@ -312,6 +312,18 @@ class BatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("Qwen MoE gate+up fusion not applied", exc_info=True)
 
+        # Qwen MoE decode router: fuse the top-k select + renormalize chain
+        # into one launch (the composed argpartition chain is ~2 ms/token on
+        # the 256-expert 35B-A3B).
+        try:
+            from ..patches.qwen35_moe_router import (
+                apply_qwen35_moe_router_patch,
+            )
+
+            apply_qwen35_moe_router_patch()
+        except Exception:
+            logger.debug("Qwen MoE router patch not applied", exc_info=True)
+
         # TurboQuant KV cache: patch attention and set kv_bits on scheduler
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
