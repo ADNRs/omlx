@@ -739,22 +739,22 @@
                                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_prompt_block') }}</label>
                                                     <select x-model.number="modelSettings.qwen35_ane_prefill_sequence_length"
                                                             class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                                        <option :value="1024">1,024 tokens</option>
-                                                        <option :value="2048">2,048 tokens — measured</option>
-                                                        <option :value="4096">4,096 tokens</option>
-                                                        <option :value="8192">8,192 tokens</option>
+                                                        <option value="1024">1,024 tokens</option>
+                                                        <option value="2048" selected>2,048 tokens — measured</option>
+                                                        <option value="4096">4,096 tokens</option>
+                                                        <option value="8192">8,192 tokens</option>
                                                     </select>
                                                 </div>
                                                 <div>
                                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_mlp_fraction') }}</label>
                                                     <select x-model.number="modelSettings.qwen35_ane_prefill_fraction"
                                                             class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                                        <option :value="0.4">40%</option>
-                                                        <option :value="0.45">45%</option>
-                                                        <option :value="0.5">50%</option>
-                                                        <option :value="0.53">53% — {{ t('modal.model_settings.qwen_ane_measured') }}</option>
-                                                        <option :value="0.55">55%</option>
-                                                        <option :value="0.6">60%</option>
+                                                        <option value="0.4">40%</option>
+                                                        <option value="0.45">45%</option>
+                                                        <option value="0.5">50%</option>
+                                                        <option value="0.53" selected>53% — {{ t('modal.model_settings.qwen_ane_measured') }}</option>
+                                                        <option value="0.55">55%</option>
+                                                        <option value="0.6">60%</option>
                                                     </select>
                                                 </div>
                                                 <div>
@@ -798,12 +798,12 @@
                                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_gdn_fraction') }}</label>
                                                     <select x-model.number="modelSettings.qwen35_ane_prefill_gdn_fraction"
                                                             class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                                        <option :value="0.4">40%</option>
-                                                        <option :value="0.45">45%</option>
-                                                        <option :value="0.5">50% — {{ t('modal.model_settings.qwen_ane_measured') }}</option>
-                                                        <option :value="0.53">53%</option>
-                                                        <option :value="0.55">55%</option>
-                                                        <option :value="0.6">60%</option>
+                                                        <option value="0.4">40%</option>
+                                                        <option value="0.45">45%</option>
+                                                        <option value="0.5" selected>50% — {{ t('modal.model_settings.qwen_ane_measured') }}</option>
+                                                        <option value="0.53">53%</option>
+                                                        <option value="0.55">55%</option>
+                                                        <option value="0.6">60%</option>
                                                     </select>
                                                 </div>
                                                 <div>

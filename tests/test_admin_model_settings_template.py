@@ -167,8 +167,23 @@ def test_qwen_ane_model_specific_controls_are_fully_wired():
 
     assert 'x-model.number="modelSettings.qwen35_ane_prefill_fraction"' in html
     assert 'x-model.number="modelSettings.qwen35_ane_prefill_gdn_fraction"' in html
-    assert '<option :value="0.53">53% —' in html
-    assert '<option :value="0.5">50% —' in html
+    assert '<option value="0.53" selected>53% —' in html
+    assert '<option value="0.5" selected>50% —' in html
+
+
+def test_qwen_ane_selects_have_static_values_and_measured_defaults():
+    """Alpine initializes the select before dynamic child bindings."""
+    html = _model_settings_template()
+    section = _section(
+        html,
+        "<!-- Qwen 3.5/3.6/3.8 private ANE/GPU prompt processing -->",
+        "<!-- TurboQuant KV Cache -->",
+    )
+
+    assert '<option value="2048" selected>' in section
+    assert '<option value="0.53" selected>' in section
+    assert '<option value="0.5" selected>' in section
+    assert "<option :value=" not in section
 
 
 def test_qwen_ane_web_defaults_match_measured_profile():
