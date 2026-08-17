@@ -25,6 +25,7 @@ from omlx.admin.benchmark import (
     _run_batch_test,
     _run_single_test,
     _upload_model_name,
+    _upload_model_repo,
     cleanup_old_runs,
     create_run,
     get_run,
@@ -1203,39 +1204,42 @@ class TestUploadModelName:
     def test_truncates_to_the_leaderboard_limit(self):
         assert len(_upload_model_name("x" * 300)) == 150
 
-    def test_org_prefix_from_two_level_layout(self):
-        # Organized layout: the org directory qualifies the name, matching
+    def test_org_repo_from_two_level_layout(self):
+        # Organized layout: the org directory qualifies the repo id, matching
         # what the local models UI shows (#1808).
         entry = MagicMock(spec=["model_path", "source_repo_id"])
         entry.model_path = "/models/mlx-community/Qwen3-30B-A3B-4bit"
         entry.source_repo_id = None
         assert (
-            _upload_model_name(
+            _upload_model_repo(
                 "Qwen3-30B-A3B-4bit", entry=entry, model_dirs=[Path("/models")]
             )
             == "mlx-community/Qwen3-30B-A3B-4bit"
         )
 
-    def test_flat_layout_stays_leaf_only(self):
+    def test_flat_layout_has_no_repo(self):
         # Flat layout: the parent is the scan root, never treated as an org.
         entry = MagicMock(spec=["model_path", "source_repo_id"])
         entry.model_path = "/models/Qwen3-30B-A3B-4bit"
         entry.source_repo_id = None
         assert (
-            _upload_model_name(
+            _upload_model_repo(
                 "Qwen3-30B-A3B-4bit", entry=entry, model_dirs=[Path("/models")]
             )
-            == "Qwen3-30B-A3B-4bit"
+            is None
         )
 
-    def test_hf_cache_uses_source_repo_id(self):
+    def test_hf_cache_repo_uses_source_repo_id(self):
         entry = MagicMock(spec=["model_path", "source_repo_id"])
         entry.model_path = "/cache/models--mlx-community--Qwen3-4bit/snapshots/ab"
         entry.source_repo_id = "mlx-community/Qwen3-4bit"
         assert (
-            _upload_model_name("mlx-community--Qwen3-4bit", entry=entry, model_dirs=[])
+            _upload_model_repo("mlx-community--Qwen3-4bit", entry=entry, model_dirs=[])
             == "mlx-community/Qwen3-4bit"
         )
+
+    def test_repo_none_without_entry(self):
+        assert _upload_model_repo("Qwen3-30B-A3B") is None
 
 
 class TestUploadToOmlxAi:

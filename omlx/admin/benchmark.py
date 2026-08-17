@@ -1034,35 +1034,43 @@ def _detect_quantization(model_path: str) -> str:
     return "unknown"
 
 
-def _upload_model_name(
-    model_id: str, entry: Any = None, model_dirs: Any = None
-) -> str:
-    """Model name to publish: the org-qualified name oMLX itself displays.
+def _upload_model_name(model_id: str) -> str:
+    """Model name to publish: exactly what oMLX shows and its copy button copies.
 
-    Uses the same derivation as the models UI (HF repo id, then the org/leaf
-    relative path under a configured model dir) so two releases sharing a
-    leaf directory name stay distinguishable on the leaderboard (#1808).
-    Falls back to the trailing path component when no context is available.
+    Quantization and MLX suffixes used to be stripped here, which lost the one
+    detail that distinguishes two builds of the same model on the leaderboard.
+    The trailing path component is taken defensively — discovery registers ids
+    as a single path component today, so this is a no-op for local runs.
     """
-    name = None
-    if entry is not None:
-        try:
-            derived = model_display_name(
-                model_id,
-                getattr(entry, "model_path", None),
-                list(model_dirs or []),
-                source_repo_id=getattr(entry, "source_repo_id", None),
-            )
-            # Echoing the model id back means nothing was derived; fall
-            # through to the leaf split so slash-bearing ids keep their
-            # historical shape.
-            if isinstance(derived, str) and derived and derived != model_id:
-                name = derived
-        except Exception as e:  # noqa: BLE001
-            logger.debug(f"Benchmark: display-name derivation failed: {e}")
-    if not name:
-        name = model_id.rstrip("/").split("/")[-1]
+    name = model_id.rstrip("/").split("/")[-1]
     return name[:_MAX_MODEL_NAME_LEN]
+
+
+def _upload_model_repo(
+    model_id: str, entry: Any = None, model_dirs: Any = None
+) -> Optional[str]:
+    """Org-qualified repo id to publish alongside the model name (#1808).
+
+    Uses the same derivation as the models UI display name: the HF repo id
+    when known, otherwise the org/leaf relative path under a configured
+    model dir. Returns None when nothing beyond the bare model id can be
+    derived (flat layouts), so the site simply shows no repo for those rows.
+    """
+    if entry is None:
+        return None
+    try:
+        derived = model_display_name(
+            model_id,
+            getattr(entry, "model_path", None),
+            list(model_dirs or []),
+            source_repo_id=getattr(entry, "source_repo_id", None),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"Benchmark: repo derivation failed: {e}")
+        return None
+    if not isinstance(derived, str) or derived == model_id or "/" not in derived:
+        return None
+    return derived[:_MAX_MODEL_NAME_LEN]
 
 
 def _sanitize_upload_error(resp: Any) -> str:
@@ -1177,11 +1185,7 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
     entry = engine_pool.get_entry(run.request.model_id)
     model_path = entry.model_path if entry else ""
     quantization = _detect_quantization(model_path)
-    model_name = _upload_model_name(
-        run.request.model_id,
-        entry=entry,
-        model_dirs=getattr(engine_pool, "_model_dirs", None),
-    )
+    model_name = _upload_model_name(run.request.model_id)
 
     # Generate submission group
     submission_group = str(uuid.uuid4())
