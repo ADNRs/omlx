@@ -87,6 +87,96 @@ def _bind_generation_thread_stream(
         response_generator_type._generate = original_generate
 
 
+def _think_token_ids(tokenizer: Any) -> tuple[list[int], int | None]:
+    """Resolve the close-think token ID(s) and open-think token ID from mlx-lm.
+
+    The single-machine scheduler reads these off the tokenizer and feeds them
+    into ``ThinkingBudgetProcessor``. The rank has the same tokenizer, so it
+    can resolve them the same way (scheduler.py ``_get_think_token_id`` /
+    ``_resolve_think_end_token_ids`` / ``_encode_thinking_marker``).
+    """
+    think_end_ids: list[int] | None = None
+
+    def _encode(text: str) -> list[int] | None:
+        try:
+            ids = tokenizer.encode(text, add_special_tokens=False)
+        except TypeError:
+            try:
+                ids = tokenizer.encode(text)
+            except Exception:
+                return None
+        except Exception:
+            return None
+        if ids:
+            return [i for i in ids if isinstance(i, int)]
+        return None
+
+    try:
+        end_id = getattr(tokenizer, "think_end_id", None)
+        if end_id is not None:
+            think_end_ids = [end_id]
+    except (ValueError, TypeError):
+        pass
+    if think_end_ids is None:
+        think_end_str = getattr(tokenizer, "think_end", None) or "</think>"
+        think_end_ids = _encode(think_end_str)
+    if think_end_ids is None:
+        try:
+            tid = tokenizer.convert_tokens_to_ids("</think>")
+            if isinstance(tid, int) and tid != getattr(tokenizer, "unk_token_id", None):
+                think_end_ids = [tid]
+        except (AttributeError, KeyError, TypeError):
+            pass
+    try:
+        think_start_id = getattr(tokenizer, "think_start_id", None)
+    except (ValueError, TypeError):
+        think_start_id = None
+    return think_end_ids or [], think_start_id
+
+
+@contextmanager
+def _install_thinking_budget_support(mlx_server: Any, tokenizer: Any):
+    """Make the rank honor a per-request ``thinking_budget``.
+
+    MLX-LM's server builds its logits processors once from CLI args
+    (``_make_logits_processors``) and never looks at the request body, so a
+    thinking budget forwarded by the coordinator is silently ignored. Wrap that
+    factory so a request carrying ``chat_template_kwargs.thinking_budget`` gets
+    an ``omlx`` ``ThinkingBudgetProcessor`` appended, enforcing the budget in
+    the rank's decode loop exactly like single-machine inference does.
+    """
+    from omlx.api.thinking import ThinkingBudgetProcessor
+
+    think_end_ids, think_start_id = _think_token_ids(tokenizer)
+    if not think_end_ids:
+        yield
+        return
+
+    original = mlx_server._make_logits_processors
+
+    @wraps(original)
+    def with_thinking_budget(args: Any) -> list[Any]:
+        processors = original(args)
+        kwargs = getattr(args, "chat_template_kwargs", None) or {}
+        budget = kwargs.get("thinking_budget")
+        if budget is not None:
+            processors = list(processors)
+            processors.append(
+                ThinkingBudgetProcessor(
+                    think_end_token_ids=think_end_ids,
+                    budget=budget,
+                    think_start_token_id=think_start_id,
+                )
+            )
+        return processors
+
+    mlx_server._make_logits_processors = with_thinking_budget
+    try:
+        yield
+    finally:
+        mlx_server._make_logits_processors = original
+
+
 class RuntimeMarker:
     """Best-effort status shared with the oMLX GUI running on this Mac."""
 
@@ -1028,6 +1118,10 @@ def run_worker(args: argparse.Namespace) -> int:
                         ResponseGenerator,
                         mx,
                         generation_stream,
+                    ),
+                    _install_thinking_budget_support(
+                        mlx_server,
+                        provider.tokenizer,
                     ),
                 ):
                     # install_server_telemetry also runs the idle heartbeat for
