@@ -1203,7 +1203,15 @@ def test_install_thinking_budget_support_appends_processor_per_request():
 
     calls = []
 
+    class FakeResponseGenerator:
+        def _tokenize(self, tokenizer, request, args):
+            prompt = getattr(request, "prompt_ids", [54])
+            initial_state = getattr(request, "initial_state", "reasoning")
+            return prompt, [prompt], ["assistant"], initial_state
+
     class FakeServer:
+        ResponseGenerator = FakeResponseGenerator
+
         @staticmethod
         def _make_logits_processors(args):
             calls.append(args)
@@ -1211,20 +1219,76 @@ def test_install_thinking_budget_support_appends_processor_per_request():
 
     server = FakeServer()
     with inference_worker._install_thinking_budget_support(server, _ThinkTokenizer()):
+        generator = server.ResponseGenerator()
         args = SimpleNamespace(chat_template_kwargs={"thinking_budget": 2048})
+        generator._tokenize(
+            _ThinkTokenizer(),
+            SimpleNamespace(request_type="chat", initial_state="reasoning"),
+            args,
+        )
         processors = server._make_logits_processors(args)
         assert len(processors) == 2
         assert isinstance(processors[1], ThinkingBudgetProcessor)
         assert processors[1]._budget == 2048
         assert processors[1]._think_end_ids == [55]
 
-    # No budget: only the base processors.
-    assert server._make_logits_processors(
-        SimpleNamespace(chat_template_kwargs={})
-    ) == ["base-processor"]
+        disabled = SimpleNamespace(
+            chat_template_kwargs={"thinking_budget": 2048, "enable_thinking": False}
+        )
+        generator._tokenize(
+            _ThinkTokenizer(),
+            SimpleNamespace(request_type="chat", initial_state="reasoning"),
+            disabled,
+        )
+        assert server._make_logits_processors(disabled) == ["base-processor"]
+
+        inactive = SimpleNamespace(chat_template_kwargs={"thinking_budget": 2048})
+        generator._tokenize(
+            _ThinkTokenizer(),
+            SimpleNamespace(request_type="chat", initial_state="normal"),
+            inactive,
+        )
+        assert server._make_logits_processors(inactive) == ["base-processor"]
+
+        text_completion = SimpleNamespace(
+            chat_template_kwargs={"thinking_budget": 2048}
+        )
+        generator._tokenize(
+            _ThinkTokenizer(),
+            SimpleNamespace(
+                request_type="text",
+                prompt="<think>",
+                prompt_ids=[54],
+                initial_state="normal",
+            ),
+            text_completion,
+        )
+        assert len(server._make_logits_processors(text_completion)) == 2
 
     # The original factory is restored after the context exits.
-    assert calls and server._make_logits_processors is FakeServer._make_logits_processors
+    assert (
+        calls and server._make_logits_processors is FakeServer._make_logits_processors
+    )
+    assert server.ResponseGenerator._tokenize is FakeResponseGenerator._tokenize
+
+
+def test_thinking_close_pattern_and_utf8_piece_match_scheduler_rules():
+    class Tokenizer:
+        chat_template = r"{{ '\n</think>\n\n' }}"
+
+        def encode(self, text, add_special_tokens=False):
+            return {"\n": [10], "\n\n": [11, 12]}[text]
+
+        def convert_ids_to_tokens(self, token_id):
+            return {1: "<0xE3>", 2: "ordinary"}[token_id]
+
+    tokenizer = Tokenizer()
+    leading, trailing = inference_worker._thinking_close_pattern(tokenizer, "</think>")
+
+    assert leading == [10]
+    assert trailing == [11, 12]
+    assert inference_worker._thinking_budget_token_to_piece(tokenizer, 1) == b"\xe3"
+    assert inference_worker._thinking_budget_token_to_piece(tokenizer, 2) == "ordinary"
 
 
 def test_install_thinking_budget_support_is_noop_without_think_tokens():

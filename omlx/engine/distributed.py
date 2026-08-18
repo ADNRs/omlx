@@ -185,7 +185,6 @@ class DistributedBatchedEngine(BatchedEngine):
                 "mtp_enabled",
                 "vlm_mtp_enabled",
                 "turboquant_kv_enabled",
-                "thinking_budget_enabled",
             )
             if bool(getattr(settings, name, False))
         ]

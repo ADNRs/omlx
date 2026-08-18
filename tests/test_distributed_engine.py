@@ -251,6 +251,15 @@ def test_completion_payload_folds_thinking_budget_into_chat_template_kwargs():
     assert payload["chat_template_kwargs"] == {"thinking_budget": 512}
 
 
+def test_model_thinking_budget_is_supported_by_distributed_engine():
+    engine = DistributedBatchedEngine(
+        _deployment(),
+        model_settings=SimpleNamespace(thinking_budget_enabled=True),
+    )
+
+    engine._validate_model_settings()
+
+
 @pytest.mark.asyncio
 async def test_distributed_generate_translates_backend_completion():
     def handler(request):
