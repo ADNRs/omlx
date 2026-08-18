@@ -435,6 +435,40 @@ process.stdout.write(JSON.stringify(component.clusterPlanNodes));
     assert result[1]["reserve_gib"] == 0
 
 
+def test_local_role_defaults_to_workstation_and_preserves_headless_selection():
+    result = _run_dashboard_helpers(
+        ("clusterNodeId", "syncClusterNodesFromPeers"),
+        """
+component.clusterStatus = { node: {
+  hostname: 'local',
+  admission_ceiling_bytes: 1000,
+} };
+component.clusterPlanNodes = [
+  { key: 1, node_id: 'local', ssh: '127.0.0.1' },
+];
+component.clusterDeployments = [];
+component.clusterPeerProbes = {};
+component.clusterWorkerPeers = () => [];
+component.normalizeClusterTensorParallelSize = () => {};
+component.invalidateClusterPlan = () => {};
+component._clusterNodeKey = 1;
+component.syncClusterNodesFromPeers();
+const defaultRole = component.clusterPlanNodes[0].role;
+component.clusterPlanNodes[0].role = 'headless';
+component.syncClusterNodesFromPeers();
+process.stdout.write(JSON.stringify({
+  defaultRole,
+  selectedRole: component.clusterPlanNodes[0].role,
+}));
+""",
+    )
+
+    assert result == {
+        "defaultRole": "workstation",
+        "selectedRole": "headless",
+    }
+
+
 def test_same_named_peer_does_not_inherit_another_macs_capacity():
     result = _run_dashboard_helpers(
         ("clusterNodeId", "syncClusterNodesFromPeers"),
