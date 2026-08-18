@@ -1379,14 +1379,8 @@ _PREFLIGHT_SCRIPT = (
     "install_torch_stub()\n"
     "import mlx_lm.server\n"
     "import omlx.adapter.output_parser\n"
-    # Same source of truth as the coordinator's ``_package_version`` (#2705):
-    # oMLX's version is the source constant. The ImportError guard matters more
-    # here than on the coordinator — this runs on a peer that may predate
-    # omlx._version (0.1.2), and an escaping exception would fail the whole
-    # preflight with a traceback instead of a readable version mismatch.
-    # The ImportError guard matters more here than on the coordinator: this
-    # runs on a peer that may predate omlx._version, and an escaping exception
-    # fails the whole preflight with a traceback instead of a version mismatch.
+    # Use the coordinator's source of truth, but tolerate peers that predate
+    # omlx._version so preflight can report a readable version mismatch.
     "def package_version(name):\n"
     "    if name == 'omlx':\n"
     "        try:\n"

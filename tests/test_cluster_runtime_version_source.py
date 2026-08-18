@@ -16,9 +16,9 @@ import importlib.metadata
 
 import pytest
 
-from omlx._version import __version__ as SOURCE_VERSION
+from omlx._version import __version__ as source_version
 from omlx.cluster import launch
-from omlx.cluster.probe import __version__ as PROBE_VERSION
+from omlx.cluster.probe import __version__ as probe_version
 
 
 @pytest.fixture
@@ -26,7 +26,7 @@ def stale_metadata(monkeypatch):
     """Pretend the installed dist-info was built at a different version."""
 
     stale = "0.0.1.dev999"
-    assert stale != SOURCE_VERSION
+    assert stale != source_version
 
     def fake_version(name: str) -> str:
         if name == "omlx":
@@ -39,17 +39,17 @@ def stale_metadata(monkeypatch):
 
 def test_the_peer_reports_the_source_version():
     # probe.py is the peer side; it has always read the source tree.
-    assert PROBE_VERSION == SOURCE_VERSION
+    assert probe_version == source_version
 
 
 def test_coordinator_reads_omlx_from_the_source_not_stale_metadata(stale_metadata):
-    assert launch._package_version("omlx") == SOURCE_VERSION
+    assert launch._package_version("omlx") == source_version
     assert launch._package_version("omlx") != stale_metadata
 
 
 def test_coordinator_and_peer_agree_when_dist_info_has_drifted(stale_metadata):
     # The whole point: identical nodes must not read as a version mismatch.
-    assert launch._local_runtime_versions()["omlx"] == PROBE_VERSION
+    assert launch._local_runtime_versions()["omlx"] == probe_version
 
 
 def test_third_party_packages_still_come_from_metadata(stale_metadata):
@@ -71,7 +71,7 @@ def test_omlx_version_survives_a_source_checkout_with_no_dist_info(monkeypatch):
         raise importlib.metadata.PackageNotFoundError(name)
 
     monkeypatch.setattr(importlib.metadata, "version", raise_missing)
-    assert launch._package_version("omlx") == SOURCE_VERSION
+    assert launch._package_version("omlx") == source_version
 
 
 def _preflight_package_version():
@@ -102,7 +102,7 @@ def _preflight_package_version():
 def test_remote_preflight_script_reads_omlx_from_the_source_too():
     package_version = _preflight_package_version()
 
-    assert package_version("omlx") == SOURCE_VERSION
+    assert package_version("omlx") == source_version
     assert package_version("mlx") == "9.9.9"
 
 
@@ -111,7 +111,7 @@ def test_remote_preflight_agrees_with_the_coordinator(stale_metadata):
     # Asserting the shared value too: agreeing on the stale number would
     # satisfy an equality-only check while leaving the bug in place.
     agreed = _preflight_package_version()("omlx")
-    assert agreed == launch._package_version("omlx") == SOURCE_VERSION
+    assert agreed == launch._package_version("omlx") == source_version
 
 
 def test_the_whole_preflight_script_is_valid_python():
