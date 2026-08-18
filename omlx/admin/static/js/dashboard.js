@@ -2029,7 +2029,6 @@
                     if (recommended) this.selectClusterModel(recommended);
                 }
                 this.normalizeClusterTensorParallelSize();
-                await this.previewClusterWeightBalance();
             },
 
             // 2-second "Copied!" affordance on the exchange token, matching
