@@ -3430,10 +3430,27 @@
                         busy: true,
                     };
                 }
-                if (this.clusterPeerProbe.runtime_compatible !== true) {
+                // Strictly false, not merely not-true: a payload that predates
+                // the runtime fields carries no verdict, and rendering it red
+                // would invent a measurement nobody took.
+                if (this.clusterPeerProbe.runtime_compatible === false) {
                     const mismatches = Array.isArray(
                         this.clusterPeerProbe.runtime_mismatches
                     ) ? this.clusterPeerProbe.runtime_mismatches.filter(Boolean) : [];
+                    // bootstrap_required means oMLX is absent or unverifiable on
+                    // that Mac, not that two runtimes disagree. The two need
+                    // different actions, so they must not share a headline.
+                    if (this.clusterPeerProbe.bootstrap_required) {
+                        return {
+                            key: 'bootstrap',
+                            label: 'Worker needs oMLX',
+                            detail: this.clusterConnectionError
+                                || mismatches[0]
+                                || 'This worker is reachable but is not running oMLX yet.',
+                            tone: 'amber',
+                            busy: false,
+                        };
+                    }
                     return {
                         key: 'runtime-mismatch',
                         label: 'Worker runtime mismatch',
