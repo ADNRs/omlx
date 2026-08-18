@@ -170,9 +170,15 @@ def _available_launch_ports(
 
 def _package_version(name: str) -> str:
     if name == "omlx":
-        from omlx._version import __version__
+        try:
+            from omlx._version import __version__
 
-        return __version__
+            return __version__
+        except ImportError:
+            # omlx._version arrived in 0.1.2. A peer older than that must still
+            # produce a legible "omlx local=X remote=Y" mismatch rather than
+            # fail the probe outright, so fall through to metadata.
+            pass
     try:
         return importlib.metadata.version(name)
     except importlib.metadata.PackageNotFoundError:
@@ -1373,10 +1379,21 @@ _PREFLIGHT_SCRIPT = (
     "install_torch_stub()\n"
     "import mlx_lm.server\n"
     "import omlx.adapter.output_parser\n"
+    # Same source of truth as the coordinator's ``_package_version`` (#2705):
+    # oMLX's version is the source constant. The ImportError guard matters more
+    # here than on the coordinator — this runs on a peer that may predate
+    # omlx._version (0.1.2), and an escaping exception would fail the whole
+    # preflight with a traceback instead of a readable version mismatch.
+    # The ImportError guard matters more here than on the coordinator: this
+    # runs on a peer that may predate omlx._version, and an escaping exception
+    # fails the whole preflight with a traceback instead of a version mismatch.
     "def package_version(name):\n"
     "    if name == 'omlx':\n"
-    "        from omlx._version import __version__\n"
-    "        return __version__\n"
+    "        try:\n"
+    "            from omlx._version import __version__\n"
+    "            return __version__\n"
+    "        except ImportError:\n"
+    "            pass\n"
     "    try:\n"
     "        return m.version(name)\n"
     "    except m.PackageNotFoundError:\n"
