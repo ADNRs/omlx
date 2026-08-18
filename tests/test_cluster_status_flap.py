@@ -161,18 +161,25 @@ def test_a_worker_without_omlx_is_not_reported_as_a_version_mismatch(statuses):
 
     assert bootstrap["key"] == "bootstrap"
     assert bootstrap["key"] != statuses["mismatched"]["key"]
+    assert bootstrap["label"] == "Worker runtime setup needed"
     assert "not match" not in bootstrap["label"]
     assert "not installed" in bootstrap["detail"]
     assert bootstrap["busy"] is False
 
 
 def test_a_probe_with_no_runtime_verdict_is_not_called_incompatible(statuses):
-    # An older or partial payload must not be rendered as a red failure.
-    assert statuses["no_verdict"]["key"] not in {"runtime-mismatch", "bootstrap"}
+    # An older or partial payload must stay fail-closed without becoming red.
+    unverified = statuses["no_verdict"]
+
+    assert unverified["key"] == "runtime-unverified"
+    assert unverified["tone"] == "amber"
+    assert unverified["busy"] is False
 
 
 def test_every_status_uses_a_tone_the_stylesheet_maps():
     tones = set(re.findall(r"tone: '(\w+)'", _method_source("clusterQuickStatus")))
-    mapped = set(re.findall(r"^\s+(\w+): 'bg-", _method_source("clusterQuickStatusTone"), re.M))
+    mapped = set(
+        re.findall(r"^\s+(\w+): 'bg-", _method_source("clusterQuickStatusTone"), re.M)
+    )
 
     assert tones <= mapped, f"unmapped tones would fall back to grey: {tones - mapped}"

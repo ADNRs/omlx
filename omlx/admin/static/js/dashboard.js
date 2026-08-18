@@ -3443,10 +3443,10 @@
                     if (this.clusterPeerProbe.bootstrap_required) {
                         return {
                             key: 'bootstrap',
-                            label: 'Worker needs oMLX',
+                            label: 'Worker runtime setup needed',
                             detail: this.clusterConnectionError
                                 || mismatches[0]
-                                || 'This worker is reachable but is not running oMLX yet.',
+                                || 'This worker is reachable, but its oMLX runtime could not be verified.',
                             tone: 'amber',
                             busy: false,
                         };
@@ -3457,6 +3457,15 @@
                         detail: mismatches.join(' · ')
                             || 'The worker runtime differs from this Mac.',
                         tone: 'red',
+                        busy: false,
+                    };
+                }
+                if (this.clusterPeerProbe.runtime_compatible !== true) {
+                    return {
+                        key: 'runtime-unverified',
+                        label: 'Worker runtime not verified',
+                        detail: 'This worker is reachable, but oMLX could not verify its runtime yet.',
+                        tone: 'amber',
                         busy: false,
                     };
                 }
