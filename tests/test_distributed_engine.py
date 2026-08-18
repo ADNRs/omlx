@@ -97,6 +97,49 @@ async def test_private_rank_zero_client_has_finite_inactivity_timeouts():
         await client.aclose()
 
 
+@pytest.mark.asyncio
+async def test_request_read_timeout_defaults_from_env_var(monkeypatch):
+    monkeypatch.setenv("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT", "600")
+    engine = DistributedBatchedEngine(_deployment())
+    client = engine._new_client("http://127.0.0.1:1")
+    try:
+        assert client.timeout.read == 600.0
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_request_read_timeout_env_var_takes_backseat_to_explicit_arg(monkeypatch):
+    monkeypatch.setenv("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT", "600")
+    engine = DistributedBatchedEngine(_deployment(), request_read_timeout=12.5)
+    client = engine._new_client("http://127.0.0.1:1")
+    try:
+        assert client.timeout.read == 12.5
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_request_read_timeout_env_var_rejects_non_numeric(monkeypatch):
+    monkeypatch.setenv("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT", "not-a-number")
+    with pytest.raises(ValueError, match="must be a number"):
+        DistributedBatchedEngine(_deployment())
+
+
+@pytest.mark.asyncio
+async def test_request_read_timeout_rejects_non_finite_and_non_positive(monkeypatch):
+    for bad in ("nan", "inf", "0", "-5"):
+        monkeypatch.setenv("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT", bad)
+        with pytest.raises(ValueError, match="finite positive"):
+            DistributedBatchedEngine(_deployment())
+
+    monkeypatch.delenv("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT")
+    with pytest.raises(ValueError, match="finite positive"):
+        DistributedBatchedEngine(_deployment(), request_read_timeout=float("nan"))
+    with pytest.raises(ValueError, match="finite positive"):
+        DistributedBatchedEngine(_deployment(), request_read_timeout=0.0)
+
+
 def _stalled_engine():
     def handler(request):
         raise httpx.ReadTimeout("collective stalled", request=request)

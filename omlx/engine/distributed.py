@@ -6,6 +6,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import suppress
@@ -45,10 +47,22 @@ class DistributedBatchedEngine(BatchedEngine):
         python_executable: str | None = None,
         cwd: Path | None = None,
         load_timeout: float = 1800.0,
-        request_read_timeout: float = 300.0,
+        request_read_timeout: float | None = None,
     ) -> None:
-        if request_read_timeout <= 0:
-            raise ValueError("distributed request read timeout must be positive")
+        if request_read_timeout is None:
+            raw = os.environ.get("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT", "300.0")
+            try:
+                request_read_timeout = float(raw)
+            except ValueError:
+                raise ValueError(
+                    "OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT must be a number, "
+                    f"got {raw!r}"
+                ) from None
+        if not math.isfinite(request_read_timeout) or request_read_timeout <= 0:
+            raise ValueError(
+                "distributed request read timeout must be a finite positive "
+                f"number, got {request_read_timeout!r}"
+            )
         super().__init__(
             model_name=deployment.model,
             trust_remote_code=deployment.trust_remote_code,
