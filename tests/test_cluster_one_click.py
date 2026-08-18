@@ -1917,6 +1917,45 @@ def test_first_run_adopts_omlx_peers_before_transport_has_been_measured():
     assert "await this.previewClusterWeightBalance()" in source
 
 
+def test_initialization_previews_by_default_but_polling_skips_it():
+    result = _run_dashboard_helpers(
+        ("initializeClusterSetup", "refreshClusterExperience"),
+        """
+const calls = [];
+Object.assign(component, {
+  clusterStatus: null,
+  clusterDiscoveredPeers: [],
+  clusterPeerProbe: null,
+  clusterModelInventory: {},
+  clusterModelInventoryLoading: false,
+  clusterCatalogueLoading: false,
+  _clusterKnownNodesNeedsSync: false,
+  _clusterDiscoveryRefreshCounter: 4,
+  clusterWorkerPeers: () => [],
+  clusterProbeBackoffActive: () => false,
+  clusterRecommendedModels: () => [],
+  clusterModelCandidates: () => [],
+  loadClusterPeerHardware: async () => {},
+  normalizeClusterTensorParallelSize: () => {},
+  previewClusterWeightBalance: async () => calls.push('preview'),
+  loadClusterRuntime: async () => calls.push('runtime'),
+  discoverClusterPeers: async () => calls.push('discover'),
+  loadClusterJoinStatus: async () => calls.push('join'),
+});
+(async () => {
+  await component.initializeClusterSetup();
+  await component.refreshClusterExperience();
+  process.stdout.write(JSON.stringify({ calls }));
+})().catch(error => {
+  console.error(error);
+  process.exit(1);
+});
+""",
+    )
+
+    assert result == {"calls": ["preview", "runtime", "discover", "join"]}
+
+
 def test_initialization_resyncs_live_capabilities_before_measuring_budgets():
     source = _method_source("initializeClusterSetup")
 

@@ -1464,7 +1464,7 @@
                     this.discoverClusterPeers(),
                     this.loadClusterJoinStatus(),
                 ]);
-                await this.initializeClusterSetup();
+                await this.initializeClusterSetup({ preview: false });
             },
 
             async runClusterWorkerSmoke() {
@@ -1908,7 +1908,7 @@
             // cluster. A deployment remains authoritative on restart; without
             // one, all RDMA peers are selected instead of forcing a three-Mac
             // user to choose one and silently ignore the rest.
-            async initializeClusterSetup() {
+            async initializeClusterSetup({ preview = true } = {}) {
                 const deployment = (this.clusterDeployments || [])[0] || null;
                 if (
                     this._clusterKnownNodesNeedsSync
@@ -2029,6 +2029,7 @@
                     if (recommended) this.selectClusterModel(recommended);
                 }
                 this.normalizeClusterTensorParallelSize();
+                if (preview) await this.previewClusterWeightBalance();
             },
 
             // 2-second "Copied!" affordance on the exchange token, matching
