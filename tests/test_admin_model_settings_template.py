@@ -246,3 +246,16 @@ def test_qwen_ane_web_defaults_match_configured_profile():
     assert "qwen35_ane_prefill_gdn: s.qwen35_ane_prefill_gdn !== false" in state
     assert "qwen35_ane_prefill_gdn_fraction: s.qwen35_ane_prefill_gdn_fraction ?? 0.5" in state
     assert "qwen35_ane_prefill_gdn_max_layers: s.qwen35_ane_prefill_gdn_max_layers ?? 48" in state
+
+
+def test_js_embedded_translations_escape_apostrophes():
+    # A t() value dropped into a single-quoted Alpine JS string breaks the
+    # whole expression as soon as a translation contains an apostrophe (or a
+    # trailing backslash). Every quoted embed must run the JS-escape replace
+    # chain instead of interpolating the raw translation.
+    import re
+
+    unsafe = re.findall(
+        r"'\{\{ t\('[a-z_.0-9]+'\) \}\}'", _model_settings_template()
+    )
+    assert unsafe == []
