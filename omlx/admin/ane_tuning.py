@@ -143,6 +143,47 @@ def _settings_for_candidate(base: Any, request: ANETuningRequest, candidate: _Ca
     return settings
 
 
+def _prefill_step_size(engine: Any) -> int | None:
+    """The prefill chunk size the scheduler will request, if determinable.
+
+    This is ``max(config.prefill_step_size, scheduler._qwen35_prefill_floor)``,
+    mirroring Scheduler._prefill_chunk_size(). The floor matters: on a >= 64 GB
+    machine serving a qwen3_5 model it raises the request to 4096, so reading
+    the config value alone would name the wrong sequence_length.
+
+    Note the *delivered* chunk can still be smaller — _guard_prefill_chunk
+    shrinks it when the predicted peak approaches the Metal cap — so callers
+    should present this as a starting point, not a guarantee.
+    """
+    config = getattr(engine, "_scheduler_config", None)
+    try:
+        size = int(getattr(config, "prefill_step_size", 0) or 0)
+    except (TypeError, ValueError):
+        size = 0
+    try:
+        scheduler = engine._engine.engine.scheduler
+        floor = int(getattr(scheduler, "_qwen35_prefill_floor", 0) or 0)
+    except Exception:
+        floor = 0
+    size = max(size, floor)
+    return size or None
+
+
+def _ane_execution_observed(trace: dict[str, Any] | None) -> bool | None:
+    """Whether the ANE ran ops, or None when that cannot be determined.
+
+    The operation counters come from the ANE profiler. When the profiler is
+    unavailable they are all zero no matter what the hardware did, so that
+    case must be reported as unknown rather than as an idle ANE.
+    """
+    if not trace or not trace.get("profiling_available"):
+        return None
+    return any(
+        int(values.get("operations", 0) or 0) > 0
+        for values in (trace.get("categories") or {}).values()
+    )
+
+
 def _ane_is_active(engine: Any) -> bool:
     model = getattr(engine, "_model", None)
     if model is None:
@@ -190,6 +231,7 @@ async def _measure_candidate(
         pass
 
     samples: list[float] = []
+    traces: list[dict[str, Any] | None] = []
     for _ in range(run.request.repeats):
         metrics = await _run_single_test(
             engine=engine,
@@ -211,6 +253,33 @@ async def _measure_candidate(
             ),
         )
         samples.append(float(metrics["processing_tps"]))
+        if candidate.enabled:
+            traces.append(metrics.get("ane_trace"))
+
+    observations = [_ane_execution_observed(trace) for trace in traces]
+    # Only fail on a positive observation of an idle ANE. If the profiler was
+    # unavailable every observation is None and the guard must stay out of the
+    # way rather than rejecting a candidate that may well have run.
+    if candidate.enabled and any(o is False for o in observations) and not any(observations):
+        # The programs compiled (checked above) but no ANE operation ran, so
+        # this candidate really measured GPU-only plus the cost of compiling
+        # and pinning unused programs. Reporting its throughput would rank a
+        # never-executed configuration against real ones.
+        step = _prefill_step_size(engine)
+        hint = (
+            f"the scheduler requests {step}-token prefill chunks, so try "
+            f"sequence_length={step}"
+            if step
+            else "sequence_length must match the scheduler's prefill chunk size"
+        )
+        raise RuntimeError(
+            "The ANE compiled but never executed for "
+            f"sequence_length={run.request.sequence_length}: each prefill chunk "
+            "failed the fixed-shape check. Measuring this candidate would "
+            f"report GPU-only throughput as an ANE result ({hint}; confirm "
+            "against chunk_tokens in the serve log, since the prefill memory "
+            "guard can shrink chunks below the requested step)."
+        )
 
     return {
         "label": candidate.label,

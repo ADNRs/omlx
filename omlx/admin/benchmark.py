@@ -814,14 +814,15 @@ async def _run_single_test(
     if trace_prefill_duration_s is None and first_token_time is not None:
         trace_prefill_duration_s = max(0.0, first_token_time - start_time)
 
-    _log_ane_benchmark_trace(
+    ane_trace = _log_ane_benchmark_trace(
         pp_len=pp_len,
         prefill_duration_s=trace_prefill_duration_s,
         config=ane_trace_config,
         profile=ane_profile,
+        profiling_available=ane_profile_enabled,
     )
 
-    return _compute_single_metrics(
+    metrics = _compute_single_metrics(
         prompt_tokens=prompt_tokens,
         completion_tokens=metric_completion_tokens,
         start_time=start_time,
@@ -833,6 +834,9 @@ async def _run_single_test(
         generation_duration_s=generation_duration_s,
         generation_measured=generation_measured,
     )
+    if ane_trace_config is not None:
+        metrics["ane_trace"] = ane_trace
+    return metrics
 
 
 def _log_ane_benchmark_trace(
@@ -841,8 +845,14 @@ def _log_ane_benchmark_trace(
     prefill_duration_s: float | None,
     config: dict[str, Any] | None,
     profile: dict[str, dict[str, float]],
-) -> None:
-    """Log an offline-comparable ANE/scheduler summary for one PP trial."""
+    profiling_available: bool = True,
+) -> dict[str, Any]:
+    """Log an offline-comparable ANE/scheduler summary for one PP trial.
+
+    Returns the same per-category counters that are logged, so callers can
+    tell whether the ANE actually executed rather than only whether its
+    programs compiled.
+    """
     config = config or {}
     sequence_length = int(config.get("sequence_length", 0) or 0)
     prefill_tokens = max(0, pp_len - 1)
@@ -863,6 +873,17 @@ def _log_ane_benchmark_trace(
             else "unknown"
         ),
     )
+
+    summary: dict[str, Any] = {
+        # Without the profiler the operation counts below are all zero
+        # regardless of what the ANE did, so callers must not read them as
+        # evidence that it stayed idle.
+        "profiling_available": bool(profiling_available),
+        "sequence_length": sequence_length,
+        "expected_full_shapes": full_shapes,
+        "gpu_tail_tokens": tail,
+        "categories": {},
+    }
 
     for category, layer_key, compiled_key in (
         ("mlp", "mlp_layers", "compiled_mlp_layers"),
@@ -919,6 +940,16 @@ def _log_ane_benchmark_trace(
                 else 0.0
             ),
         )
+
+        summary["categories"][category] = {
+            "operations": operations,
+            "expected_operations": expected_operations,
+            "observed_shapes": observed_shapes,
+            "configured_layers": configured_layers,
+            "compiled_layers": compiled_layers,
+        }
+
+    return summary
 
 
 async def _run_batch_test(
