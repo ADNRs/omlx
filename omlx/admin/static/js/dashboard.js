@@ -6819,8 +6819,15 @@
                     });
 
                     if (response.ok) {
-                        if (field === 'is_default' && value === true) {
-                            this.models.forEach(m => { m.is_default = (m.id === modelId); });
+                        if (field === 'is_default') {
+                            if (value === true) {
+                                // Exactly this model is default now; every other
+                                // model's flag clears.
+                                this.models.forEach(m => { m.is_default = (m.id === modelId); });
+                            } else {
+                                const model = this.models.find(m => m.id === modelId);
+                                if (model) model.is_default = false;
+                            }
                         } else if (field === 'is_pinned') {
                             const model = this.models.find(m => m.id === modelId);
                             if (model) model.pinned = value;
