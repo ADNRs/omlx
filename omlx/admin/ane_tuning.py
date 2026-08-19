@@ -144,28 +144,20 @@ def _settings_for_candidate(base: Any, request: ANETuningRequest, candidate: _Ca
 
 
 def _prefill_step_size(engine: Any) -> int | None:
-    """The prefill chunk size the scheduler will request, if determinable.
+    """The configured prefill step size, if determinable.
 
-    This is ``max(config.prefill_step_size, scheduler._qwen35_prefill_floor)``,
-    mirroring Scheduler._prefill_chunk_size(). The floor matters: on a >= 64 GB
-    machine serving a qwen3_5 model it raises the request to 4096, so reading
-    the config value alone would name the wrong sequence_length.
-
-    Note the *delivered* chunk can still be smaller — _guard_prefill_chunk
-    shrinks it when the predicted peak approaches the Metal cap — so callers
-    should present this as a starting point, not a guarantee.
+    On an ANE-enabled engine configure_qwen35_ane_prefill_scheduler aligns
+    the scheduler's own config copy to the compiled sequence length and
+    zeroes the qwen35 prefill floor, so the shared config read here is a
+    hint at best. The delivered chunk can also be cut by the cache block
+    boundary or the memory guard, which is why callers point at
+    chunk_tokens in the serve log as the authority.
     """
     config = getattr(engine, "_scheduler_config", None)
     try:
         size = int(getattr(config, "prefill_step_size", 0) or 0)
     except (TypeError, ValueError):
         size = 0
-    try:
-        scheduler = engine._engine.engine.scheduler
-        floor = int(getattr(scheduler, "_qwen35_prefill_floor", 0) or 0)
-    except Exception:
-        floor = 0
-    size = max(size, floor)
     return size or None
 
 
@@ -267,18 +259,21 @@ async def _measure_candidate(
         # never-executed configuration against real ones.
         step = _prefill_step_size(engine)
         hint = (
-            f"the scheduler requests {step}-token prefill chunks, so try "
-            f"sequence_length={step}"
+            f"the scheduler is configured for {step}-token prefill chunks, "
+            f"so try sequence_length={step}"
             if step
             else "sequence_length must match the scheduler's prefill chunk size"
         )
         raise RuntimeError(
             "The ANE compiled but never executed for "
-            f"sequence_length={run.request.sequence_length}: each prefill chunk "
-            "failed the fixed-shape check. Measuring this candidate would "
-            f"report GPU-only throughput as an ANE result ({hint}; confirm "
-            "against chunk_tokens in the serve log, since the prefill memory "
-            "guard can shrink chunks below the requested step)."
+            f"sequence_length={run.request.sequence_length}: no ANE operation "
+            "was observed during measurement, so this candidate would report "
+            "GPU-only throughput as an ANE result. The most common cause is a "
+            f"prefill chunk size mismatch ({hint}; confirm against "
+            "chunk_tokens in the serve log, since delivered chunks can shrink "
+            "below the configured step). A runtime dispatch failure can also "
+            "disable the path; check the serve log for 'Disabling ANE' "
+            "warnings."
         )
 
     return {

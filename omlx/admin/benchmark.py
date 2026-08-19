@@ -819,7 +819,9 @@ async def _run_single_test(
         prefill_duration_s=trace_prefill_duration_s,
         config=ane_trace_config,
         profile=ane_profile,
-        profiling_available=ane_profile_enabled,
+        # An ABI-skewed extension can enable the profiler yet return an empty
+        # snapshot; that must read as unknown, not as an idle ANE.
+        profiling_available=ane_profile_enabled and bool(ane_profile),
     )
 
     metrics = _compute_single_metrics(
