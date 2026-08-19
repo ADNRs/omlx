@@ -94,9 +94,9 @@ from .runtime import read_runtime_markers
 from .staging import (
     DEFAULT_REMOTE_PYTHON,
     InsufficientDiskError,
+    home_relative_model_path,
     index_shards,
     model_staging_inventory,
-    home_relative_model_path,
     plan_staging,
     remote_file_sizes,
     remote_model_dir,
@@ -1568,7 +1568,7 @@ def _run_staging_job(
             }
         else:
             shards, sidecar_sizes = remote_model_staging_inventory(
-                source_host, str(model_path)
+                source_host, home_relative_model_path(str(model_path))
             )
         shard_sizes = {item.name: item.size_bytes for item in shards}
         sidecars = tuple(sorted(sidecar_sizes))

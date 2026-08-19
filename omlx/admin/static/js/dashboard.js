@@ -1874,7 +1874,9 @@
                 if (this.clusterAutoconfigureLoading
                     || this.clusterActivationLoading
                     || this.clusterLinkSetupLoading) {
-                    return;
+                    // Report the skip so callers holding a pending-sync flag
+                    // keep it armed for the next tick instead of dropping it.
+                    return false;
                 }
                 this.clusterModelInventory = null;
                 this.clusterCatalogue = null;
@@ -2037,6 +2039,7 @@
                 if (nodesChanged) {
                     this.invalidateClusterPlan();
                 }
+                return true;
             },
 
             // Turn every unambiguous fast-link discovery into the default
@@ -2050,8 +2053,13 @@
                     && this.clusterStatus
                     && this.clusterWorkerPeers().length
                 ) {
-                    this.syncClusterNodesFromPeers();
-                    this._clusterKnownNodesNeedsSync = false;
+                    // Clear the flag only when the sync actually ran: it
+                    // skips itself during activation loads, and dropping the
+                    // flag on a skipped run lost the joining node until the
+                    // next join event re-armed it.
+                    if (this.syncClusterNodesFromPeers() === true) {
+                        this._clusterKnownNodesNeedsSync = false;
+                    }
                 }
                 if (!this.clusterWorkerPeers().length) {
                     const deployedPeers = (deployment?.hosts || []).filter(
@@ -3469,7 +3477,14 @@
                 const nodes = Math.max(1, this.clusterPlanNodes.length);
                 const fitted = Number(fit?.tensor_parallel_size || 1);
                 if (Number(fit?.nodes_required || 1) >= nodes) return fitted;
-                if (fit?.supports_pipeline === false) return nodes;
+                // Force full tensor only when the architecture actually
+                // supports it — both flags can be false (unsplittable), and
+                // tp=nodes there turns the accurate "cannot combine Macs"
+                // refusal into a confusing heads-divisibility error.
+                if (
+                    fit?.supports_pipeline === false
+                    && fit?.supports_tensor_parallel === true
+                ) return nodes;
                 // Pipeline is possible too: keep whatever is selected.
                 return Number(this.clusterPlanTensorParallelSize) || 1;
             },
@@ -3477,14 +3492,17 @@
             normalizeClusterTensorParallelSize() {
                 const options = this.clusterTensorParallelOptions();
                 const current = Number(this.clusterPlanTensorParallelSize);
-                // Guard against the status poll transiently reporting a single
-                // node (options === [1]): resetting to 1 there silently threw
-                // away a user's multi-way tensor choice every ~10s. Only correct
-                // a genuinely out-of-range value, and snap to the largest degree
+                // Snap an out-of-range value to the largest available degree
                 // (tensor parallelism) rather than 1 (pipeline) — several
-                // architectures (VLMs) support tensor but not the MLX-LM pipeline
-                // forward path, so 1 would make the only valid plan fail.
-                if (options.length > 1 && !options.includes(current)) {
+                // architectures (VLMs) support tensor but not the MLX-LM
+                // pipeline forward path, so 1 would make the only valid plan
+                // fail. This must also fire when the cluster genuinely shrank
+                // to one node (options === [1]); leaving a stale multi-way
+                // size there sends /plan a world size that cannot divide. The
+                // transient-poll wipe this used to cause is prevented
+                // upstream: the poll skips resync mid-activation and only
+                // rebuilds the node set when it actually changed.
+                if (!options.includes(current)) {
                     this.clusterPlanTensorParallelSize =
                         options[options.length - 1];
                     this.invalidateClusterPlan();
@@ -3501,6 +3519,7 @@
                     && Number(this.clusterPlanTensorParallelSize) === 1
                     && fit?.fits === true
                     && fit.supports_pipeline === false
+                    && fit.supports_tensor_parallel === true
                 ) {
                     this.clusterPlanTensorParallelSize =
                         options[options.length - 1];
