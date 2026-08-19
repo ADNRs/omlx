@@ -107,6 +107,14 @@ working profile is applied. The editor starts from the measured 2,048-token,
 53% MLP / 50% GDN, dual-ANE, 64/48-layer configuration above; the feature
 itself stays off until explicitly enabled.
 
+The split tuner calibrates MLP gate/up and GDN work between ANE and GPU. It
+packages several widths from one real MLP and GDN layer into a small temporary
+procedure bank, measures the production native paths, and eagerly compiles
+only the predicted full-model candidate. Timings from that application-level
+run rebalance the ANE and GPU branch rates once before a final verification.
+This avoids a full-model grid while retaining end-to-end prompt throughput as
+the recommendation criterion.
+
 The scheduler keeps its normal prompt chunk width; chunks wider than the
 compiled ANE shape are tiled internally. sequence_length must therefore not
 exceed the delivered chunk width: chunks narrower than the compiled shape
