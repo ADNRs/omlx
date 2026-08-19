@@ -344,6 +344,12 @@
             clusterPlanTensorParallelSize: 1,
             clusterPeerHealth: null,
             clusterPeerHealthLoading: false,
+            // Server-owned incident feed. Polls merge by id and never delete:
+            // the only paths that change a row are new server records (via the
+            // since cursor) and an explicit dismissal round-trip.
+            clusterIncidents: [],
+            _clusterIncidentSeq: 0,
+            _clusterIncidentsById: null,
             clusterStagingResult: null,
             clusterStagingLoading: false,
             clusterGuidance: null,
@@ -1473,6 +1479,7 @@
             // four-node clusters grow automatically when another Mac starts.
             async refreshClusterExperience() {
                 await this.loadClusterRuntime();
+                await this.loadClusterIncidents();
                 this._clusterDiscoveryRefreshCounter += 1;
                 if (this._clusterDiscoveryRefreshCounter < 5) return;
                 this._clusterDiscoveryRefreshCounter = 0;
@@ -1481,6 +1488,95 @@
                     this.loadClusterJoinStatus(),
                 ]);
                 await this.initializeClusterSetup({ preview: false });
+            },
+
+            // Monotonic merge: the ?since= cursor means the server only ever
+            // sends records this browser has not seen, and the merge below
+            // only adds or updates Map entries — nothing on the poll path can
+            // delete a row, so no refresh can wipe error state (#8). The only
+            // removal is an explicit dismissal, which round-trips through the
+            // server so it also survives reloads.
+            async loadClusterIncidents() {
+                try {
+                    const since = this._clusterIncidentSeq || 0;
+                    const response = await fetch(`/admin/api/cluster/incidents?since=${since}`);
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    if (!response.ok) return;
+                    const payload = await response.json();
+                    const incidents = Array.isArray(payload.incidents) ? payload.incidents : [];
+                    if (!this._clusterIncidentsById) this._clusterIncidentsById = new Map();
+                    for (const incident of incidents) {
+                        if (incident && incident.id) {
+                            this._clusterIncidentsById.set(incident.id, incident);
+                        }
+                    }
+                    if (typeof payload.latest_seq === 'number' && payload.latest_seq > since) {
+                        this._clusterIncidentSeq = payload.latest_seq;
+                    }
+                    this.clusterIncidents = Array.from(this._clusterIncidentsById.values())
+                        .sort((a, b) => (b.seq || 0) - (a.seq || 0));
+                } catch (error) {
+                    // A failed poll must leave the existing incident state alone.
+                }
+            },
+
+            async dismissClusterIncident(incidentId) {
+                if (!incidentId) return;
+                try {
+                    const response = await fetch(
+                        `/admin/api/cluster/incidents/${encodeURIComponent(incidentId)}/dismiss`,
+                        { method: 'POST' },
+                    );
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    if (!response.ok) return;
+                    // Reflect the server's decision locally: the record keeps
+                    // its seq, so the cursor will not re-send it — update the
+                    // merged copy rather than waiting for a full reload.
+                    const existing = this._clusterIncidentsById
+                        ? this._clusterIncidentsById.get(incidentId)
+                        : null;
+                    if (existing && !existing.dismissed_at) {
+                        existing.dismissed_at = Date.now() / 1000;
+                        this.clusterIncidents = Array.from(this._clusterIncidentsById.values())
+                            .sort((a, b) => (b.seq || 0) - (a.seq || 0));
+                    }
+                } catch (error) {
+                    // Leave the row visible; dismissal is retryable.
+                }
+            },
+
+            clusterActiveIncidents() {
+                return (this.clusterIncidents || []).filter((incident) => !incident.dismissed_at);
+            },
+
+            clusterIncidentAge(ts) {
+                if (!ts) return '';
+                const seconds = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+                if (seconds < 60) return `${seconds}s ago`;
+                if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+                if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+                return `${Math.floor(seconds / 86400)}d ago`;
+            },
+
+            // The error-banner X posts a dismissal for the matching incident
+            // (when one exists) instead of only blanking client state, so the
+            // dismissal is server-owned and holds across browser reloads.
+            async dismissClusterErrorBanner() {
+                const displayed = this.clusterDisplayedError();
+                this.clusterError = '';
+                this.clusterConnectionError = '';
+                this.dismissClusterGuidance();
+                if (!displayed) return;
+                const match = this.clusterActiveIncidents().find(
+                    (incident) => incident.message === displayed,
+                );
+                if (match) await this.dismissClusterIncident(match.id);
             },
 
             async runClusterWorkerSmoke() {
