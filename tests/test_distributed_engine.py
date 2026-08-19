@@ -752,3 +752,219 @@ async def test_distributed_preflight_rejects_features_before_stream_starts():
             )
     finally:
         await engine._client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# reasoning_effort fallback: the distributed engine cannot render the chat
+# template itself (only rank-zero can), so an unsupported value must be
+# retried against rank-zero's HTTP endpoint rather than caught locally the
+# way the batched/vlm/dflash engines do.
+# ---------------------------------------------------------------------------
+
+
+def test_reasoning_effort_retry_payloads_maps_alias_first():
+    from omlx.engine.distributed import _reasoning_effort_retry_payloads
+
+    payload = {"chat_template_kwargs": {"reasoning_effort": "high"}}
+    variants = _reasoning_effort_retry_payloads(
+        payload, "Unexpected reasoning effort high. Supported types are xhigh."
+    )
+    assert len(variants) == 2
+    assert variants[0]["chat_template_kwargs"]["reasoning_effort"] == "xhigh"
+    # Second tier drops the field entirely (template's own default).
+    assert "reasoning_effort" not in variants[1].get("chat_template_kwargs", {})
+
+
+def test_reasoning_effort_retry_payloads_drops_when_no_alias_helps():
+    from omlx.engine.distributed import _reasoning_effort_retry_payloads
+
+    # "xhigh" has no further fallback in _ALIAS_FALLBACKS beyond "max", but if
+    # the alias candidate equals the normalized value there is nothing to
+    # retry with as an alias -- only the drop tier applies. Use a value with a
+    # real alias to prove the two-tier ordering, and a bogus value to prove
+    # single-tier (drop only) when there's no useful candidate.
+    payload = {"chat_template_kwargs": {"reasoning_effort": "not-a-real-level"}}
+    variants = _reasoning_effort_retry_payloads(
+        payload, "Unexpected reasoning effort not-a-real-level."
+    )
+    assert len(variants) == 1
+    assert "reasoning_effort" not in variants[0].get("chat_template_kwargs", {})
+
+
+def test_reasoning_effort_retry_payloads_ignores_unrelated_failures():
+    from omlx.engine.distributed import _reasoning_effort_retry_payloads
+
+    payload = {"chat_template_kwargs": {"reasoning_effort": "high"}}
+    assert _reasoning_effort_retry_payloads(payload, "model not found") == []
+
+
+def test_reasoning_effort_retry_payloads_ignores_when_not_requested():
+    from omlx.engine.distributed import _reasoning_effort_retry_payloads
+
+    payload = {"chat_template_kwargs": {}}
+    assert (
+        _reasoning_effort_retry_payloads(
+            payload, "Unexpected reasoning effort high."
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_distributed_chat_retries_unsupported_reasoning_effort():
+    calls = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        effort = body.get("chat_template_kwargs", {}).get("reasoning_effort")
+        calls.append(effort)
+        if effort == "high":
+            return httpx.Response(
+                404,
+                json={
+                    "error": "Unexpected reasoning effort high. Supported "
+                    "types are xhigh (default), medium, and low."
+                },
+            )
+        assert effort == "xhigh"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            },
+        )
+
+    engine = _ready_engine(handler)
+    try:
+        output = await engine.chat(
+            [{"role": "user", "content": "hi"}],
+            chat_template_kwargs={"reasoning_effort": "high"},
+        )
+    finally:
+        await engine._client.aclose()
+
+    assert calls == ["high", "xhigh"]
+    assert output.text == "ok"
+
+
+@pytest.mark.asyncio
+async def test_distributed_generate_retries_unsupported_reasoning_effort():
+    calls = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        effort = body.get("chat_template_kwargs", {}).get("reasoning_effort")
+        calls.append(effort)
+        if effort == "minimal":
+            return httpx.Response(
+                404,
+                json={"error": "Unexpected reasoning effort minimal."},
+            )
+        assert effort == "low"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"text": "ok", "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            },
+        )
+
+    engine = _ready_engine(handler)
+    try:
+        output = await engine.generate(
+            "hi", chat_template_kwargs={"reasoning_effort": "minimal"}
+        )
+    finally:
+        await engine._client.aclose()
+
+    assert calls == ["minimal", "low"]
+    assert output.text == "ok"
+
+
+@pytest.mark.asyncio
+async def test_distributed_stream_chat_retries_unsupported_reasoning_effort():
+    calls = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        effort = body.get("chat_template_kwargs", {}).get("reasoning_effort")
+        calls.append(effort)
+        if effort == "high":
+            return httpx.Response(
+                404,
+                json={"error": "Unexpected reasoning effort high."},
+            )
+        assert effort == "xhigh"
+        lines = [
+            'data: {"choices": [{"delta": {"content": "ok"}, "finish_reason": null}]}',
+            'data: {"choices": [{"delta": {}, "finish_reason": "stop"}], '
+            '"usage": {"prompt_tokens": 1, "completion_tokens": 1}}',
+            "data: [DONE]",
+        ]
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content="\n".join(lines) + "\n",
+        )
+
+    engine = _ready_engine(handler)
+    try:
+        outputs = [
+            output
+            async for output in engine.stream_chat(
+                [{"role": "user", "content": "hi"}],
+                chat_template_kwargs={"reasoning_effort": "high"},
+            )
+        ]
+    finally:
+        await engine._client.aclose()
+
+    assert calls == ["high", "xhigh"]
+    assert "".join(o.new_text for o in outputs) == "ok"
+
+
+@pytest.mark.asyncio
+async def test_distributed_stream_generate_bounds_retries_and_gives_up():
+    # Every attempt is rejected: must try at most 1 (original) + 2 (fallback
+    # tiers) = 3 times, then raise -- never an unbounded loop.
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(
+            404,
+            json={"error": "Unexpected reasoning effort weird."},
+        )
+
+    engine = _ready_engine(handler)
+    try:
+        with pytest.raises(DistributedInferenceError, match="HTTP 404"):
+            async for _ in engine.stream_generate(
+                "hi", chat_template_kwargs={"reasoning_effort": "weird"}
+            ):
+                pass
+    finally:
+        await engine._client.aclose()
+
+    assert len(calls) <= 3
+
+
+@pytest.mark.asyncio
+async def test_distributed_chat_does_not_retry_unrelated_404():
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(404, json={"error": "model not found"})
+
+    engine = _ready_engine(handler)
+    try:
+        with pytest.raises(DistributedInferenceError, match="model not found"):
+            await engine.chat([{"role": "user", "content": "hi"}])
+    finally:
+        await engine._client.aclose()
+
+    assert len(calls) == 1
