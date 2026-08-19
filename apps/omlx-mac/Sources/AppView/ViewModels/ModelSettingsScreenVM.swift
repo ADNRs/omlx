@@ -44,7 +44,7 @@ final class ModelSettingsScreenVM {
         case dflashEnabled, dflashDraftModel, dflashMaxCtx
         case dflashDraftQuantEnabled, dflashDraftQuantWeightBits
         case dflashDraftQuantActivationBits, dflashDraftQuantGroupSize
-        case dflashVerifyMode, dflashDraftWindowSize, dflashDraftSinkSize
+        case dflashVerifyMode, dflashDraftWindowSize, dflashDraftSinkSize, dflashBlockSize
         case dflashInMemoryCache, dflashInMemoryCacheGib, dflashInMemoryCacheMaxEntries
         case dflashSsdCache, dflashSsdCacheGib
         case mtpEnabled
@@ -313,7 +313,8 @@ final class ModelSettingsScreenVM {
     var dflashMaxCtx: String = ""
     var dflashVerifyMode: String = ""
     var dflashDraftWindowSize: String = ""
-    var dflashDraftSinkSize: String = ""
+    var dflashDraftSinkSize: String = "0"
+    var dflashBlockSize: String = ""
     var dflashInMemoryCache: Bool = false
     var dflashInMemoryCacheGib: String = "8"
     var dflashInMemoryCacheMaxEntries: String = "4"
@@ -400,7 +401,7 @@ final class ModelSettingsScreenVM {
             return true
         case .dflashDraftQuantActivationBits, .dflashDraftQuantGroupSize:
             return true
-        case .dflashVerifyMode, .dflashDraftWindowSize, .dflashDraftSinkSize:
+        case .dflashVerifyMode, .dflashDraftWindowSize, .dflashDraftSinkSize, .dflashBlockSize:
             return true
         case .dflashInMemoryCache, .dflashInMemoryCacheGib:
             return true
@@ -537,7 +538,8 @@ final class ModelSettingsScreenVM {
                 self.dflashMaxCtx = s?.dflashMaxCtx.map(String.init) ?? ""
                 self.dflashVerifyMode = s?.dflashVerifyMode ?? ""
                 self.dflashDraftWindowSize = s?.dflashDraftWindowSize.map(String.init) ?? ""
-                self.dflashDraftSinkSize = s?.dflashDraftSinkSize.map(String.init) ?? ""
+                self.dflashDraftSinkSize = s?.dflashDraftSinkSize.map(String.init) ?? "0"
+                self.dflashBlockSize = s?.dflashBlockSize.map(String.init) ?? ""
                 self.dflashInMemoryCache = s?.dflashInMemoryCache ?? false
                 self.dflashInMemoryCacheGib = DflashByteSize.bytesToGib(s?.dflashInMemoryCacheMaxBytes)
                     .map(String.init) ?? "8"
@@ -695,6 +697,7 @@ final class ModelSettingsScreenVM {
         case .dflashVerifyMode:        patch.dflashVerifyMode = dflashVerifyMode.isEmpty ? nil : dflashVerifyMode
         case .dflashDraftWindowSize:   patch.dflashDraftWindowSize = Int(dflashDraftWindowSize)
         case .dflashDraftSinkSize:     patch.dflashDraftSinkSize = Int(dflashDraftSinkSize)
+        case .dflashBlockSize:         patch.dflashBlockSize = Int(dflashBlockSize)
         case .dflashInMemoryCache:
             patch.dflashInMemoryCache = dflashInMemoryCache
             if !dflashInMemoryCache {
@@ -1087,6 +1090,7 @@ final class ModelSettingsScreenVM {
                 }
                 putInt(ProfileSettingsKey.dflashDraftWindowSize, dflashDraftWindowSize)
                 putInt(ProfileSettingsKey.dflashDraftSinkSize, dflashDraftSinkSize)
+                putInt(ProfileSettingsKey.dflashBlockSize, dflashBlockSize)
                 putBool(ProfileSettingsKey.dflashInMemoryCache, dflashInMemoryCache)
                 if dflashInMemoryCache {
                     if let bytes = DflashByteSize.gibToBytes(Int(dflashInMemoryCacheGib)) {

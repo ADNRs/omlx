@@ -1440,19 +1440,28 @@ private struct ExperimentalSection: View {
                                   defaultValue: "Draft Window Size",
                                   comment: "Row label for the DFlash draft sliding-attention window size field"),
                     sublabel: String(localized: "settings.experimental.dflash.window_size.sub",
-                                     defaultValue: "Draft model sliding-attention window. Empty = dflash default (1024).",
+                                     defaultValue: "Draft model sliding-attention window. Empty = dflash default (2048).",
                                      comment: "Sublabel for the DFlash draft window size field")) {
                     TextInput(text: vm.bindProfile($vm.dflashDraftWindowSize),
-                              placeholder: "1024", mono: true, width: 110)
+                              placeholder: "2048", mono: true, width: 110)
                 }
                 Row(label: String(localized: "settings.experimental.dflash.sink_size.label",
                                   defaultValue: "Draft Sink Size",
                                   comment: "Row label for the DFlash attention-sink tokens field"),
                     sublabel: String(localized: "settings.experimental.dflash.sink_size.sub",
-                                     defaultValue: "Attention-sink tokens always kept in the window. Empty = dflash default (64).",
+                                     defaultValue: "Attention-sink tokens always kept in the window. Empty = dflash default (0).",
                                      comment: "Sublabel for the DFlash draft sink size field")) {
                     TextInput(text: vm.bindProfile($vm.dflashDraftSinkSize),
-                              placeholder: "64", mono: true, width: 110)
+                              placeholder: "0", mono: true, width: 110)
+                }
+                Row(label: String(localized: "settings.experimental.dflash.block_size.label",
+                                  defaultValue: "Runtime Block Size",
+                                  comment: "Row label for the DFlash runtime block size field"),
+                    sublabel: String(localized: "settings.experimental.dflash.block_size.sub",
+                                     defaultValue: "Maximum draft and verify tokens per cycle. Empty = checkpoint default.",
+                                     comment: "Sublabel for the DFlash runtime block size field")) {
+                    TextInput(text: vm.bindProfile($vm.dflashBlockSize),
+                              placeholder: "checkpoint", mono: true, width: 110)
                 }
                 Row(label: String(localized: "settings.experimental.dflash.mem_cache.label",
                                   defaultValue: "DFlash in-memory cache",
