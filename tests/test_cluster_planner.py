@@ -544,6 +544,40 @@ def test_nemotron_h_divisors_omit_quant_groups_when_unquantized():
     assert set(divisors) == {32, 2, 64, 8}
 
 
+def test_complete_model_layout_cache_invalidates_on_shard_overwrite(
+    tmp_path, monkeypatch
+):
+    """An in-place shard rewrite bumps neither the directory mtime nor
+    config.json's, so the shard stats themselves must be in the cache key."""
+
+    from omlx.cluster import planner
+
+    (tmp_path / "config.json").write_text(json.dumps({"num_hidden_layers": 1}))
+    _write_safetensors(
+        tmp_path / "model.safetensors", [("model.layers.0.weight", 100)]
+    )
+
+    calls = []
+    real_inspect = planner.inspect_safetensors_layout
+
+    def counting_inspect(path):
+        calls.append(str(path))
+        return real_inspect(path)
+
+    monkeypatch.setattr(planner, "inspect_safetensors_layout", counting_inspect)
+
+    planner.complete_model_layout(tmp_path)
+    planner.complete_model_layout(tmp_path)
+    assert len(calls) == 1  # second read served from the cache
+
+    _write_safetensors(
+        tmp_path / "model.safetensors", [("model.layers.0.weight", 200)]
+    )
+    layout = planner.complete_model_layout(tmp_path)
+    assert len(calls) == 2  # overwrite invalidated the cached entry
+    assert layout.layer_weight_bytes == (200,)
+
+
 def test_nemotron_h_per_module_quant_overrides_tighten_the_guard():
     """oQ mixed checkpoints override group_size per module inside the
     quantization dict; a coarser override can leave a prime group count the

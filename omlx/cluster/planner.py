@@ -1055,7 +1055,12 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
     )
 
 
-_LAYOUT_CACHE: dict[str, tuple[tuple[float, float], ModelLayout]] = {}
+# Directory mtime + config mtime + per-shard (name, mtime, size). The shard
+# stats matter: an in-place shard overwrite changes neither the directory's
+# mtime (no entry added or removed) nor config.json's, and a stale layout
+# would silently mis-size every plan built from it.
+_LayoutFingerprint = tuple[float, float, tuple[tuple[str, float, int], ...]]
+_LAYOUT_CACHE: dict[str, tuple[_LayoutFingerprint, ModelLayout]] = {}
 _LAYOUT_CACHE_LOCK = threading.Lock()
 
 
@@ -1089,9 +1094,14 @@ def complete_model_layout(model_path: str | Path) -> ModelLayout:
 
     resolved = str(root.resolve())
     try:
-        fingerprint = (
+        shard_stats = []
+        for shard_path in sorted(root.glob("*.safetensors")):
+            stat = shard_path.stat()
+            shard_stats.append((shard_path.name, stat.st_mtime, stat.st_size))
+        fingerprint: _LayoutFingerprint | None = (
             root.stat().st_mtime,
             (root / "config.json").stat().st_mtime,
+            tuple(shard_stats),
         )
     except OSError:
         fingerprint = None
