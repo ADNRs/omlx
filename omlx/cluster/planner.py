@@ -630,6 +630,30 @@ def _tensor_parallel_divisors(config: dict[str, Any]) -> tuple[int, ...]:
                 _config_int(config, "n_groups", 1),
             )
         )
+        # Quantized row-parallel projections split with the even
+        # ``shard_inplace`` path (attention/Mamba ``out_proj`` and the
+        # shared-expert ``down_proj``) require a quant-group count divisible by
+        # the TP degree, or the split raises mid-load. Contribute those counts
+        # so a degree the head counts would allow but the quantization forbids
+        # is refused up front. The routed-expert ``fc1``/``fc2`` are excluded on
+        # purpose: they use the custom uneven split in ``tensor_strategies`` and
+        # only need ``group_count >= degree`` (see D1b in the cluster plan).
+        quant = config.get("quantization")
+        if isinstance(quant, dict):
+            group_size = _config_int(quant, "group_size", 0)
+            if group_size > 0:
+                attn_dim = _config_int(config, "num_attention_heads", 0) * _config_int(
+                    config, "head_dim", 0
+                )
+                mamba_dim = _config_int(
+                    config, "mamba_num_heads", 0
+                ) * _config_int(config, "mamba_head_dim", 0)
+                shared_dim = _config_int(
+                    config, "moe_shared_expert_intermediate_size", 0
+                )
+                for dim in (attn_dim, mamba_dim, shared_dim):
+                    if dim > 0 and dim % group_size == 0:
+                        values.append(dim // group_size)
     return tuple(dict.fromkeys(values))
 
 

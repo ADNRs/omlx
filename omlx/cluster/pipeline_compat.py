@@ -182,10 +182,22 @@ def _install_nemotron_h_pipeline(
         pipeline_model: Any,
         inputs: Any,
         cache: Any | None = None,
+        n_confirmed: int = 0,
+        **_unused: Any,
     ) -> Any:
+        # The base MTP patch threads ``n_confirmed`` (and occasionally other
+        # kwargs) through every model ``__call__``. MTP is inactive on the
+        # distributed path — the worker always drives this with
+        # ``n_confirmed == 0`` — so we accept and ignore it rather than
+        # rejecting the call. Mirrors the mlx-vlm runtimes' ``pop`` convention.
         hidden_states = pipeline_model.embeddings(inputs)
-        pipeline_rank = pipeline_model.pipeline_rank
-        pipeline_size = pipeline_model.pipeline_size
+        # ``pipeline()`` sets these for the pipeline-parallel path. On the
+        # pure tensor-parallel path mlx-lm never calls ``pipeline()`` (each
+        # rank holds every layer, tensor-sharded), so default to a single
+        # stage: send/recv/all_gather below then correctly no-op and this
+        # becomes the ordinary full-stack forward.
+        pipeline_rank = getattr(pipeline_model, "pipeline_rank", 0)
+        pipeline_size = getattr(pipeline_model, "pipeline_size", 1)
         layers = pipeline_model.pipeline_layers
 
         if cache is None:
@@ -193,14 +205,33 @@ def _install_nemotron_h_pipeline(
                 layer.block_type in {"M", "*"} for layer in layers
             )
 
+        # The first attention / SSM cache slots. ``pipeline()`` publishes these;
+        # recompute them here when it did not run (tensor-parallel path). These
+        # are local cache indices over this rank's layers, matching ``cache``.
+        fa_idx = getattr(pipeline_model, "fa_idx", _MISSING)
+        ssm_idx = getattr(pipeline_model, "ssm_idx", _MISSING)
+        if fa_idx is _MISSING or ssm_idx is _MISSING:
+            fa_idx = None
+            ssm_idx = None
+            cache_index = 0
+            for layer in layers:
+                if layer.block_type == "*":
+                    if fa_idx is None:
+                        fa_idx = cache_index
+                    cache_index += 1
+                elif layer.block_type == "M":
+                    if ssm_idx is None:
+                        ssm_idx = cache_index
+                    cache_index += 1
+
         attention_mask = (
-            create_attention_mask(hidden_states, cache[pipeline_model.fa_idx])
-            if pipeline_model.fa_idx is not None
+            create_attention_mask(hidden_states, cache[fa_idx])
+            if fa_idx is not None
             else None
         )
         ssm_mask = (
-            create_ssm_mask(hidden_states, cache[pipeline_model.ssm_idx])
-            if pipeline_model.ssm_idx is not None
+            create_ssm_mask(hidden_states, cache[ssm_idx])
+            if ssm_idx is not None
             else None
         )
 
