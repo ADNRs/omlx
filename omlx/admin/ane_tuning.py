@@ -482,7 +482,7 @@ def _profile_refinement(candidate: _Candidate, result: dict[str, Any]) -> _Candi
             float(mlp.get("ane0_eval_ns", 0.0)),
             float(mlp.get("ane1_eval_ns", 0.0)),
         ) / mlp_ops
-        gpu_time = float(mlp.get("gpu_completion_ns", 0.0)) / mlp_ops
+        gpu_time = float(mlp.get("gpu_qmm_ns", 0.0)) / mlp_ops
         balanced = _balanced_fractions(
             [ane_fraction, gpu_fraction],
             [ane_time, gpu_time],
@@ -501,7 +501,7 @@ def _profile_refinement(candidate: _Candidate, result: dict[str, Any]) -> _Candi
             float(gdn.get("ane0_eval_ns", 0.0)),
             float(gdn.get("ane1_eval_ns", 0.0)),
         ) / gdn_ops
-        gpu_time = float(gdn.get("gpu_completion_ns", 0.0)) / gdn_ops
+        gpu_time = float(gdn.get("gpu_qmm_ns", 0.0)) / gdn_ops
         balanced = _balanced_fractions(
             [float(gdn_fraction), 1.0 - float(gdn_fraction)],
             [ane_time, gpu_time],
@@ -615,6 +615,27 @@ async def _calibrate_components(
     engine: Any,
     base_settings: Any,
 ) -> _CalibrationChoice:
+    # Bank compilation and the per-width timings hold the GIL-side thread for
+    # the whole calibration, so run them on the MLX executor like every other
+    # model-touching path; the event loop keeps serving results polling,
+    # cancel, and health checks in the meantime.
+    from omlx.engine_core import get_mlx_executor
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        get_mlx_executor(),
+        _calibrate_components_sync,
+        run,
+        engine,
+        base_settings,
+    )
+
+
+def _calibrate_components_sync(
+    run: ANETuningRun,
+    engine: Any,
+    base_settings: Any,
+) -> _CalibrationChoice:
     import mlx.core as mx
 
     from ..patches import qwen35_ane_prefill as patch
@@ -708,7 +729,6 @@ async def _calibrate_components(
         gate_results.append((latency, fraction))
         run.current += 1
         run.message = f"MLP gate/up: ANE {fraction:.1%}…"
-        await asyncio.sleep(0)
     if not gate_results:
         raise RuntimeError("Every representative MLP gate/up candidate failed")
     gate_ms, best_mlp = min(gate_results)
@@ -743,8 +763,7 @@ async def _calibrate_components(
             gdn_results.append((latency, fraction))
             run.current += 1
             run.message = f"GDN: ANE {fraction:.1%}…"
-            await asyncio.sleep(0)
-        gdn_ms, best_gdn = min(gdn_results)
+            gdn_ms, best_gdn = min(gdn_results)
         _complete_phase(
             run,
             _GDN_SLOT,
@@ -900,6 +919,23 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
             f"{run.error_message}"
         )
         run.message = "Tuning stopped early"
+        baseline_result = run.results[_GPU_SLOT]
+        if (
+            run.recommendation is None
+            and baseline_result.get("processing_tps") is not None
+        ):
+            # A completed GPU-only baseline is still a valid answer: keep ANE
+            # off. Discarding it because a later measurement failed would
+            # throw away the one number the run did establish.
+            run.recommendation = {
+                "enabled": False,
+                "mlp_fraction": None,
+                "gdn_enabled": False,
+                "gdn_fraction": None,
+                "processing_tps": baseline_result["processing_tps"],
+                "speedup_percent": baseline_result.get("speedup_percent"),
+                "sequence_length": run.request.sequence_length,
+            }
     finally:
         _restore_speed_priority(engine_pool, previous_speed_priority)
         try:

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -66,13 +67,13 @@ def test_full_model_profile_rebalances_representative_prediction(monkeypatch):
                 "operations": 192,
                 "ane0_eval_ns": 19.03e6 * 192,
                 "ane1_eval_ns": 18.97e6 * 192,
-                "gpu_completion_ns": 16.20e6 * 192,
+                "gpu_qmm_ns": 16.20e6 * 192,
             },
             "gdn": {
                 "operations": 144,
                 "ane0_eval_ns": 11.47e6 * 144,
                 "ane1_eval_ns": 11.48e6 * 144,
-                "gpu_completion_ns": 8.72e6 * 144,
+                "gpu_qmm_ns": 8.72e6 * 144,
             },
         }
     }
@@ -81,6 +82,24 @@ def test_full_model_profile_rebalances_representative_prediction(monkeypatch):
 
     assert refined.mlp_fraction == 0.465
     assert refined.gdn_fraction == 0.53
+
+
+def test_profile_refinement_reads_only_native_profile_keys():
+    """Every key the refinement consumes must exist in the native schema.
+
+    Regression guard: the tuner once read gpu_completion_ns, a key that only
+    existed on a development branch, so gpu_time was always zero and the
+    refinement stage silently never fired.
+    """
+    import inspect
+
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    source = inspect.getsource(ane_tuning._profile_refinement)
+    used = set(re.findall(r'\.get\("([a-z0-9_]+_ns|operations)"', source))
+    assert used, "expected the refinement to read profile keys"
+    missing = used - set(fast._ANE_PROFILE_KEYS)
+    assert not missing, f"refinement reads keys absent from the schema: {missing}"
 
 
 @pytest.mark.asyncio
@@ -406,4 +425,14 @@ async def test_tuner_preserves_partial_matrix_and_failure_reason(monkeypatch):
     assert snapshot["termination_reason"] == (
         f"Stopped after 1 of {run.total} tests: MemoryError: Metal heap exhausted"
     )
-    assert snapshot["recommendation"] is None
+    # A completed GPU-only baseline survives a later failure as the
+    # recommendation: keep ANE off.
+    assert snapshot["recommendation"] == {
+        "enabled": False,
+        "mlp_fraction": None,
+        "gdn_enabled": False,
+        "gdn_fraction": None,
+        "processing_tps": 100.0,
+        "speedup_percent": 0.0,
+        "sequence_length": run.request.sequence_length,
+    }

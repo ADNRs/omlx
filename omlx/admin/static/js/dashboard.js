@@ -8155,12 +8155,15 @@
                                     ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
                                     : 4,
                                 qwen35_ane_prefill_enabled: !!this.modelSettings.qwen35_ane_prefill_enabled,
-                                qwen35_ane_prefill_sequence_length: Number(this.modelSettings.qwen35_ane_prefill_sequence_length),
-                                qwen35_ane_prefill_fraction: Number(this.modelSettings.qwen35_ane_prefill_fraction),
-                                qwen35_ane_prefill_max_layers: Number(this.modelSettings.qwen35_ane_prefill_max_layers),
+                                // Validation only runs when the feature is enabled, so a
+                                // blank numeric input must fall back to the server default
+                                // instead of coercing to 0 and failing an unrelated save.
+                                qwen35_ane_prefill_sequence_length: Number(this.modelSettings.qwen35_ane_prefill_sequence_length) || 2048,
+                                qwen35_ane_prefill_fraction: Number(this.modelSettings.qwen35_ane_prefill_fraction) || 0.53,
+                                qwen35_ane_prefill_max_layers: Number(this.modelSettings.qwen35_ane_prefill_max_layers) || 64,
                                 qwen35_ane_prefill_dual_ane: !!this.modelSettings.qwen35_ane_prefill_dual_ane,
                                 qwen35_ane_prefill_gdn: !!this.modelSettings.qwen35_ane_prefill_gdn,
-                                qwen35_ane_prefill_gdn_fraction: Number(this.modelSettings.qwen35_ane_prefill_gdn_fraction),
+                                qwen35_ane_prefill_gdn_fraction: Number(this.modelSettings.qwen35_ane_prefill_gdn_fraction) || 0.5,
                                 qwen35_ane_prefill_gdn_max_layers: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers))
                                     ? Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers)
                                     : 48,
