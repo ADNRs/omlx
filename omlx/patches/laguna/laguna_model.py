@@ -379,8 +379,9 @@ class LagunaTopKRouter(nn.Module):
         # compiles this router tail (``lagunaCompiledRouterTail``: two outputs
         # consuming the same sigmoid intermediate) into one kernel. In Python
         # MLX 0.32 a two-output compiled function with a shared intermediate is
-        # ULP-divergent, and this feeds argpartition expert selection, so it
-        # stays eager (see docs/laguna-mlxfast-port-correctness.md C1). Only the
+        # bit-exact on some Apple GPUs and ULP-divergent on others. This feeds
+        # argpartition expert selection, so it stays eager for portable token
+        # exactness (see docs/laguna-mlxfast-port-correctness.md C1). Only the
         # single-output top-k renormalization below is compiled.
         k = self.top_k
         inds = mx.stop_gradient(

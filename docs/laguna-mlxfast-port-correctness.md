@@ -33,13 +33,13 @@ migration `4799830` and are not part of the current model surface).
 
 ## Concern register (token/bit-exactness issues, with challenge commits)
 
-### C1 — Compiled two-output router tail is not bit-exact in Python MLX
+### C1 — Compiled two-output router tail is not portably bit-exact in Python MLX
 
 - **Submission / challenge commit:** `8adb56be-8f8f-4611-8914-8daf052b5f21` / `f8848e0` (`lagunaCompiledRouterTail`).
 - **Optimization:** compile `[sigmoid(logits), -(sigmoid(logits)+bias)]` into one kernel (four elementwise launches per router call, 39 per token).
-- **Token-exactness issue:** a compiled function returning TWO outputs that consume the same `sigmoid(a)` intermediate diverges from eager at ULP (5.96e-8–1.19e-7, deterministic, isolated to the multi-consumer shape). Single-output compiled fusions reusing the same sigmoid are bit-exact, so the trigger is the two-output shape. It feeds `argpartition` expert selection — a ULP flip at a near-tie boundary changes WHICH experts are gathered (a different forward, not a small perturbation), i.e. the challenge's own documented correctness cliff ("Rank is the wrong metric").
-- **Mitigation:** kept eager in the port; pinned by `test_two_output_compiled_tail_diverges_documented` (fails if MLX ever fixes it).
-- **MLX-version dependence:** property of MLX 0.32.0 compiled kernels; re-verify after any MLX bump.
+- **Token-exactness issue:** a compiled function returning TWO outputs that consume the same `sigmoid(a)` intermediate is bit-exact on the GitHub `macos-14-arm64` runner but diverges from eager at ULP on an M3 Ultra (5.96e-8–2.38e-7, deterministic, isolated to the multi-consumer shape). Single-output compiled fusions reusing the same sigmoid are bit-exact, so the trigger is the two-output shape on affected GPUs. It feeds `argpartition` expert selection — a ULP flip at a near-tie boundary changes WHICH experts are gathered (a different forward, not a small perturbation), i.e. the challenge's own documented correctness cliff ("Rank is the wrong metric").
+- **Mitigation:** kept eager in the port for portable token exactness; bounded numerical parity is pinned by `test_two_output_compiled_tail_is_numerically_close` on both bit-exact and ULP-divergent GPUs.
+- **Hardware and MLX-version dependence:** property of MLX 0.32.0 compiled kernels varies by Apple GPU; re-verify across supported GPU generations after any MLX bump.
 
 ### C2 — `logits_last_only` head slicing is ULP-divergent (frame divergence)
 
