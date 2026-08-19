@@ -18,11 +18,18 @@ import httpx
 
 from ..cluster.deployment import ClusterDeployment
 from ..cluster.launch import DistributedJobSupervisor, DistributedLaunchError
+from ..cluster.liveness import check_peers, describe_failure
 from ..reasoning_effort import _fallback_candidate, _normalized_input
 from .base import GenerationOutput
 from .batched import BatchedEngine
 
 logger = logging.getLogger(__name__)
+
+# How long one per-rank marker health read stays authoritative. Every request
+# preflights the cluster, so this bounds both the added latency (one SSH read
+# per peer, paid once per window) and how long a half-dead cluster can keep
+# answering 200s before requests start failing cleanly (#2708).
+_PEER_HEALTH_TTL = 10.0
 
 
 def _reasoning_effort_retry_payloads(
@@ -159,6 +166,8 @@ class DistributedBatchedEngine(BatchedEngine):
         self._model_type: str | None = None
         self._active_requests = 0
         self._active_lock = asyncio.Lock()
+        self._peer_health: tuple[float, bool, str] | None = None
+        self._peer_health_lock = asyncio.Lock()
 
     def _new_client(self, endpoint: str) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -1267,12 +1276,71 @@ class DistributedBatchedEngine(BatchedEngine):
             f"rank-zero backend returned HTTP {response.status_code}{suffix}"
         )
 
+    async def _require_healthy_cluster(self) -> None:
+        """Refuse a request the cluster cannot serve, before the 200 commits.
+
+        A streaming response commits its status line before the body
+        generator runs, so any failure detected later reaches the client as
+        an error frame inside a 200 — the empty-response class from #2708.
+        Preflight is the last point a clean HTTP error is still possible.
+        The supervisor read is free; the per-rank marker read costs one SSH
+        round trip per peer and is cached for ``_PEER_HEALTH_TTL`` seconds.
+        """
+
+        status = self._supervisor.status()
+        if status.returncode is not None:
+            raise DistributedInferenceError(
+                f"distributed job exited with code {status.returncode}"
+            )
+        if status.failure_reason:
+            raise DistributedInferenceError(
+                f"distributed cluster failure: {status.failure_reason}"
+            )
+        cached = self._peer_health
+        if cached is None or time.monotonic() - cached[0] >= _PEER_HEALTH_TTL:
+            async with self._peer_health_lock:
+                cached = self._peer_health
+                if cached is None or (
+                    time.monotonic() - cached[0] >= _PEER_HEALTH_TTL
+                ):
+                    hosts_by_rank = {
+                        rank: (host.node_id, host.ssh)
+                        for rank, host in enumerate(self.deployment.hosts)
+                    }
+                    try:
+                        health = await asyncio.to_thread(
+                            check_peers,
+                            hosts_by_rank,
+                            deployment_id=self.deployment.deployment_id,
+                            require_heartbeat=True,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - probe plumbing
+                        # A broken probe must not take down a serving
+                        # cluster; the supervisor checks above still catch
+                        # hard failures.
+                        logger.warning("peer health probe failed: %s", exc)
+                        cached = (time.monotonic(), True, "")
+                    else:
+                        healthy = all(item.healthy for item in health)
+                        cached = (
+                            time.monotonic(),
+                            healthy,
+                            "" if healthy else describe_failure(health),
+                        )
+                    self._peer_health = cached
+        if not cached[1]:
+            raise DistributedInferenceError(
+                f"cluster is not serving: {cached[2]}"
+            )
+
     async def preflight_chat(self, *args: Any, **kwargs: Any) -> None:
         self._validate_request_features(kwargs)
+        await self._require_healthy_cluster()
         return None
 
     async def preflight_completion(self, *args: Any, **kwargs: Any) -> None:
         self._validate_request_features(kwargs)
+        await self._require_healthy_cluster()
         return None
 
     def has_active_requests(self) -> bool:
