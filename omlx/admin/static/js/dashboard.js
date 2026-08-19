@@ -350,6 +350,7 @@
             clusterIncidents: [],
             _clusterIncidentSeq: 0,
             _clusterIncidentsById: null,
+            _clusterIncidentEpoch: '',
             clusterStagingResult: null,
             clusterStagingLoading: false,
             clusterGuidance: null,
@@ -1506,6 +1507,17 @@
                     }
                     if (!response.ok) return;
                     const payload = await response.json();
+                    // The epoch names the seq numbering. A corrupt-log reset
+                    // restarts seq at 1 under a new epoch; keeping the old
+                    // cursor there would silence the feed for this tab
+                    // forever, so restart the merge from scratch.
+                    if (payload.epoch && payload.epoch !== this._clusterIncidentEpoch) {
+                        if (this._clusterIncidentEpoch) {
+                            this._clusterIncidentSeq = 0;
+                            this._clusterIncidentsById = null;
+                        }
+                        this._clusterIncidentEpoch = payload.epoch;
+                    }
                     const incidents = Array.isArray(payload.incidents) ? payload.incidents : [];
                     if (!this._clusterIncidentsById) this._clusterIncidentsById = new Map();
                     for (const incident of incidents) {
