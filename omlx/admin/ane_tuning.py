@@ -205,7 +205,11 @@ async def _measure_candidate(
 
     tokenizer = engine.tokenizer
     warmup_length = run.request.sequence_length + 1
-    measure_length = run.request.sequence_length * 2 + 1
+    # stream_generate prefills tokens[:-1], so sequence_length * 2 leaves a
+    # non-ANE-shaped tail chunk in the measurement like real traffic does.
+    # The previous * 2 + 1 measured two full ANE blocks with no GPU tail and
+    # overstated the ANE gain.
+    measure_length = run.request.sequence_length * 2
     warmup = _generate_prompt(
         tokenizer, warmup_length, BenchmarkContextProfile.CODE_PYTHON
     )

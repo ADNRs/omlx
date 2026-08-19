@@ -243,6 +243,31 @@ async def test_measure_accepts_candidate_whose_ane_executed(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_measure_prompt_leaves_a_non_ane_tail_chunk(monkeypatch):
+    """sequence_length * 2 keeps a tail chunk in the measured prefill.
+
+    stream_generate prefills tokens[:-1]; the previous * 2 + 1 made that
+    exactly two full ANE-shaped blocks with no GPU tail, which overstated
+    the ANE gain in every v0.6.2 tuner result.
+    """
+    pool = _measure_env(monkeypatch, trace=_trace(mlp_ops=126))
+    lengths = []
+    monkeypatch.setattr(
+        ane_tuning,
+        "_generate_prompt",
+        lambda tok, length, profile: lengths.append(length) or [0] * length,
+    )
+    run = ane_tuning.create_run(
+        ane_tuning.ANETuningRequest(model_id="qwen", sequence_length=2048, repeats=1)
+    )
+    candidate = ane_tuning._Candidate("MLP 35%", True, 0.35, False, None)
+
+    await ane_tuning._measure_candidate(run, pool, ModelSettings(), candidate)
+
+    assert lengths == [2048 + 1, 2048 * 2]
+
+
+@pytest.mark.asyncio
 async def test_gpu_only_candidate_is_never_rejected_for_idle_ane(monkeypatch):
     """The GPU-only baseline has no ANE trace by design."""
     pool = _measure_env(monkeypatch, trace=None)
