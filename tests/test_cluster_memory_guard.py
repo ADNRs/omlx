@@ -957,3 +957,64 @@ def test_the_tier_the_operator_chose_is_the_tier_that_is_measured(monkeypatch):
     assert safe["hard_limit"] <= aggressive["hard_limit"]
     # An explicit tier from a caller still wins over the operator's default.
     assert ceiling_breakdown("safe")["static"] == safe["static"]
+
+
+def test_operator_memory_settings_initializes_uninitialized_settings(monkeypatch):
+    """When settings are uninitialized (as in a fresh worker/probe process),
+    _operator_memory_settings calls init_settings() instead of silently defaulting
+    to stock balanced/0."""
+    from types import SimpleNamespace
+    import omlx.settings as settings_module
+    from omlx.cluster.memory_guard import _operator_memory_settings
+
+    initialized = False
+
+    def fake_get_settings():
+        if not initialized:
+            raise RuntimeError("Settings not initialized. Call init_settings() first.")
+        return SimpleNamespace(
+            memory=SimpleNamespace(
+                memory_guard_tier="custom",
+                memory_guard_custom_ceiling_gb=44.0,
+                prefill_memory_guard=True,
+            )
+        )
+
+    def fake_init_settings(*args, **kwargs):
+        nonlocal initialized
+        initialized = True
+        return fake_get_settings()
+
+    monkeypatch.setattr(settings_module, "get_settings", fake_get_settings)
+    monkeypatch.setattr(settings_module, "init_settings", fake_init_settings)
+
+    tier, custom_gb, enabled = _operator_memory_settings()
+    assert initialized is True
+    assert tier == "custom"
+    assert custom_gb == 44.0
+    assert enabled is True
+
+
+def test_operator_memory_settings_does_not_initialize_on_other_runtime_error(monkeypatch):
+    from types import SimpleNamespace
+    import omlx.settings as settings_module
+    from omlx.cluster.memory_guard import _operator_memory_settings
+
+    init_called = False
+
+    def fake_get_settings():
+        raise RuntimeError('Some other failure')
+
+    def fake_init_settings(*args, **kwargs):
+        nonlocal init_called
+        init_called = True
+        return SimpleNamespace()
+
+    monkeypatch.setattr(settings_module, 'get_settings', fake_get_settings)
+    monkeypatch.setattr(settings_module, 'init_settings', fake_init_settings)
+
+    tier, custom_gb, enabled = _operator_memory_settings()
+    assert init_called is False
+    assert tier == 'balanced'
+    assert custom_gb == 0.0
+    assert enabled is True
