@@ -1412,19 +1412,16 @@ Example directory structure:
         help="Emit machine-readable JSON",
     )
 
-    # Use parse_known_args so `omlx launch <tool> -- ...` can forward unknown
-    # tokens (e.g. `-r`, `--resume <id>`) to the underlying tool binary.
-    # Non-launch commands keep the previous strictness by rejecting unknowns.
-    args, extra_args = parser.parse_known_args()
-    # argparse's parse_known_args doesn't always consume the `--` separator
-    # itself (only when needed to resolve its own positionals), so it can
-    # leak into extra_args verbatim. Left in place, that literal "--" is
-    # forwarded to the underlying tool binary, which (for Commander.js-based
-    # CLIs like Claude Code) treats it as its own end-of-options marker —
-    # turning everything after it into positional prompt text instead of
-    # flags. Strip a single leading "--" before forwarding.
-    if extra_args and extra_args[0] == "--":
-        extra_args = extra_args[1:]
+    # Split launch's forwarding separator before argparse. parse_known_args()
+    # inconsistently retains it when known options precede it, and stripping it
+    # afterward cannot distinguish it from a separator intended for the tool.
+    argv = sys.argv[1:]
+    if argv[:1] == ["launch"] and "--" in argv[2:]:
+        separator_index = argv.index("--", 2)
+        args, extra_args = parser.parse_known_args(argv[:separator_index])
+        extra_args.extend(argv[separator_index + 1 :])
+    else:
+        args, extra_args = parser.parse_known_args(argv)
 
     if args.command == "launch":
         launch_command(args, extra_args=extra_args)
