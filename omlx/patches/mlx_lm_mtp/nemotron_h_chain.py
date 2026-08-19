@@ -54,6 +54,15 @@ def apply() -> bool:
         logger.debug("nemotron_h base MTP patch missing; chain patch skipped")
         return False
 
+    # Every sub-patch below already guards itself against re-patching, but
+    # apply() still re-ran and logged "applied" on every call regardless —
+    # the planner calls this on every discovered model on every autoconfigure
+    # tick, so a live cluster logged this every ~10-15s indefinitely. Mirror
+    # the sub-patches' own guard at the top level so a fully-patched module
+    # is a silent no-op, not just a cheap one.
+    if getattr(nh.Model, "_omlx_nh_chain_init", False):
+        return True
+
     _patch_mixer(nh)
     _patch_ssm_sequential()
     _patch_conv_capture(nh)

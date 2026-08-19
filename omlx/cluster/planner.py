@@ -8,6 +8,7 @@ import json
 import re
 import struct
 import subprocess
+import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -993,6 +994,10 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
     )
 
 
+_LAYOUT_CACHE: dict[str, tuple[tuple[float, float], ModelLayout]] = {}
+_LAYOUT_CACHE_LOCK = threading.Lock()
+
+
 def complete_model_layout(model_path: str | Path) -> ModelLayout:
     """Layout of a model this node holds in full, refusing one it holds part of.
 
@@ -1002,6 +1007,13 @@ def complete_model_layout(model_path: str | Path) -> ModelLayout:
     nothing in them says the other 22 exist on another Mac. Planning from that
     number splits a model that does not exist, so a layout is measured against
     the depth declared in config.json — a sidecar every node is staged.
+
+    The planner recomputes this for every discovered model on every
+    autoconfigure tick (the admin dashboard's cluster tab polls every ~10s
+    while open), so opening and re-parsing every safetensors shard's header
+    each call put real, sustained disk I/O and CPU load on a node that may be
+    mid-inference. Layouts are cached per resolved path and only recomputed
+    when the model directory or its config.json actually changed.
     """
 
     root = Path(model_path).expanduser()
@@ -1013,7 +1025,29 @@ def complete_model_layout(model_path: str | Path) -> ModelLayout:
     from omlx.utils.model_loading import maybe_apply_pre_load_patches
 
     maybe_apply_pre_load_patches(str(root))
-    layout = inspect_safetensors_layout(root)
+
+    resolved = str(root.resolve())
+    try:
+        fingerprint = (
+            root.stat().st_mtime,
+            (root / "config.json").stat().st_mtime,
+        )
+    except OSError:
+        fingerprint = None
+
+    layout: ModelLayout | None = None
+    if fingerprint is not None:
+        with _LAYOUT_CACHE_LOCK:
+            cached = _LAYOUT_CACHE.get(resolved)
+        if cached is not None and cached[0] == fingerprint:
+            layout = cached[1]
+
+    if layout is None:
+        layout = inspect_safetensors_layout(root)
+        if fingerprint is not None:
+            with _LAYOUT_CACHE_LOCK:
+                _LAYOUT_CACHE[resolved] = (fingerprint, layout)
+
     declared = _config_int(_model_config(root), "num_hidden_layers", 0)
     # Multi-token-prediction and draft heads add layers past the declared
     # depth, so only a shortfall means missing weights.
