@@ -7048,10 +7048,9 @@ async def stream_responses_api(
             "output_tokens_details": {"reasoning_tokens": reasoning_token_count},
         }
 
-    # 13. response.completed — MUST always be sent. Surface max_output_tokens
-    # truncation as status="incomplete" so clients see the turn was cut off
-    # (the Responses API has no finish_reason field).
+    # 13. Emit the terminal event matching the final response status.
     truncated = getattr(last_output, "finish_reason", None) == "length"
+    terminal_event = "response.incomplete" if truncated else "response.completed"
     final_response = {
         "id": response_id,
         "object": "response",
@@ -7077,9 +7076,9 @@ async def stream_responses_api(
 
     seq += 1
     yield format_sse_event(
-        "response.completed",
+        terminal_event,
         {
-            "type": "response.completed",
+            "type": terminal_event,
             "response": final_response,
             "sequence_number": seq,
         },
