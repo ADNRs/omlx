@@ -49,6 +49,13 @@ classic Metal kernels, and `OMLX_QWEN35_QMM_NAX=0` forces that fallback.
 `OMLX_QWEN35_ANE_PREFILL=0` keeps the whole feature off everywhere
 regardless of the per-model setting.
 
+The ANE GDN dispatch runs through the mlx-lm prefill linear patch, so
+`OMLX_QWEN35_Q4_LM_LINEAR=0` disables ANE GDN acceleration as well as the
+standalone GPU qmm routing. GDN b/a suffix projections follow the same q8
+token threshold as that patch: below `OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS`
+(default 16384, which covers every fixed ANE shape) q8 b/a use stock MLX,
+where the native q8 tile is not profitable.
+
 ## Per-model settings
 
 ```json

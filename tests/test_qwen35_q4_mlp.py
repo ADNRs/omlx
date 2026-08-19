@@ -188,6 +188,45 @@ def test_qwen35_q8_route_uses_bit_specific_min_tokens():
     )
 
 
+def test_post_ane_qmm_or_linear_routes_q8_through_env_threshold(monkeypatch):
+    import omlx.patches.qwen35_q4_mlp as q4patch
+
+    routed = []
+    monkeypatch.setattr(
+        q4patch,
+        "_linear_qmm",
+        lambda linear, x, variant: routed.append((linear, variant)) or x,
+    )
+
+    class _Stock:
+        def __init__(self, bits=None):
+            if bits is not None:
+                self.bits = bits
+            self.called = 0
+
+        def __call__(self, x):
+            self.called += 1
+            return x
+
+    x = mx.zeros((1, 2048, 64), dtype=mx.bfloat16)
+
+    q8 = _Stock(bits=8)
+    assert q4patch._post_ane_qmm_or_linear(q8, x, 8) is x
+    assert q8.called == 1
+    assert routed == []
+
+    monkeypatch.setenv("OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS", "2048")
+    q8_low = _Stock(bits=8)
+    q4patch._post_ane_qmm_or_linear(q8_low, x, 8)
+    assert q8_low.called == 0
+    assert routed == [(q8_low, 8)]
+
+    q5 = _Stock(bits=5)
+    q4patch._post_ane_qmm_or_linear(q5, x, 8)
+    assert q5.called == 0
+    assert routed[-1] == (q5, 8)
+
+
 def test_qwen35_q8_gdn_backend_has_first_refusal_before_gpu_threshold(
     monkeypatch,
 ):
@@ -195,7 +234,7 @@ def test_qwen35_q8_gdn_backend_has_first_refusal_before_gpu_threshold(
 
     import omlx.patches.qwen35_q4_mlp as q4patch
 
-    class BackendCalled(Exception):
+    class BackendCalledError(Exception):
         pass
 
     monkeypatch.setattr(q4patch, "_has_native_qmm", lambda: True)
@@ -217,7 +256,7 @@ def test_qwen35_q8_gdn_backend_has_first_refusal_before_gpu_threshold(
         assert module is gdn
         assert inputs is x
         assert target_verify is False
-        raise BackendCalled
+        raise BackendCalledError
 
     def original_call(module, inputs, mask=None, cache=None):
         return inputs
@@ -246,7 +285,7 @@ def test_qwen35_q8_gdn_backend_has_first_refusal_before_gpu_threshold(
         q4patch.register_qwen35_lm_gdn_prefill_backend(gdn_backend)
         assert q4patch.apply_qwen35_q4_lm_prefill_linear_patch() is True
 
-        with pytest.raises(BackendCalled):
+        with pytest.raises(BackendCalledError):
             qwen35.GatedDeltaNet.__call__(gdn, x)
         monkeypatch.setenv("OMLX_QWEN35_Q4_LM_LINEAR", "0")
         assert qwen35.GatedDeltaNet.__call__(gdn, x) is x

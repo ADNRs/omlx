@@ -670,7 +670,7 @@ def _gdn_backend(
         return None
     try:
         from omlx.custom_kernels.qwen35_prefill import fast
-        from omlx.patches.qwen35_q4_mlp import _linear_qmm
+        from omlx.patches.qwen35_q4_mlp import _post_ane_qmm_or_linear
 
         if state.model1 is not None:
             combined = fast.qwen35_ane_dual_affine_qmm_t(
@@ -704,16 +704,8 @@ def _gdn_backend(
             a = combined[..., a_start : a_start + state.a_outputs]
         else:
             _, _, b_proj, a_proj = _gdn_linears(gdn)
-            b = (
-                b_proj(x)
-                if getattr(b_proj, "bits", None) == 8
-                else _linear_qmm(b_proj, x, config.variant)
-            )
-            a = (
-                a_proj(x)
-                if getattr(a_proj, "bits", None) == 8
-                else _linear_qmm(a_proj, x, config.variant)
-            )
+            b = _post_ane_qmm_or_linear(b_proj, x, config.variant)
+            a = _post_ane_qmm_or_linear(a_proj, x, config.variant)
         return mixed_qkv, z, b, a
     except Exception:
         gdn._omlx_ane_gdn_failed = True
