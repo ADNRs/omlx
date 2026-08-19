@@ -1577,7 +1577,7 @@ def test_supervisor_reaps_remote_ranks_via_ssh_sigterm(monkeypatch, tmp_path):
         assert result.returncode == 0, result.stderr
         victim.wait(timeout=2.0)
         assert victim.poll() is not None
-        assert not marker_file.exists()
+        assert marker_file.exists()  # kept as crash evidence for _runtime_failure_reason
     finally:
         if victim.poll() is None:
             victim.kill()
@@ -1643,7 +1643,7 @@ def test_supervisor_reaps_remote_ranks_escalates_to_sigkill(monkeypatch, tmp_pat
         assert result.returncode == 0, result.stderr
         victim.wait(timeout=5.0)
         assert victim.poll() is not None
-        assert not marker_file.exists()
+        assert marker_file.exists()  # kept as crash evidence for _runtime_failure_reason
     finally:
         if victim.poll() is None:
             victim.kill()
