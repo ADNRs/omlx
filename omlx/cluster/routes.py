@@ -95,8 +95,10 @@ from .staging import (
     InsufficientDiskError,
     index_shards,
     model_staging_inventory,
+    home_relative_model_path,
     plan_staging,
     remote_file_sizes,
+    remote_model_dir,
     remote_model_staging_inventory,
     stage_files_from_source,
     stage_manifest,
@@ -751,10 +753,16 @@ def _create_cluster_plan(request: ClusterPlanRequest):
         and model.source != "synthetic"
         and not model.supports_pipeline
     ):
-        raise PlanningError(
+        detail = (
             "pipeline parallelism is not possible for this model: the "
             "architecture does not implement the MLX-LM pipeline forward path"
         )
+        if model.supports_tensor_parallel:
+            detail += (
+                f". Choose {len(nodes)}-way tensor parallelism to run it "
+                f"across {len(nodes)} Macs."
+            )
+        raise PlanningError(detail)
     defaults = execution_profile(request.execution_profile)
     if request.tensor_parallel_size > 1:
         return plan_hybrid(
@@ -1525,21 +1533,28 @@ def _run_staging_job(
             job_id,
             lambda job: job.update(status="running"),
         )
+        # deployment.model is the coordinator's own absolute path. A peer with a
+        # different macOS account has a different $HOME, so probing it at that
+        # path finds nothing and re-copies the whole model (and then trips the
+        # disk-space check). Resolve each peer's copy in its OWN home from the
+        # portable ~-form.
+        portable_model_path = home_relative_model_path(deployment.model)
         failed_nodes: list[str] = []
         for host, assignment in zip(deployment.hosts, assignments):
-            present = (
-                {
-                    path.name: path.stat().st_size
-                    for path in model_path.iterdir()
-                    if path.is_file()
-                }
-                if _local_ssh_target(host.ssh) and model_path.is_dir()
-                else (
-                    {}
-                    if _local_ssh_target(host.ssh)
-                    else remote_file_sizes(host.ssh, str(model_path))
+            if _local_ssh_target(host.ssh):
+                destination_dir = str(model_path)
+                present = (
+                    {
+                        path.name: path.stat().st_size
+                        for path in model_path.iterdir()
+                        if path.is_file()
+                    }
+                    if model_path.is_dir()
+                    else {}
                 )
-            )
+            else:
+                destination_dir = remote_model_dir(host.ssh, portable_model_path)
+                present = remote_file_sizes(host.ssh, destination_dir)
             plan = plan_staging(
                 model_path,
                 node_id=assignment.node_id,
@@ -1602,6 +1617,7 @@ def _run_staging_job(
                 source_host=source_host,
                 destination_host=host.ssh,
                 expected_sizes=expected_sizes,
+                destination_dir=destination_dir,
                 parallel=parallel,
                 progress=progress,
             )

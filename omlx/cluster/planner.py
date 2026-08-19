@@ -685,6 +685,26 @@ def _supports_pipeline(config: dict[str, Any]) -> bool:
     model_type = config.get("model_type")
     if not isinstance(model_type, str):
         return False
+    # An architecture oMLX explicitly vouches for wins, even a VLM: the
+    # minimax_m3_vl patch ships its own ``pipeline()`` and sets
+    # ``SUPPORTS_PIPELINE = True``. Honour that before the vision guard below.
+    import sys
+
+    declared = getattr(
+        sys.modules.get(f"mlx_lm.models.{model_type}"), "SUPPORTS_PIPELINE", None
+    )
+    if declared is not None:
+        return bool(declared)
+    # A checkpoint carrying a vision sub-config is served by mlx-vlm, whose
+    # loaded wrapper never exposes ``model.model.pipeline`` — the exact
+    # attribute progressive_loading gates on. Its text backbone's source-level
+    # ``pipeline()`` belongs to the mlx-lm implementation this model does not
+    # use, so trusting it (as ``_declares_pipeline`` does) is the false positive
+    # that offered pipeline for Qwen3.5/3.6-family VLMs and then failed at load.
+    from omlx.model_discovery import _has_vision_subconfig
+
+    if _has_vision_subconfig(config):
+        return False
     return _declares_pipeline(model_type)
 
 

@@ -204,6 +204,37 @@ def test_parse_invalid_thunderbolt_payload_returns_no_ports():
     assert probe.parse_thunderbolt_ports(result) == ()
 
 
+def test_local_login_name_is_the_short_name_from_the_password_db(monkeypatch):
+    import pwd
+
+    monkeypatch.setattr(probe.os, "getuid", lambda: 501)
+    monkeypatch.setattr(
+        probe.pwd,
+        "getpwuid",
+        lambda uid: pwd.struct_passwd(
+            ("aphoenix", "*", uid, 20, "Alyta Phoenix", "/Users/aphoenix", "/bin/zsh")
+        ),
+    )
+    # The full name ("Alyta Phoenix") must never be used; only the login name.
+    assert probe.local_login_name() == "aphoenix"
+
+
+def test_local_login_name_falls_back_to_env_when_passwd_missing(monkeypatch):
+    def _raise(_uid):
+        raise KeyError("no such uid")
+
+    monkeypatch.setattr(probe.pwd, "getpwuid", _raise)
+    monkeypatch.setenv("USER", "fallbackuser")
+    assert probe.local_login_name() == "fallbackuser"
+
+
+def test_collect_status_advertises_ssh_user(monkeypatch):
+    monkeypatch.setattr(probe, "local_login_name", lambda: "aphoenix")
+    status = probe.collect_cluster_status()
+    assert status.ssh_user == "aphoenix"
+    assert status.to_dict()["node"]["ssh_user"] == "aphoenix"
+
+
 def test_mlx_version_uses_core_module_version(monkeypatch):
     monkeypatch.setattr(probe.hardware, "HAS_MLX", True)
     monkeypatch.setattr(

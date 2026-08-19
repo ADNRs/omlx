@@ -439,6 +439,50 @@ def test_remote_staging_resumes_without_recopying_verified_files(
     assert result.copied == ()
 
 
+def test_remote_staging_probes_the_peer_destination_dir_not_the_source(
+    tmp_path,
+    monkeypatch,
+):
+    # A cross-user cluster: the source lives under the coordinator's home, but
+    # the peer holds its copy under a different $HOME. The present-file probe
+    # and scp destination must use the peer path, otherwise the probe reads an
+    # empty directory and re-copies the whole model.
+    from omlx.cluster.staging import stage_remote_files
+
+    root = _model(tmp_path / "source", layers=2, per_file=2)
+    peer_dir = "/Users/peer/.omlx/models/m"
+    plan = plan_staging(root, node_id="studio", start_layer=0, end_layer=2)
+    landed = {
+        name: (root / name).stat().st_size
+        for name in (*plan.required, *sidecar_files(root))
+    }
+    seen_paths = []
+    monkeypatch.setattr(
+        "omlx.cluster.staging.check_disk_for_staging",
+        lambda *args, **kwargs: 100 * 1024**3,
+    )
+
+    def present_reader(_host, path):
+        seen_paths.append(path)
+        return dict(landed)
+
+    result = stage_remote_files(
+        plan,
+        model_path=root,
+        destination_host="studio.local",
+        destination_dir=peer_dir,
+        sidecars=sidecar_files(root),
+        transfer=lambda **_kwargs: pytest.fail(
+            "files already on the peer must not be copied"
+        ),
+        present_reader=present_reader,
+    )
+
+    assert seen_paths == [peer_dir]
+    assert result.ok
+    assert result.copied == ()
+
+
 def test_peer_owned_model_stages_from_the_holder_not_the_coordinator(monkeypatch):
     from omlx.cluster import staging
     from omlx.cluster.staging import StagingPlan, stage_files_from_source

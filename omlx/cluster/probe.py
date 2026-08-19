@@ -7,6 +7,7 @@ import ipaddress
 import json
 import os
 import platform
+import pwd
 import re
 import shutil
 import socket
@@ -381,6 +382,46 @@ def _warning_for(result: CommandResult, label: str) -> str | None:
     return f"{label} probe unavailable: {detail}"
 
 
+def local_login_name() -> str:
+    """This account's real login short name — never the display/full name.
+
+    Keyed by UID rather than getpass.getuser(), which trusts $USER/$LOGNAME and
+    can report a spoofed or inherited value. Advertised in cluster status so a
+    peer forms a correct ``user@host`` instead of relying on OpenSSH's fallback
+    to the caller's own account name.
+    """
+
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except (KeyError, OSError):
+        return os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+
+
+def _advertised_python_executable() -> str:
+    """The interpreter another Mac should run over SSH to reach this node.
+
+    ``sys.executable`` loses the environment a launcher (the packaged app or a
+    run-from-source script) assembled, so running it bare over SSH cannot import
+    oMLX. The worker shim published at server start re-creates that environment.
+    Advertise the shim only when it wraps THIS interpreter — a shim rewritten by
+    a different install must not be advertised.
+    """
+
+    from pathlib import Path
+
+    shim = Path.home() / ".omlx" / "bin" / "omlx-cluster-python"
+    try:
+        if (
+            shim.is_file()
+            and os.access(shim, os.X_OK)
+            and sys.executable in shim.read_text(encoding="utf-8")
+        ):
+            return str(shim)
+    except OSError:
+        pass
+    return sys.executable
+
+
 def collect_cluster_status(
     *,
     route_to: str | None = None,
@@ -561,6 +602,7 @@ def collect_cluster_status(
     return ClusterStatus(
         collected_at=timestamp.isoformat(),
         hostname=socket.gethostname(),
+        ssh_user=local_login_name(),
         platform=platform.platform(),
         chip_name=chip_name,
         physical_memory_bytes=physical_memory_bytes,
@@ -573,7 +615,7 @@ def collect_cluster_status(
             macos_version=platform.mac_ver()[0] or "unknown",
             os_name=platform.system().lower() or "unknown",
             os_version=platform.release() or "unknown",
-            python_executable=sys.executable,
+            python_executable=_advertised_python_executable(),
         ),
         transport_state=transport_state,
         rdma=RDMACapability(

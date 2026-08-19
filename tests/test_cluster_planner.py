@@ -491,3 +491,42 @@ def test_a_misspelled_role_is_refused_rather_than_quietly_made_headless():
     assert NodeBudget(
         node_id="macbook", capacity_bytes=100 * GIB, role=" WorkStation "
     ).role == "workstation"
+
+
+def test_supports_pipeline_false_for_vision_config_vlm(monkeypatch):
+    # The text backbone declares a pipeline() in mlx-lm source, but the on-disk
+    # checkpoint carries a vision sub-config, so it is served by mlx-vlm and has
+    # no model.model.pipeline (progressive_loading gates on exactly that). The
+    # static flag must mirror the runtime, i.e. report False.
+    from omlx.cluster import planner
+
+    monkeypatch.setattr(
+        planner, "_model_source", lambda mt: "def pipeline(self, group): ..."
+    )
+    config = {"model_type": "qwen3_5_moe", "vision_config": {"depth": 24}}
+    assert planner._supports_pipeline(config) is False
+
+
+def test_supports_pipeline_true_for_text_model(monkeypatch):
+    from omlx.cluster import planner
+
+    monkeypatch.setattr(
+        planner, "_model_source", lambda mt: "def pipeline(self, group): ..."
+    )
+    assert planner._supports_pipeline({"model_type": "qwen3_moe"}) is True
+
+
+def test_explicit_support_declaration_wins_over_vision_guard(monkeypatch):
+    # A VLM oMLX explicitly vouches for (ships its own pipeline()) stays True.
+    import sys
+    import types
+
+    from omlx.cluster import planner
+
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_lm.models.minimax_m3_vl",
+        types.SimpleNamespace(SUPPORTS_PIPELINE=True),
+    )
+    config = {"model_type": "minimax_m3_vl", "vision_config": {"depth": 8}}
+    assert planner._supports_pipeline(config) is True
