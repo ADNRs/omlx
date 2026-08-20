@@ -4252,6 +4252,32 @@
                 return true;
             },
 
+            async prepareCudaSupernodesForActivation({ rebuildPlan = false } = {}) {
+                const planRevision = Number(this._clusterPlanRevision || 0);
+                if (
+                    typeof this.ensureCudaSupernodesVerified === 'function'
+                    && !await this.ensureCudaSupernodesVerified()
+                ) {
+                    const message = this.clusterCudaFabricVerificationError
+                        || 'Verify the CUDA direct link before starting the cluster.';
+                    if (rebuildPlan) this.clusterPlanError = message;
+                    else this.clusterAutoconfigureError = message;
+                    return false;
+                }
+                if (
+                    rebuildPlan
+                    && Number(this._clusterPlanRevision || 0) !== planRevision
+                ) {
+                    await this.runClusterPlan();
+                    if (!this.clusterActivationReady()) {
+                        this.clusterPlanError = this.clusterPlanError
+                            || 'Rebuild the plan after verifying the CUDA direct link.';
+                        return false;
+                    }
+                }
+                return true;
+            },
+
             clusterNeuralFabricJob() {
                 const jobs = this.clusterStatus?.runtime_jobs?.jobs || [];
                 return jobs.find(job => job.live) || null;
@@ -5373,15 +5399,7 @@
                         'Choose a worker before starting the cluster.';
                     return;
                 }
-                if (
-                    typeof this.ensureCudaSupernodesVerified === 'function'
-                    && !await this.ensureCudaSupernodesVerified()
-                ) {
-                    this.clusterAutoconfigureError =
-                        this.clusterCudaFabricVerificationError
-                        || 'Verify the CUDA direct link before starting the cluster.';
-                    return;
-                }
+                if (!await this.prepareCudaSupernodesForActivation()) return;
                 const linkStatus = await this.loadClusterLinkStatus();
                 if (linkStatus?.setup_available) {
                     const ready = await this.prepareClusterLink();
@@ -6274,6 +6292,9 @@
 
             async activateClusterDeployment() {
                 if (!this.clusterActivationReady()) return;
+                if (!await this.prepareCudaSupernodesForActivation({
+                    rebuildPlan: true,
+                })) return;
                 this.clusterActivationLoading = true;
                 this.clusterActivationResult = null;
                 this.clusterPlanChanges = null;

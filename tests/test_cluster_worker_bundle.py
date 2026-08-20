@@ -188,6 +188,27 @@ def test_bootstrap_refuses_a_symlinked_authorized_keys(monkeypatch, tmp_path):
     assert target.read_text() == "must stay unchanged\n"
 
 
+def test_bootstrap_refuses_a_symlinked_ssh_directory(tmp_path):
+    target = tmp_path / "outside-ssh"
+    target.mkdir()
+    authorized_keys = target / "authorized_keys"
+    authorized_keys.write_text("must stay unchanged\n")
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".ssh").symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(cuda_worker_bootstrap.BootstrapError, match="SSH directory"):
+        cuda_worker_bootstrap._install_controller_key(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAworker controller",
+            controller_ip="10.42.0.10",
+            home=home,
+            uid=1000,
+            gid=1000,
+        )
+
+    assert authorized_keys.read_text() == "must stay unchanged\n"
+
+
 def test_bootstrap_claims_before_slow_system_provisioning(monkeypatch, tmp_path):
     events = []
     source = b"worker-source"

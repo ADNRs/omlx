@@ -230,7 +230,11 @@ def _install_controller_key(
 ) -> None:
     ssh_dir = home / ".ssh"
     authorized_keys = ssh_dir / "authorized_keys"
+    if ssh_dir.is_symlink():
+        raise BootstrapError("SSH directory must not be a symbolic link")
     ssh_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if ssh_dir.is_symlink():
+        raise BootstrapError("SSH directory must not be a symbolic link")
     if authorized_keys.is_symlink():
         raise BootstrapError("authorized_keys must not be a symbolic link")
     existing = authorized_keys.read_text(encoding="utf-8") if authorized_keys.exists() else ""
