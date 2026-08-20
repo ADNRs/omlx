@@ -1360,12 +1360,16 @@ class GlobalSettings:
             "idle_timeout": self.idle_timeout.to_dict(),
         }
 
+        # Write to a temp file and rename so a crash or a concurrent
+        # writer can never leave a torn settings.json (same pattern as
+        # ModelSettingsManager._save). The rename also carries the temp
+        # file's 0o600 mode onto the destination. The temp name embeds the
+        # pid: with a shared name, two processes saving at once interleave
+        # inside the same temp file and the rename publishes the mix.
+        temp_file = settings_file.with_name(
+            f"{settings_file.name}.{os.getpid()}.tmp"
+        )
         try:
-            # Write to a temp file and rename so a crash or a concurrent
-            # writer can never leave a torn settings.json (same pattern as
-            # ModelSettingsManager._save). The rename also carries the temp
-            # file's 0o600 mode onto the destination.
-            temp_file = settings_file.with_name(settings_file.name + ".tmp")
             with os.fdopen(
                 os.open(temp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600),
                 "w",
@@ -1378,6 +1382,7 @@ class GlobalSettings:
             logger.info(f"Saved settings to {settings_file}")
         except OSError as e:
             logger.error(f"Failed to save settings to {settings_file}: {e}")
+            temp_file.unlink(missing_ok=True)
             raise
 
     def save_cli_overrides(self, args: Any) -> None:

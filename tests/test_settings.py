@@ -754,7 +754,7 @@ class TestMCPSettings:
         settings_file = tmp_path / "settings.json"
         assert settings_file.exists()
         json.loads(settings_file.read_text())  # parses cleanly
-        assert not list(tmp_path.glob("settings.json.tmp"))
+        assert not list(tmp_path.glob("settings.json*.tmp"))
         if os.name == "posix":
             assert (settings_file.stat().st_mode & 0o777) == 0o600
 
