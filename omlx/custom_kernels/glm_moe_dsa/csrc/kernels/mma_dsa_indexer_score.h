@@ -13,8 +13,8 @@
 // benchmark. The one-time runtime compile (~100-300ms, cached by library
 // name and by the OS shader cache) is paid at first prefill.
 //
-// Structure (why it beats Steel by ~1.37x on M2 Ultra — see
-// dsv4f_m2_kernels/docs/v25-zero-barrier-kernel.md for the measured story):
+// Structure (why it beats Steel by ~1.37x on M2 Ultra — measured story in
+// PR #2802):
 //   1. K tile resident in threadgroup memory TRANSPOSED [k][n], PAD=0
 //      (16KB = exactly half the M2 per-core tgp, preserving 2 resident
 //      threadgroups). Loaded once; the ONLY threadgroup_barrier in the
@@ -82,7 +82,7 @@ inline T mma_dsa_finfo_min() {
       ushort(metal::is_same<T, bfloat>::value ? 0xFF7F : 0xFBFF));
 }
 
-template <typename T, int BM, int BN, int BK, int WM, int WN, int H, int D,
+template <typename T, int BM, int BN, int WM, int WN, int H, int D,
           bool BOUNDARY>
 [[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void
 mma_dsa_indexer_score(
@@ -261,11 +261,11 @@ mma_dsa_indexer_score(
 }
 
 template [[host_name("mma_dsa_indexer_score_bfloat16_interior")]] [[kernel]]
-decltype(mma_dsa_indexer_score<bfloat, 64, 64, 32, 2, 2, 64, 128, false>)
-mma_dsa_indexer_score<bfloat, 64, 64, 32, 2, 2, 64, 128, false>;
+decltype(mma_dsa_indexer_score<bfloat, 64, 64, 2, 2, 64, 128, false>)
+mma_dsa_indexer_score<bfloat, 64, 64, 2, 2, 64, 128, false>;
 template [[host_name("mma_dsa_indexer_score_bfloat16_boundary")]] [[kernel]]
-decltype(mma_dsa_indexer_score<bfloat, 64, 64, 32, 2, 2, 64, 128, true>)
-mma_dsa_indexer_score<bfloat, 64, 64, 32, 2, 2, 64, 128, true>;
+decltype(mma_dsa_indexer_score<bfloat, 64, 64, 2, 2, 64, 128, true>)
+mma_dsa_indexer_score<bfloat, 64, 64, 2, 2, 64, 128, true>;
 )MMADSA";
 
 } // namespace omlx::glm_kernels
