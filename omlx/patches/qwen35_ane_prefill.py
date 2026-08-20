@@ -316,7 +316,13 @@ def _prepare_cpu_linear(
     linear: Any, fraction: float
 ) -> _CpuLinearState | None:
     """Eagerly split one affine projection into FP16 CPU and quantized GPU rows."""
+    from omlx.custom_kernels.qwen35_prefill import fast
+
     if fraction <= 0 or getattr(linear, "scales", None) is None:
+        return None
+    # Without the native symbol the dispatch wrapper would raise at first use
+    # and latch the whole layer off; stay a clean no-op like the other sites.
+    if not fast.has_symbol("qwen35_cpu_fp16_affine_qmm_t"):
         return None
     spec = _affine_spec(linear, mx.float16)
     if spec is None:
@@ -1957,14 +1963,25 @@ def _enable_dual_procedure_banks(
         # than ANE warmup. Guarded per-model so an older compiled extension
         # without warmup() degrades to the previous behavior instead of
         # failing the load.
+        # Warmup failures are soft: the procedures are already registered, so
+        # a broken one is disabled by the runtime failure latch at first
+        # dispatch instead of aborting the whole ANE setup here.
         warm_start = time.perf_counter()
         warmed = 0
-        for warm_model in (*models0, *models1):
-            warmup = getattr(warm_model, "warmup", None)
-            if warmup is None:
-                continue
-            warmup()
-            warmed += 1
+        try:
+            for warm_model in (*models0, *models1):
+                warmup = getattr(warm_model, "warmup", None)
+                if warmup is None:
+                    continue
+                warmup()
+                warmed += 1
+        except Exception:
+            logger.warning(
+                "ANE warmup failed after %d procedures; continuing, the "
+                "runtime failure latch handles broken procedures at first use",
+                warmed,
+                exc_info=True,
+            )
         if warmed:
             logger.info(
                 "Warmed %d ANE procedures in %.1fs at load",

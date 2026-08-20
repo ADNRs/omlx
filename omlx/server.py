@@ -2512,18 +2512,24 @@ def _ane_prefill_status(pool) -> dict:
     omitted, so an empty ``models`` list means no loaded model uses it. Lets a
     statusline distinguish "ANE active on N layers" from a silent no-op.
     """
-    result = {"available": False, "configured_models": 0, "models": []}
+    result = {"patch_available": False, "configured_models": 0, "models": []}
     if pool is None:
         return result
     try:
         from .patches.qwen35_ane_prefill import qwen35_ane_prefill_status
     except Exception:  # noqa: BLE001 - patch optional at runtime
         return result
-    result["available"] = True
+    # "patch importable", not "ANE hardware present": eligibility is decided
+    # per model at enable time and reported through the per-model entries.
+    result["patch_available"] = True
     try:
         for model_id, entry in pool._entries.items():
             engine = getattr(entry, "engine", None)
-            mdl = getattr(engine, "_model", None) if engine is not None else None
+            mdl = (
+                getattr(engine, "_model", None) or getattr(engine, "_vlm_model", None)
+                if engine is not None
+                else None
+            )
             if mdl is None:
                 continue
             st = qwen35_ane_prefill_status(mdl)

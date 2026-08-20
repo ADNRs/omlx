@@ -853,7 +853,6 @@ final class ModelSettingsScreenVM {
         if let fraction = recommendation.mlpFraction {
             qwen35AnePrefillFraction = Self.formatPct(fraction)
         }
-        qwen35AnePrefillDualAne = true
         qwen35AnePrefillGdn = recommendation.gdnEnabled
         if let fraction = recommendation.gdnFraction {
             qwen35AnePrefillGdnFraction = Self.formatPct(fraction)

@@ -184,13 +184,17 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             terminationReason: nil
         )
 
+        // The tuner ran in whatever ANE mode the model had; applying its
+        // result must not flip dual_ane and invalidate the measurement.
+        vm.qwen35AnePrefillDualAne = false
+
         vm.applyANETuningRecommendation()
 
         XCTAssertTrue(vm.profileDirty)
         XCTAssertTrue(vm.qwen35AnePrefillEnabled)
         XCTAssertEqual(vm.qwen35AnePrefillSequenceLength, "2112")
         XCTAssertEqual(vm.qwen35AnePrefillFraction, "0.467")
-        XCTAssertTrue(vm.qwen35AnePrefillDualAne)
+        XCTAssertFalse(vm.qwen35AnePrefillDualAne)
         XCTAssertTrue(vm.qwen35AnePrefillGdn)
         XCTAssertEqual(vm.qwen35AnePrefillGdnFraction, "0.527")
     }

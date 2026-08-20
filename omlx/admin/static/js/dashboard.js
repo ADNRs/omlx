@@ -7962,7 +7962,6 @@
                 };
                 if (recommendation.enabled) {
                     patch.qwen35_ane_prefill_fraction = Number(recommendation.mlp_fraction);
-                    patch.qwen35_ane_prefill_dual_ane = true;
                     patch.qwen35_ane_prefill_gdn = !!recommendation.gdn_enabled;
                     if (recommendation.gdn_enabled) {
                         patch.qwen35_ane_prefill_gdn_fraction = Number(

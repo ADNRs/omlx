@@ -562,6 +562,9 @@ def test_down_projection_cpu_share_is_prepared_and_dispatched(monkeypatch):
     linear = mlp.down_proj
     linear.scales = linear.scales.astype(mx.float16)
     linear.biases = linear.biases.astype(mx.float16)
+    monkeypatch.setattr(
+        fast, "has_symbol", lambda name: name == "qwen35_cpu_fp16_affine_qmm_t"
+    )
     state = ane_patch._prepare_cpu_linear(linear, 0.5)
 
     assert state is not None
@@ -2195,3 +2198,48 @@ def test_bank_prepare_keeps_packed_q6_suffix():
     assert bool(mx.array_equal(state.scales, expected_scales))
     assert bool(mx.array_equal(state.biases, expected_biases))
     assert dense1 is not None
+
+
+def test_enable_survives_warmup_failure(monkeypatch, caplog):
+    """A procedure whose warmup throws must not abort the whole ANE setup."""
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+
+    class _FailingModel:
+        def warmup(self):
+            raise RuntimeError("ANE evaluation failed")
+
+    def compile_bank(weights, sequence_length, ane_instance):
+        return [_FailingModel() for _ in weights]
+
+    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    model = _Model(2)
+
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        count = ane_patch.enable_qwen35_ane_prefill(
+            model,
+            sequence_length=2048,
+            fraction=0.5,
+            max_layers=2,
+            dual_ane=True,
+        )
+
+    assert count == 2
+    assert "ANE warmup failed" in caplog.text
+
+
+def test_prepare_cpu_linear_needs_the_native_symbol(monkeypatch):
+    """Without the CPU qmm symbol the down split stays a clean no-op."""
+    linear = nn.QuantizedLinear(128, 256, bias=False, group_size=64, bits=4)
+    linear.scales = linear.scales.astype(mx.float16)
+    linear.biases = linear.biases.astype(mx.float16)
+
+    monkeypatch.setattr(fast, "has_symbol", lambda name: False)
+    assert ane_patch._prepare_cpu_linear(linear, 0.25) is None
+
+    monkeypatch.setattr(
+        fast, "has_symbol", lambda name: name == "qwen35_cpu_fp16_affine_qmm_t"
+    )
+    assert ane_patch._prepare_cpu_linear(linear, 0.25) is not None

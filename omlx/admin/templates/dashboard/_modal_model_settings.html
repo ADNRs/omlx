@@ -779,11 +779,7 @@
                                                     </div>
                                                     <button type="button"
                                                             @click="modelSettings.qwen35_ane_prefill_cpu_enabled = !modelSettings.qwen35_ane_prefill_cpu_enabled"
-                                                            :disabled="!modelSettings.qwen35_ane_prefill_dual_ane"
-                                                            :class="[
-                                                                modelSettings.qwen35_ane_prefill_cpu_enabled ? 'bg-black' : 'bg-neutral-200',
-                                                                !modelSettings.qwen35_ane_prefill_dual_ane ? 'opacity-40 cursor-not-allowed' : ''
-                                                            ]"
+                                                            :class="modelSettings.qwen35_ane_prefill_cpu_enabled ? 'bg-black' : 'bg-neutral-200'"
                                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                         <span :class="modelSettings.qwen35_ane_prefill_cpu_enabled ? 'translate-x-5' : 'translate-x-0'"
                                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>

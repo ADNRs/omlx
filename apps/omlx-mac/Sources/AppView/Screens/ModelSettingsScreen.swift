@@ -1287,7 +1287,6 @@ private struct ExperimentalSection: View {
                                          comment: "Constraint and tuning guidance for Qwen CPU prefill sharing")) {
                         Toggle("", isOn: vm.bindProfile($vm.qwen35AnePrefillCpuEnabled))
                             .labelsHidden().toggleStyle(.switch)
-                            .disabled(!vm.qwen35AnePrefillDualAne)
                     }
                     if vm.qwen35AnePrefillCpuEnabled {
                         Row(label: String(localized: "settings.experimental.qwen_ane.cpu_fraction.label",

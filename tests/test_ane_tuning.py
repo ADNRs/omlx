@@ -539,3 +539,27 @@ async def test_tuner_preserves_partial_matrix_and_failure_reason(monkeypatch):
         "speedup_percent": 0.0,
         "sequence_length": run.request.sequence_length,
     }
+
+
+def test_profile_refinement_rebalances_mlp_without_cpu_share(monkeypatch):
+    """cpu_fraction 0 must keep the plain two-way ANE/GPU rebalance."""
+    monkeypatch.setattr(
+        ane_tuning, "_fraction_grid", lambda: [0.4, 0.45, 0.5, 0.53, 0.6]
+    )
+    candidate = ane_tuning._Candidate("predicted", True, 0.5, False, None)
+    operations = 192
+    result = {
+        "_profile": {
+            "mlp": {
+                "operations": operations,
+                "ane0_eval_ns": 19.0e6 * operations,
+                "ane1_eval_ns": 19.0e6 * operations,
+                "gpu_completion_ns": 10.0e6 * operations,
+            }
+        }
+    }
+
+    refined = ane_tuning._profile_refinement(candidate, result)
+
+    assert refined.mlp_fraction == 0.35
+    assert not refined.cpu_fraction
