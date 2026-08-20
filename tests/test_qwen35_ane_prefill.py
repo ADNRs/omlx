@@ -2442,3 +2442,47 @@ def test_builder_split_ladder_retries_without_restaging(monkeypatch):
         builder0.compiled_spans
     ) > 1
     assert model._omlx_ane_resident_program_count == 4
+
+
+def test_warmup_failure_latches_only_the_owning_module(monkeypatch, caplog):
+    """One broken procedure disables its module; the rest keep warming (#2940)."""
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(
+        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+    )
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+
+    warm_calls = []
+
+    class _WarmModel:
+        def __init__(self, index):
+            self.index = index
+
+        def warmup(self):
+            if self.index == 1:
+                raise RuntimeError("ANE evaluation failed")
+            warm_calls.append(self.index)
+
+    def compile_bank(weights, sequence_length, ane_instance):
+        return [_WarmModel(i) for i in range(len(weights))]
+
+    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    model = _Model(3)
+
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        count = ane_patch.enable_qwen35_ane_prefill(
+            model,
+            sequence_length=2048,
+            fraction=0.5,
+            max_layers=3,
+            dual_ane=True,
+        )
+
+    assert count == 3
+    assert getattr(model.layers[1], "_omlx_ane_prefill_failed", False)
+    assert not getattr(model.layers[0], "_omlx_ane_prefill_failed", False)
+    assert not getattr(model.layers[2], "_omlx_ane_prefill_failed", False)
+    assert sorted(warm_calls) == [0, 0, 2, 2]
+    assert "disabling ANE" in caplog.text

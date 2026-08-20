@@ -2034,24 +2034,43 @@ def _enable_dual_procedure_banks(
         # than ANE warmup. Guarded per-model so an older compiled extension
         # without warmup() degrades to the previous behavior instead of
         # failing the load.
-        # Warmup failures are soft: the procedures are already registered, so
-        # a broken one is disabled by the runtime failure latch at first
-        # dispatch instead of aborting the whole ANE setup here.
+        # A warmup failure latches ANE off for the owning module right here.
+        # The per-module flag is checked at graph construction, which is the
+        # only place the failure can still be intercepted: by evaluation time
+        # the sticky per-procedure error re-raises inside the scheduler and
+        # fails every request instead of falling back (#2940). Remaining
+        # procedures keep warming, so one broken procedure costs one module
+        # its ANE path rather than taking down the request path.
         warm_start = time.perf_counter()
         warmed = 0
-        try:
-            for warm_model in (*models0, *models1):
-                warmup = getattr(warm_model, "warmup", None)
-                if warmup is None:
-                    continue
-                warmup()
-                warmed += 1
-        except Exception:
+        disabled = 0
+        for procedure, (module, _) in enumerate((*prepared_mlps, *prepared_gdns)):
+            try:
+                for warm_model in (models0[procedure], models1[procedure]):
+                    warmup = getattr(warm_model, "warmup", None)
+                    if warmup is None:
+                        continue
+                    warmup()
+                    warmed += 1
+            except Exception:
+                if procedure < len(prepared_mlps):
+                    module._omlx_ane_prefill_failed = True
+                else:
+                    module._omlx_ane_gdn_failed = True
+                disabled += 1
+                logger.warning(
+                    "ANE warmup failed for procedure %d; disabling ANE for "
+                    "its %s module and continuing",
+                    procedure,
+                    "MLP" if procedure < len(prepared_mlps) else "GDN",
+                    exc_info=True,
+                )
+        if disabled:
             logger.warning(
-                "ANE warmup failed after %d procedures; continuing, the "
-                "runtime failure latch handles broken procedures at first use",
-                warmed,
-                exc_info=True,
+                "Disabled ANE on %d of %d modules after warmup failures; "
+                "they fall back to GPU",
+                disabled,
+                total_procedures,
             )
         if warmed:
             logger.info(
