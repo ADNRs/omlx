@@ -1558,8 +1558,16 @@ public:
     gpu_buffer->retain();
     encoder.commit();
 
-    cpu_fp16_matmul(cpu_input ? *cpu_input : x, cpu_weight, cpu_output,
-                    M, cpu_n, K, cpu_threads_, cpu_shared_resource_);
+    try {
+      cpu_fp16_matmul(cpu_input ? *cpu_input : x, cpu_weight, cpu_output,
+                      M, cpu_n, K, cpu_threads_, cpu_shared_resource_);
+    } catch (...) {
+      // The committed qmm still reads this frame's MLX arrays; drain it
+      // before unwinding so the allocator cannot recycle them mid-flight.
+      gpu_buffer->waitUntilCompleted();
+      gpu_buffer->release();
+      throw;
+    }
     gpu_buffer->waitUntilCompleted();
     gpu_buffer->release();
 
@@ -1782,21 +1790,34 @@ public:
         profile_add(profile_category, kAne0EvalNs, end - start);
       }
     }).detach();
-    if (cpu_weight) {
-      const uint64_t cpu_start = profiling ? profile_now_ns() : 0;
-      cpu_fp16_matmul(cpu_input ? *cpu_input : x, *cpu_weight, *cpu_output, M,
-                      cpu_n, K, cpu_threads_, cpu_shared_resource_);
-      if (profiling) {
-        const uint64_t cpu_done = profile_now_ns();
-        profile_add(profile_category, kCpuMatmulNs, cpu_done - cpu_start);
-        profile_add(profile_category, kCpuCompletionNs, cpu_done - launch);
+    try {
+      if (cpu_weight) {
+        const uint64_t cpu_start = profiling ? profile_now_ns() : 0;
+        cpu_fp16_matmul(cpu_input ? *cpu_input : x, *cpu_weight, *cpu_output,
+                        M, cpu_n, K, cpu_threads_, cpu_shared_resource_);
+        if (profiling) {
+          const uint64_t cpu_done = profile_now_ns();
+          profile_add(profile_category, kCpuMatmulNs, cpu_done - cpu_start);
+          profile_add(profile_category, kCpuCompletionNs, cpu_done - launch);
+        }
       }
+      // Do not submit a future Metal wait here: on current M3 Ultra drivers
+      // it can stall the already-queued qmm behind ANE. Both devices are
+      // running at this point, so a host wait preserves their overlap and
+      // immediately exposes asynchronous ANE failures before the merge is
+      // encoded.
+      model_->wait(ticket);
+    } catch (...) {
+      // The committed qmm buffer references MLX arrays owned by this frame;
+      // drain it before unwinding so the allocator cannot recycle them while
+      // the GPU is still writing. The detached ANE thread holds its own
+      // model reference and signals the ticket on its own.
+      [qmm_buffer waitUntilCompleted];
+      if (cpu_gpu_buffer != nil) {
+        [cpu_gpu_buffer release];
+      }
+      throw;
     }
-    // Do not submit a future Metal wait here: on current M3 Ultra drivers it
-    // can stall the already-queued qmm behind ANE. Both devices are running at
-    // this point, so a host wait preserves their overlap and immediately
-    // exposes asynchronous ANE failures before the merge is encoded.
-    model_->wait(ticket);
     if (cpu_gpu_buffer != nil) {
       [cpu_gpu_buffer waitUntilCompleted];
       [cpu_gpu_buffer release];
@@ -2069,18 +2090,29 @@ public:
         profile_add(profile_category, kAne1EvalNs, end - start);
       }
     }).detach();
-    if (cpu_weight) {
-      const uint64_t cpu_start = profiling ? profile_now_ns() : 0;
-      cpu_fp16_matmul(cpu_input ? *cpu_input : x, *cpu_weight, *cpu_output,
-                      M, cpu_n, K, cpu_threads_, cpu_shared_resource_);
-      if (profiling) {
-        const uint64_t cpu_done = profile_now_ns();
-        profile_add(profile_category, kCpuMatmulNs, cpu_done - cpu_start);
-        profile_add(profile_category, kCpuCompletionNs, cpu_done - launch);
+    try {
+      if (cpu_weight) {
+        const uint64_t cpu_start = profiling ? profile_now_ns() : 0;
+        cpu_fp16_matmul(cpu_input ? *cpu_input : x, *cpu_weight, *cpu_output,
+                        M, cpu_n, K, cpu_threads_, cpu_shared_resource_);
+        if (profiling) {
+          const uint64_t cpu_done = profile_now_ns();
+          profile_add(profile_category, kCpuMatmulNs, cpu_done - cpu_start);
+          profile_add(profile_category, kCpuCompletionNs, cpu_done - launch);
+        }
       }
+      model0_->wait(ticket0);
+      model1_->wait(ticket1);
+    } catch (...) {
+      // Same unwind hazard as the single-instance path: drain the committed
+      // qmm before this frame's MLX arrays can be recycled. The detached ANE
+      // threads hold their own model references.
+      [qmm_buffer waitUntilCompleted];
+      if (cpu_gpu_buffer != nil) {
+        [cpu_gpu_buffer release];
+      }
+      throw;
     }
-    model0_->wait(ticket0);
-    model1_->wait(ticket1);
     if (cpu_gpu_buffer != nil) {
       [cpu_gpu_buffer waitUntilCompleted];
       [cpu_gpu_buffer release];
