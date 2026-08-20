@@ -223,7 +223,7 @@ def test_cluster_status_route(monkeypatch):
 
     response = _client().get(
         "/admin/api/cluster/status",
-        params={"route_to": "192.168.100.197"},
+        params={"route_to": "198.51.100.197"},
     )
 
     assert response.status_code == 200
@@ -1225,6 +1225,7 @@ def test_cuda_join_command_is_single_use_pinned_and_not_cached(
     assert "/cluster/join/bootstrap.py" in payload["command"]
     assert payload["controller_key_fingerprint"] == fingerprint
     assert payload["single_use"] is True
+    assert payload["expires_at"] - payload["created_at"] == 30 * 60
     assert '"join_key":' not in _enrollment_client().get(
         "/admin/api/cluster/join-status"
     ).text
