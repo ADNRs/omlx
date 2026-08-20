@@ -993,25 +993,64 @@ std::shared_ptr<AneLinearModel> qwen35_ane_compile_linear(
   return std::shared_ptr<AneLinearModel>(new AneLinearModel(std::move(impl)));
 }
 
-std::vector<std::shared_ptr<AneLinearModel>> qwen35_ane_compile_linear_bank(
-    const std::vector<array> &weights, int sequence_length, int ane_instance) {
+struct AneLinearBankBuilder::Impl {
+  struct Chunk {
+    QuantizedMatrix quantized;
+    int input_dim;
+    int output_dim;
+  };
+  int sequence_length = 0;
+  std::vector<Chunk> chunks;
+};
+
+AneLinearBankBuilder::AneLinearBankBuilder(int sequence_length)
+    : impl_(std::make_unique<Impl>()) {
   if (!qwen35_ane_available()) {
     throw std::runtime_error("Private ANE runtime is unavailable.");
   }
-  if (weights.empty() || weights.size() > 256 || sequence_length <= 1) {
+  if (sequence_length <= 1) {
     throw std::invalid_argument("Invalid ANE linear procedure bank shape.");
   }
+  impl_->sequence_length = sequence_length;
+}
+
+AneLinearBankBuilder::~AneLinearBankBuilder() = default;
+
+void AneLinearBankBuilder::add(const array &weight) {
+  if (weight.dtype() != float32 || weight.ndim() != 2 ||
+      !row_contiguous(weight) || weight.shape(0) <= 0 ||
+      weight.shape(1) <= 0) {
+    throw std::invalid_argument(
+        "ANE bank weights must be contiguous rank-2 float32 MLX arrays.");
+  }
+  // Quantize to the INT8 program format now so the caller can drop the fp32
+  // staging array immediately; the retained chunk is a quarter of its size.
+  Impl::Chunk chunk{
+      quantize_rows(weight.data<float>(), static_cast<int>(weight.shape(0)),
+                    static_cast<int>(weight.shape(1))),
+      static_cast<int>(weight.shape(1)),
+      static_cast<int>(weight.shape(0)),
+  };
+  impl_->chunks.emplace_back(std::move(chunk));
+}
+
+int AneLinearBankBuilder::size() const {
+  return static_cast<int>(impl_->chunks.size());
+}
+
+std::vector<std::shared_ptr<AneLinearModel>>
+AneLinearBankBuilder::compile(int ane_instance, int start, int stop) {
+  const int count = static_cast<int>(impl_->chunks.size());
+  if (start < 0 || stop <= start || stop > count || stop - start > 256) {
+    throw std::invalid_argument("Invalid ANE linear procedure bank span.");
+  }
+  const int sequence_length = impl_->sequence_length;
+  const int span = stop - start;
   std::vector<std::pair<int, int>> shapes;
-  shapes.reserve(weights.size());
-  for (const auto &weight : weights) {
-    if (weight.dtype() != float32 || weight.ndim() != 2 ||
-        !row_contiguous(weight) || weight.shape(0) <= 0 ||
-        weight.shape(1) <= 0) {
-      throw std::invalid_argument(
-          "ANE bank weights must be contiguous rank-2 float32 MLX arrays.");
-    }
-    shapes.emplace_back(static_cast<int>(weight.shape(1)),
-                        static_cast<int>(weight.shape(0)));
+  shapes.reserve(span);
+  for (int index = start; index < stop; ++index) {
+    const auto &chunk = impl_->chunks[index];
+    shapes.emplace_back(chunk.input_dim, chunk.output_dim);
   }
 
   @autoreleasepool {
@@ -1019,12 +1058,9 @@ std::vector<std::shared_ptr<AneLinearModel>> qwen35_ane_compile_linear_bank(
     NSDictionary *execution_options = ane_execution_options(ane_instance);
     NSMutableData *weight_blob = [NSMutableData dataWithLength:64];
     std::vector<std::pair<uint64_t, uint64_t>> weight_offsets;
-    weight_offsets.reserve(weights.size());
-    for (size_t index = 0; index < weights.size(); ++index) {
-      const auto &weight = weights[index];
-      auto quantized = quantize_rows(
-          weight.data<float>(), static_cast<int>(weight.shape(0)),
-          static_cast<int>(weight.shape(1)));
+    weight_offsets.reserve(span);
+    for (int index = start; index < stop; ++index) {
+      const auto &quantized = impl_->chunks[index].quantized;
       uint64_t data_offset = append_blob_chunk(
           weight_blob,
           quantized.data.data(),
@@ -1036,7 +1072,7 @@ std::vector<std::shared_ptr<AneLinearModel>> qwen35_ane_compile_linear_bank(
       weight_offsets.emplace_back(data_offset, scale_offset);
     }
     auto *weight_header = static_cast<uint32_t *>(weight_blob.mutableBytes);
-    weight_header[0] = static_cast<uint32_t>(weights.size() * 2);
+    weight_header[0] = static_cast<uint32_t>(span * 2);
     weight_header[1] = 2;
     NSData *mil =
         [int8_linear_bank_mil(shapes, weight_offsets, sequence_length)
@@ -1098,15 +1134,27 @@ std::vector<std::shared_ptr<AneLinearModel>> qwen35_ane_compile_linear_bank(
     auto program =
         std::make_shared<SharedAneProgram>(model, directory, execution_options);
     std::vector<std::shared_ptr<AneLinearModel>> result;
-    result.reserve(weights.size());
-    for (size_t index = 0; index < weights.size(); ++index) {
+    result.reserve(span);
+    for (int index = 0; index < span; ++index) {
       auto impl = std::make_unique<AneLinearModel::Impl>(
           program, shapes[index].first, shapes[index].second, sequence_length,
-          static_cast<int>(index));
+          index);
       result.emplace_back(new AneLinearModel(std::move(impl)));
     }
     return result;
   }
+}
+
+std::vector<std::shared_ptr<AneLinearModel>> qwen35_ane_compile_linear_bank(
+    const std::vector<array> &weights, int sequence_length, int ane_instance) {
+  AneLinearBankBuilder builder(sequence_length);
+  if (weights.empty() || weights.size() > 256) {
+    throw std::invalid_argument("Invalid ANE linear procedure bank shape.");
+  }
+  for (const auto &weight : weights) {
+    builder.add(weight);
+  }
+  return builder.compile(ane_instance, 0, builder.size());
 }
 
 std::shared_ptr<AneLinearModel>
