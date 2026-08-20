@@ -83,6 +83,23 @@ def test_mma_scores_second_seed():
     assert _bit_equal(ref, got)
 
 
+def test_mma_scores_batched():
+    # B > 1 exercises the per-batch base-pointer arithmetic (tgpig.z), which
+    # the B=1 matrix above never touches.
+    mx.random.seed(13)
+    q = mx.random.uniform(-0.5, 0.5, (3, 64, 895, 128)).astype(mx.bfloat16)
+    k = mx.random.uniform(-0.5, 0.5, (3, 1, 1999, 128)).astype(mx.bfloat16)
+    w = mx.random.uniform(-0.5, 0.5, (3, 895, 64)).astype(mx.bfloat16)
+    mx.eval(q, k, w)
+    ref = glm_fast.dsa_indexer_scores(
+        q, k, w, causal=False, mask_ratio=4, mask_q_offset=4096
+    )
+    got = glm_fast.dsa_indexer_scores_mma(
+        q, k, w, mask_ratio=4, mask_q_offset=4096
+    )
+    assert _bit_equal(ref, got)
+
+
 def test_mma_scores_rejects_unsupported_configs():
     # fp16 (kernel is bf16-only)
     q, k, w = _inputs(128, 512)
