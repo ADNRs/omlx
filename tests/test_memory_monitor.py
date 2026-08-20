@@ -1008,3 +1008,44 @@ class TestDeepSeekV4PrefillMemoryProfile:
         config = self._config()
         config.model_type = "llama"
         assert make_prefill_memory_profile(config, compute_dtype_size=2) is None
+
+
+class TestAnePrefillTransientReserve:
+    def test_ane_prefill_transient_is_added_to_the_peak(self):
+        # issue #2841: the ANE I/O surfaces are dirtied by the first long
+        # prompt, so admission reserves them on top of the KV+SDPA peak.
+        from omlx.memory_monitor import MemoryMonitor
+
+        def make(reserve=0):
+            monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+            monitor.set_model_info(
+                num_layers=62,
+                num_kv_heads=4,
+                head_dim=128,
+                dtype_size=2,
+                num_attention_heads=32,
+                ane_prefill_transient_bytes=reserve,
+            )
+            return monitor
+
+        reserve = 4 * 1024**3
+        base_peak = make().estimate_prefill_peak_bytes(32768, 2048)
+        ane_peak = make(reserve).estimate_prefill_peak_bytes(32768, 2048)
+        assert ane_peak == base_peak + reserve
+
+    def test_reserve_defaults_to_zero_and_resets_per_model(self):
+        from omlx.memory_monitor import MemoryMonitor
+
+        monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+        assert monitor._ane_prefill_transient_bytes == 0
+        monitor.set_model_info(
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=64,
+            dtype_size=2,
+            ane_prefill_transient_bytes=123,
+        )
+        assert monitor._ane_prefill_transient_bytes == 123
+        # a following model without ANE must not inherit the reserve
+        monitor.set_model_info(num_layers=2, num_kv_heads=2, head_dim=64, dtype_size=2)
+        assert monitor._ane_prefill_transient_bytes == 0

@@ -224,6 +224,9 @@ class MemoryMonitor:
         # full-attention formula. Empty for non-hybrid models.
         self._rotating_layer_specs: tuple[tuple[int, int], ...] = ()
         self._prefill_memory_profile: PrefillMemoryProfile | None = None
+        # Fixed-shape ANE prefill I/O surfaces (issue #2841); set via
+        # set_model_info, 0 unless the Qwen ANE prefill backend is attached.
+        self._ane_prefill_transient_bytes: int = 0
         # Fixed per-sequence recurrent state (GDN/Mamba ArraysCache),
         # measured once from a live cache after the first prefill chunk.
         self._fixed_state_bytes: int = 0
@@ -407,6 +410,7 @@ class MemoryMonitor:
         kv_bytes_per_token: Optional[float] = None,
         rotating_layer_specs: Sequence[tuple[int, int]] | None = None,
         prefill_memory_profile: PrefillMemoryProfile | None = None,
+        ane_prefill_transient_bytes: int = 0,
     ) -> None:
         """
         Set model information for memory estimation.
@@ -466,6 +470,10 @@ class MemoryMonitor:
             if count > 0 and window > 0
         )
         self._prefill_memory_profile = prefill_memory_profile
+        # ANE prefill I/O surfaces are dirtied by the first long prompt, on
+        # top of the KV+SDPA peak, so admission must price them or the hard
+        # watermark aborts the request mid-prefill (issue #2841).
+        self._ane_prefill_transient_bytes = max(int(ane_prefill_transient_bytes), 0)
         # A new model's fixed state must be re-measured; a stale value from
         # the previous model would silently mis-charge admission.
         self._fixed_state_bytes = 0
@@ -780,7 +788,7 @@ class MemoryMonitor:
         # baseline. Resident math includes window-capped sliding-window
         # layers and measured fixed state, not just full-attention KVCache.
         kv = self.estimate_resident_kv_bytes(new_tokens, chunk_tokens=eff_chunk)
-        return attn + kv
+        return attn + kv + self._ane_prefill_transient_bytes
 
     def estimate_chunk_transient_bytes(self, n_tokens: int, kv_len: int) -> int:
         """Transient SDPA activation bytes for ONE prefill chunk.
@@ -1352,6 +1360,20 @@ def estimate_mla_kv_bytes_per_token(
     return float(elems_per_token) * float(dtype_size)
 
 
+def _ane_prefill_transient_bytes(model: Any) -> int:
+    """ANE prefill I/O surface bytes for ``model``, 0 when not attached.
+
+    Defensive: the ANE patch is optional at runtime, so any import or lookup
+    failure leaves the KV+SDPA estimate unchanged (issue #2841).
+    """
+    try:
+        from omlx.patches.qwen35_ane_prefill import ane_prefill_transient_bytes
+
+        return int(ane_prefill_transient_bytes(model))
+    except Exception:  # noqa: BLE001 - patch optional; never break estimation
+        return 0
+
+
 def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
     """Populate ``monitor`` with KV/SDPA dims read from an mlx-lm ``model``.
 
@@ -1472,6 +1494,7 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
                 compute_dtype_size=dtype_size,
                 kv_bytes_per_token=kv_bytes_per_token,
                 rotating_layer_specs=rotating_layer_specs,
+                ane_prefill_transient_bytes=_ane_prefill_transient_bytes(model),
             )
             logger.debug(
                 f"Model info for memory estimation: "

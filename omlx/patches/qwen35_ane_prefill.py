@@ -2324,6 +2324,32 @@ def enable_qwen35_ane_prefill(
     return count
 
 
+def ane_prefill_transient_bytes(model: Any) -> int:
+    """Bytes of fp16 ANE I/O surfaces held by ``model``'s compiled slices.
+
+    Every compiled procedure owns a fixed-shape input and output IOSurface of
+    ``dim * sequence_length * 2`` bytes, allocated at compile time and dirtied
+    at first use, which is exactly the first-request spike of issue #2841.
+    Reads the dims off the live native models, so packing, dual splits, and
+    partial banks are all accounted exactly. 0 when no ANE slice is attached.
+    """
+    total = 0
+    for module in model.modules() if hasattr(model, "modules") else ():
+        for state_attr in ("_omlx_ane_prefill_state", "_omlx_ane_gdn_state"):
+            state = getattr(module, state_attr, None)
+            if state is None:
+                continue
+            for ane_model in (state.model, getattr(state, "model1", None)):
+                input_dim = getattr(ane_model, "input_dim", 0)
+                output_dim = getattr(ane_model, "output_dim", 0)
+                seq = getattr(ane_model, "sequence_length", 0)
+                try:
+                    total += (int(input_dim) + int(output_dim)) * int(seq) * 2
+                except (TypeError, ValueError):
+                    continue
+    return total
+
+
 def qwen35_ane_prefill_status(model: Any) -> dict:
     """Report the ANE prefill state that :func:`enable_qwen35_ane_prefill`
     attached to ``model``.

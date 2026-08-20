@@ -2291,3 +2291,38 @@ def test_enable_warms_the_cpu_sharing_path(monkeypatch):
     )
     assert count == 2
     assert warmed == []
+
+
+# --- ANE prefill transient memory estimate (issue #2841) ---
+
+
+def test_ane_prefill_transient_bytes_reads_live_model_dims():
+    """The estimate sums (input + output) * seq * 2 over the compiled models."""
+    seq = 2048
+
+    def _ane_model(input_dim, output_dim):
+        return SimpleNamespace(
+            input_dim=input_dim, output_dim=output_dim, sequence_length=seq
+        )
+
+    mlp = SimpleNamespace(
+        _omlx_ane_prefill_state=SimpleNamespace(
+            model=_ane_model(5120, 4608), model1=_ane_model(5120, 4608)
+        )
+    )
+    gdn = SimpleNamespace(
+        _omlx_ane_gdn_state=SimpleNamespace(
+            model=_ane_model(5120, 768), model1=None
+        )
+    )
+    model = SimpleNamespace(modules=lambda: [mlp, gdn, SimpleNamespace()])
+
+    expected = 2 * (5120 + 4608) * seq * 2 + (5120 + 768) * seq * 2
+    assert ane_patch.ane_prefill_transient_bytes(model) == expected
+
+
+def test_ane_prefill_transient_bytes_zero_without_ane():
+    """A model with no compiled ANE slice reserves nothing."""
+    assert ane_patch.ane_prefill_transient_bytes(SimpleNamespace()) == 0
+    plain = SimpleNamespace(modules=lambda: [SimpleNamespace()])
+    assert ane_patch.ane_prefill_transient_bytes(plain) == 0

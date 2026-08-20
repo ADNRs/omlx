@@ -12184,6 +12184,8 @@ class Scheduler:
                 return isinstance(v, int) and not isinstance(v, bool) and v > 0
 
             if _pos_int(num_layers) and _pos_int(num_kv_heads) and _pos_int(head_dim):
+                from .memory_monitor import _ane_prefill_transient_bytes
+
                 self.memory_monitor.set_model_info(
                     num_layers=num_layers,
                     num_kv_heads=num_kv_heads,
@@ -12197,6 +12199,11 @@ class Scheduler:
                     kv_bytes_per_token=kv_bytes_per_token,
                     rotating_layer_specs=rotating_layer_specs,
                     prefill_memory_profile=prefill_memory_profile,
+                    # ANE prefill holds fixed-shape I/O surfaces the first
+                    # long prompt dirties on top of KV+SDPA (issue #2841).
+                    ane_prefill_transient_bytes=_ane_prefill_transient_bytes(
+                        self.model
+                    ),
                 )
                 # Fixed recurrent state (GDN/Mamba) can only be measured from
                 # a live cache after the first forward; arm a one-shot probe.
