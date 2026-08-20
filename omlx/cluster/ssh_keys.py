@@ -133,6 +133,7 @@ def generate_ssh_key_pair(
     # Ensure SSH directory exists
     key_path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(key_path.parent, 0o700)
+    pubkey_path = Path(str(key_path) + ".pub")
 
     # ssh-keygen prompts before overwriting an existing path, which a server
     # process cannot answer. Build rotations beside the live key and replace
@@ -174,10 +175,21 @@ def generate_ssh_key_pair(
         public_key = generated_public_path.read_text().strip()
         fingerprint = _key_fingerprint(public_key)
         if rotation_dir is not None:
-            os.replace(generated_public_path, Path(str(key_path) + ".pub"))
-            os.replace(generation_path, key_path)
+            backup_public_path = Path(rotation_dir.name) / "previous.pub"
+            public_key_existed = pubkey_path.exists()
+            if public_key_existed:
+                shutil.copy2(pubkey_path, backup_public_path)
+            try:
+                os.replace(generated_public_path, pubkey_path)
+                os.replace(generation_path, key_path)
+            except Exception:
+                if public_key_existed:
+                    os.replace(backup_public_path, pubkey_path)
+                else:
+                    with suppress(FileNotFoundError):
+                        pubkey_path.unlink()
+                raise
 
-        pubkey_path = Path(str(key_path) + ".pub")
         os.chmod(key_path, 0o600)
         os.chmod(pubkey_path, 0o644)
     finally:

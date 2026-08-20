@@ -2216,11 +2216,13 @@ async def cluster_generate_ssh_key(
         )
         return {
             "success": True,
+            "available": True,
             "key_type": key_pair.key_type,
             "fingerprint": key_pair.fingerprint,
             "public_key": key_pair.public_key,
             "private_key_path": str(key_pair.private_key_path),
             "public_key_path": str(key_pair.public_key_path),
+            "created_at": key_pair.created_at,
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc

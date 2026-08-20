@@ -66,6 +66,7 @@ def test_ssh_key_generation_requires_explicit_overwrite(monkeypatch, tmp_path):
         public_key="ssh-ed25519 AAAA test",
         private_key_path=tmp_path / "omlx_cluster",
         public_key_path=tmp_path / "omlx_cluster.pub",
+        created_at=123.0,
     )
 
     def generate(*, overwrite=False):
@@ -74,13 +75,13 @@ def test_ssh_key_generation_requires_explicit_overwrite(monkeypatch, tmp_path):
 
     monkeypatch.setattr(ssh_keys, "generate_ssh_key_pair", generate)
 
-    assert _client().post("/admin/api/cluster/ssh-key/generate").status_code == 200
-    assert (
-        _client()
-        .post("/admin/api/cluster/ssh-key/generate?overwrite=true")
-        .status_code
-        == 200
-    )
+    created = _client().post("/admin/api/cluster/ssh-key/generate")
+    rotated = _client().post("/admin/api/cluster/ssh-key/generate?overwrite=true")
+
+    assert created.status_code == 200
+    assert rotated.status_code == 200
+    assert created.json()["available"] is True
+    assert rotated.json()["created_at"] == 123.0
     assert calls == [False, True]
 
 
