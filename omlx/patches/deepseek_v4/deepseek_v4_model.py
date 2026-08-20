@@ -534,7 +534,6 @@ def _dsv4f_m2_mma_score_enabled(config, compress_ratio: int) -> bool:
     return _dsv4f_m2_exact_pairing(config, compress_ratio)
 
 
-
 @partial(mx.compile, shapeless=True)
 def _indexer_head_reduce(scores, weights, scale):
     """relu -> scale -> head-weight -> head-sum, fused over `scores`.
