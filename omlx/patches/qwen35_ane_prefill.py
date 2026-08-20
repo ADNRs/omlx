@@ -1041,22 +1041,17 @@ def _prepare_gdn_for_bank(
     else:
         dense0 = dense_logical_slice(0, ane_outputs)
         dense1 = None
-    qkv_offset = ane_outputs - z_outputs
-    gpu_offset = qkv_offset + cpu_outputs
     cpu_weight = None
     if cpu_outputs:
         cpu_weight = mx.contiguous(
             mx.dequantize(
-                qkv.weight[qkv_offset:gpu_offset],
-                qkv.scales[qkv_offset:gpu_offset],
-                qkv.biases[qkv_offset:gpu_offset],
+                qkv.weight[qkv_offset : qkv_offset + cpu_outputs],
+                qkv.scales[qkv_offset : qkv_offset + cpu_outputs],
+                qkv.biases[qkv_offset : qkv_offset + cpu_outputs],
                 group_size=qkv_group_size,
                 bits=qkv_bits,
             ).astype(mx.float16)
         )
-    weight = mx.contiguous(qkv.weight[gpu_offset:])
-    scales = mx.contiguous(qkv.scales[gpu_offset:])
-    biases = mx.contiguous(qkv.biases[gpu_offset:])
     values = [dense0, weight, scales, biases]
     if dense1 is not None:
         values.append(dense1)

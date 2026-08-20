@@ -2165,3 +2165,33 @@ def test_enable_warns_when_no_eligible_layers(monkeypatch, caplog):
     assert "no eligible MLP layers found" in caplog.text
     # counters are attached even on the empty path, so status is never silent
     assert ane_patch.qwen35_ane_prefill_status(model)["attempted"] is True
+
+
+# --- follow-up fixes after the CPU sharing merge (#2892) ---
+
+
+def test_bank_prepare_keeps_packed_q6_suffix():
+    """The packed q6 b/a suffix must survive bank preparation intact.
+
+    A late unconditional slice reassignment used to clobber the packed
+    weight while keeping b_outputs/a_outputs, which made the runtime slice
+    b/a beyond the combined width and latch q6 GDN off at first prefill.
+    """
+    gdn = _make_affine_gdn(6, 128)
+    config = ane_patch._AneGDNConfig(2048, 0.5, 8, True)
+
+    packed = ane_patch._pack_affine_gdn_suffix(
+        gdn.in_proj_qkv, gdn.in_proj_b, gdn.in_proj_a, 0, (6, 128)
+    )
+    assert packed is not None
+    expected_weight, expected_scales, expected_biases, b_outputs, a_outputs = packed
+
+    prepared = ane_patch._prepare_gdn_for_bank(gdn, config)
+    assert prepared is not None
+    state, dense0, dense1 = prepared
+    assert (state.b_outputs, state.a_outputs) == (b_outputs, a_outputs)
+    assert state.weight.shape == expected_weight.shape
+    assert bool(mx.array_equal(state.weight, expected_weight))
+    assert bool(mx.array_equal(state.scales, expected_scales))
+    assert bool(mx.array_equal(state.biases, expected_biases))
+    assert dense1 is not None
