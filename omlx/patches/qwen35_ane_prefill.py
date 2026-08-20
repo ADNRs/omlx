@@ -1989,6 +1989,64 @@ def _enable_dual_procedure_banks(
                 time.perf_counter() - warm_start,
             )
 
+        # When CPU sharing is on, the first dispatch additionally pays BNNS
+        # setup and the first touch of the eagerly dequantized FP16 CPU rows,
+        # which measured as a collapsed first request (prefill and decode).
+        # One dummy chunk per shared module moves that cost to load time; the
+        # merged output is discarded. Same soft-failure contract as above.
+        cpu_mlps = [
+            module
+            for module, state, _, _ in prepared_mlps
+            if getattr(state, "cpu_outputs", 0)
+            or getattr(state, "down_cpu", None) is not None
+        ]
+        cpu_gdns = [
+            module
+            for module, state, _, _ in prepared_gdns
+            if getattr(state, "cpu_outputs", 0)
+        ]
+        if cpu_mlps or cpu_gdns:
+            warm_start = time.perf_counter()
+            warmed = 0
+            inputs: dict[int, mx.array] = {}
+
+            def _warm_input(linear: Any) -> mx.array:
+                dim = int(linear.weight.shape[1]) * 32 // int(linear.bits)
+                x = inputs.get(dim)
+                if x is None:
+                    x = mx.zeros(
+                        (1, config.sequence_length, dim), dtype=linear.scales.dtype
+                    )
+                    mx.eval(x)
+                    inputs[dim] = x
+                return x
+
+            try:
+                for module in cpu_mlps:
+                    out = _backend(module, _warm_input(module.gate_proj))
+                    if out is not None:
+                        mx.eval(out)
+                        warmed += 1
+                for module in cpu_gdns:
+                    out = _gdn_backend(module, _warm_input(module.in_proj_qkv))
+                    if out is not None:
+                        mx.eval(*out)
+                        warmed += 1
+            except Exception:
+                logger.warning(
+                    "CPU sharing warmup failed after %d modules; continuing, "
+                    "the runtime failure latch handles broken modules at "
+                    "first use",
+                    warmed,
+                    exc_info=True,
+                )
+            if warmed:
+                logger.info(
+                    "Warmed the CPU sharing path on %d modules in %.1fs at load",
+                    warmed,
+                    time.perf_counter() - warm_start,
+                )
+
     return (
         len(prepared_mlps),
         len(prepared_mlps),
