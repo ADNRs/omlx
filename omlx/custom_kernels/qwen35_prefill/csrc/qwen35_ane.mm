@@ -2642,10 +2642,16 @@ public:
 
     auto *producer_buffer = encoder.get_command_buffer();
     producer_buffer->retain();
-    auto ticket = model_->begin(producer_buffer);
+    AneLinearModel::Ticket ticket{};
     AneLinearModel::Ticket ticket1{};
-    if (model1_) {
-      ticket1 = model1_->begin(producer_buffer);
+    try {
+      ticket = model_->begin(producer_buffer);
+      if (model1_) {
+        ticket1 = model1_->begin(producer_buffer);
+      }
+    } catch (...) {
+      producer_buffer->release();
+      throw;
     }
     encoder.commit();
     producer_buffer->waitUntilCompleted();
@@ -2739,25 +2745,34 @@ public:
         }
       }).detach();
     }
-    if (cpu_fp16_) {
-      const uint64_t cpu_start = profiling ? profile_now_ns() : 0;
-      cpu_fp16_matmul(cpu_input ? *cpu_input : x, *cpu_gate_up_weight,
-                      *cpu_gate_up, M, 2 * cpu_hidden, input_dim,
-                      cpu_threads_, cpu_shared_resource_);
-      cpu_fp16_swiglu(*cpu_gate_up, *cpu_activation, M, cpu_hidden,
-                      cpu_threads_, cpu_shared_resource_);
-      cpu_fp16_matmul(*cpu_activation, *cpu_down_weight, *cpu_output, M,
-                      output_dim, cpu_hidden, cpu_threads_,
-                      cpu_shared_resource_);
-      if (profiling) {
-        const uint64_t cpu_done = profile_now_ns();
-        profile_add(profile_category, kCpuMatmulNs, cpu_done - cpu_start);
-        profile_add(profile_category, kCpuCompletionNs, cpu_done - launch);
+    try {
+      if (cpu_fp16_) {
+        const uint64_t cpu_start = profiling ? profile_now_ns() : 0;
+        cpu_fp16_matmul(cpu_input ? *cpu_input : x, *cpu_gate_up_weight,
+                        *cpu_gate_up, M, 2 * cpu_hidden, input_dim,
+                        cpu_threads_, cpu_shared_resource_);
+        cpu_fp16_swiglu(*cpu_gate_up, *cpu_activation, M, cpu_hidden,
+                        cpu_threads_, cpu_shared_resource_);
+        cpu_fp16_matmul(*cpu_activation, *cpu_down_weight, *cpu_output, M,
+                        output_dim, cpu_hidden, cpu_threads_,
+                        cpu_shared_resource_);
+        if (profiling) {
+          const uint64_t cpu_done = profile_now_ns();
+          profile_add(profile_category, kCpuMatmulNs, cpu_done - cpu_start);
+          profile_add(profile_category, kCpuCompletionNs, cpu_done - launch);
+        }
       }
-    }
-    model_->wait(ticket);
-    if (model1_) {
-      model1_->wait(ticket1);
+      model_->wait(ticket);
+      if (model1_) {
+        model1_->wait(ticket1);
+      }
+    } catch (...) {
+      // Same unwind hazard as the shared linear paths: drain the committed
+      // suffix before this frame's MLX arrays can be recycled. The detached
+      // ANE threads hold their own model references.
+      [suffix_buffer waitUntilCompleted];
+      [suffix_buffer release];
+      throw;
     }
     [suffix_buffer waitUntilCompleted];
     [suffix_buffer release];
