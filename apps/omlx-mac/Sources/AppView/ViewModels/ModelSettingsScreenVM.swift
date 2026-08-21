@@ -279,6 +279,7 @@ final class ModelSettingsScreenVM {
     var qwen35AnePrefillCpuGdnFraction: String = "0"
     var qwen35AnePrefillCpuThreads: String = "8"
     var qwen35AnePrefillCpuSharedResource: Bool = true
+    var qwen35AnePrefillFusedDown: Bool = false
     var aneTuningID: String?
     var aneTuningIsRunning: Bool = false
     var aneTuningStatus: ANETuningStatusResponse?
@@ -530,6 +531,7 @@ final class ModelSettingsScreenVM {
                 self.qwen35AnePrefillCpuGdnFraction = s?.qwen35AnePrefillCpuGdnFraction.map { Self.formatPct($0) } ?? "0"
                 self.qwen35AnePrefillCpuThreads = s?.qwen35AnePrefillCpuThreads.map(String.init) ?? "8"
                 self.qwen35AnePrefillCpuSharedResource = s?.qwen35AnePrefillCpuSharedResource ?? true
+                self.qwen35AnePrefillFusedDown = s?.qwen35AnePrefillFusedDown ?? false
                 self.indexCacheEnabled = s?.indexCacheFreq != nil
                 self.indexCacheFreq = s?.indexCacheFreq.map(String.init) ?? "4"
                 self.specprefillEnabled = s?.specprefillEnabled ?? false
@@ -853,6 +855,7 @@ final class ModelSettingsScreenVM {
         if let fraction = recommendation.mlpFraction {
             qwen35AnePrefillFraction = Self.formatPct(fraction)
         }
+        qwen35AnePrefillFusedDown = recommendation.fusedDown ?? false
         qwen35AnePrefillGdn = recommendation.gdnEnabled
         if let fraction = recommendation.gdnFraction {
             qwen35AnePrefillGdnFraction = Self.formatPct(fraction)
@@ -1133,6 +1136,7 @@ final class ModelSettingsScreenVM {
                     putInt(ProfileSettingsKey.qwen35AnePrefillGdnMaxLayers, qwen35AnePrefillGdnMaxLayers)
                 }
                 putBool(ProfileSettingsKey.qwen35AnePrefillCpuEnabled, qwen35AnePrefillCpuEnabled)
+                putBool(ProfileSettingsKey.qwen35AnePrefillFusedDown, qwen35AnePrefillFusedDown)
                 if qwen35AnePrefillCpuEnabled {
                     putDouble(ProfileSettingsKey.qwen35AnePrefillCpuFraction, qwen35AnePrefillCpuFraction)
                     putDouble(ProfileSettingsKey.qwen35AnePrefillCpuDownFraction, qwen35AnePrefillCpuDownFraction)

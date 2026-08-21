@@ -174,6 +174,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
                 cpuFraction: nil,
                 cpuDownFraction: nil,
                 cpuGdnFraction: nil,
+                fusedDown: true,
                 cpuThreads: nil,
                 cpuSharedResource: nil,
                 processingTps: 123.4,
@@ -194,6 +195,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertTrue(vm.qwen35AnePrefillEnabled)
         XCTAssertEqual(vm.qwen35AnePrefillSequenceLength, "2112")
         XCTAssertEqual(vm.qwen35AnePrefillFraction, "0.467")
+        XCTAssertTrue(vm.qwen35AnePrefillFusedDown)
         XCTAssertFalse(vm.qwen35AnePrefillDualAne)
         XCTAssertTrue(vm.qwen35AnePrefillGdn)
         XCTAssertEqual(vm.qwen35AnePrefillGdnFraction, "0.527")

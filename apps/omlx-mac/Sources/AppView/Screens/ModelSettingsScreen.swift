@@ -1758,7 +1758,11 @@ private struct ExperimentalSection: View {
             )
         }
         let mlp = Int(((recommendation.mlpFraction ?? 0) * 100).rounded())
-        var parts = ["MLP ANE \(mlp)%"]
+        var parts = [
+            recommendation.fusedDown == true
+                ? "Fused MLP per ANE \(mlp)%"
+                : "MLP ANE \(mlp)%"
+        ]
         if recommendation.gdnEnabled {
             let gdn = Int(((recommendation.gdnFraction ?? 0) * 100).rounded())
             parts.append("GDN ANE \(gdn)%")

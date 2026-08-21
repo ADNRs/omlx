@@ -563,13 +563,11 @@ def test_cpu_shared_resource_scheduler_is_capability_guarded(
 
 
 def test_down_projection_cpu_share_is_prepared_and_dispatched(monkeypatch):
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     mlp = _MLP()
     linear = mlp.down_proj
     linear.scales = linear.scales.astype(mx.float16)
     linear.biases = linear.biases.astype(mx.float16)
-    monkeypatch.setattr(
-        fast, "has_symbol", lambda name: name == "qwen35_cpu_fp16_affine_qmm_t"
-    )
     state = ane_patch._prepare_cpu_linear(linear, 0.5)
 
     assert state is not None
@@ -1879,6 +1877,70 @@ def test_backend_uses_both_ane_models_for_one_prompt(monkeypatch):
     )
 
 
+def test_fused_down_backend_runs_compatible_cpu_hidden_branch(monkeypatch):
+    output = mx.zeros((1, 1, 8), dtype=mx.float16)
+    captured = {}
+
+    def fused(*args):
+        captured["args"] = args
+        return output
+
+    monkeypatch.setattr(
+        fast, "qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t", fused
+    )
+    model0, model1 = object(), object()
+    state = ane_patch._FusedDownMLPState(
+        model=model0,
+        model1=model1,
+        gate_up_weight=mx.zeros((4, 1), dtype=mx.uint32),
+        gate_up_scales=mx.zeros((4, 1), dtype=mx.float16),
+        gate_up_biases=mx.zeros((4, 1), dtype=mx.float16),
+        down_weight=mx.zeros((8, 1), dtype=mx.uint32),
+        down_scales=mx.zeros((8, 1), dtype=mx.float16),
+        down_biases=mx.zeros((8, 1), dtype=mx.float16),
+        cpu_gate_up_weight=mx.zeros((4, 8), dtype=mx.float16),
+        cpu_down_weight=mx.zeros((8, 2), dtype=mx.float16),
+    )
+    config = ane_patch._AnePrefillConfig(
+        1,
+        0.5,
+        8,
+        dual_ane=True,
+        cpu_fraction=0.14,
+        cpu_threads=12,
+        cpu_shared_resource=True,
+        ane_down_fraction=0.19,
+        fused_down=True,
+    )
+    mlp = SimpleNamespace(
+        _omlx_ane_prefill_config=config,
+        _omlx_ane_fused_down_state=state,
+    )
+    x = mx.zeros((1, 1, 8), dtype=mx.float16)
+
+    result = ane_patch._backend(mlp, x)
+    mx.eval(result)
+
+    assert result is output
+    assert captured["args"] == (
+        x,
+        state.cpu_gate_up_weight,
+        state.cpu_down_weight,
+        state.gate_up_weight,
+        state.gate_up_scales,
+        state.gate_up_biases,
+        state.down_weight,
+        state.down_scales,
+        state.down_biases,
+        model0,
+        model1,
+        8,
+        128,
+        12,
+        True,
+    )
+
+
 @pytest.mark.parametrize(
     ("bits", "expected_kernel"),
     [(4, "q4"), (5, "generic"), (6, "generic"), (8, "generic")],
@@ -2126,19 +2188,14 @@ def test_enable_env_kill_switch_wins(monkeypatch):
     assert installed == []
 
 
-# --- ANE prefill observability (feat/ane-prefill-observability) ---
-
-
 def test_prefill_status_reports_configured_layers():
-    """qwen35_ane_prefill_status surfaces the counters enable_ attaches."""
     model = SimpleNamespace(
         _omlx_ane_mlp_prefill_count=12,
         _omlx_ane_gdn_prefill_count=4,
         _omlx_ane_dual_prefill_count=8,
         _omlx_ane_resident_program_count=24,
     )
-    status = ane_patch.qwen35_ane_prefill_status(model)
-    assert status == {
+    assert ane_patch.qwen35_ane_prefill_status(model) == {
         "attempted": True,
         "configured": True,
         "mlp_layers": 12,
@@ -2149,7 +2206,6 @@ def test_prefill_status_reports_configured_layers():
 
 
 def test_prefill_status_flags_attempted_but_empty():
-    """A model that ran enable_ but compiled nothing reports the no-op, not silence."""
     model = SimpleNamespace(
         _omlx_ane_mlp_prefill_count=0,
         _omlx_ane_gdn_prefill_count=0,
@@ -2162,7 +2218,6 @@ def test_prefill_status_flags_attempted_but_empty():
 
 
 def test_prefill_status_safe_on_untouched_model():
-    """Any model that never attempted ANE prefill is reported cleanly."""
     status = ane_patch.qwen35_ane_prefill_status(SimpleNamespace())
     assert status["attempted"] is False
     assert status["configured"] is False
@@ -2170,39 +2225,25 @@ def test_prefill_status_safe_on_untouched_model():
 
 
 def test_enable_warns_when_no_eligible_layers(monkeypatch, caplog):
-    """The dominant silent no-op (ANE requested, no eligible MLP) now warns."""
-    from omlx.custom_kernels.qwen35_prefill import fast
-
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
-    # force the banked path to decline so the plain loop reports the empty result
-    monkeypatch.setattr(ane_patch, "_enable_dual_procedure_banks", lambda *a, **k: None)
+    monkeypatch.setattr(
+        ane_patch, "_enable_dual_procedure_banks", lambda *args, **kwargs: None
+    )
     monkeypatch.delenv("OMLX_QWEN35_ANE_PREFILL", raising=False)
 
-    model = SimpleNamespace(modules=lambda: [])  # no dense MLP modules at all
-
+    model = SimpleNamespace(modules=lambda: [])
     with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
         count = ane_patch.enable_qwen35_ane_prefill(model)
 
     assert count == 0
     assert "no eligible MLP layers found" in caplog.text
-    # counters are attached even on the empty path, so status is never silent
     assert ane_patch.qwen35_ane_prefill_status(model)["attempted"] is True
 
 
-# --- follow-up fixes after the CPU sharing merge (#2892) ---
-
-
 def test_bank_prepare_keeps_packed_q6_suffix():
-    """The packed q6 b/a suffix must survive bank preparation intact.
-
-    A late unconditional slice reassignment used to clobber the packed
-    weight while keeping b_outputs/a_outputs, which made the runtime slice
-    b/a beyond the combined width and latch q6 GDN off at first prefill.
-    """
     gdn = _make_affine_gdn(6, 128)
     config = ane_patch._AneGDNConfig(2048, 0.5, 8, True)
-
     packed = ane_patch._pack_affine_gdn_suffix(
         gdn.in_proj_qkv, gdn.in_proj_b, gdn.in_proj_a, 0, (6, 128)
     )
@@ -2211,7 +2252,7 @@ def test_bank_prepare_keeps_packed_q6_suffix():
 
     prepared = ane_patch._prepare_gdn_for_bank(gdn, config)
     assert prepared is not None
-    state, dense0, dense1 = prepared
+    state, _dense0, dense1 = prepared
     assert (state.b_outputs, state.a_outputs) == (b_outputs, a_outputs)
     assert state.weight.shape == expected_weight.shape
     assert bool(mx.array_equal(state.weight, expected_weight))
@@ -2221,7 +2262,6 @@ def test_bank_prepare_keeps_packed_q6_suffix():
 
 
 def test_enable_survives_warmup_failure(monkeypatch, caplog):
-    """A procedure whose warmup throws must not abort the whole ANE setup."""
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(
@@ -2234,12 +2274,14 @@ def test_enable_survives_warmup_failure(monkeypatch, caplog):
         def warmup(self):
             raise RuntimeError("ANE evaluation failed")
 
-    def compile_bank(weights, sequence_length, ane_instance):
-        return [_FailingModel() for _ in weights]
-
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    monkeypatch.setattr(
+        fast,
+        "qwen35_ane_compile_linear_bank",
+        lambda weights, sequence_length, ane_instance: [
+            _FailingModel() for _ in weights
+        ],
+    )
     model = _Model(2)
-
     with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
         count = ane_patch.enable_qwen35_ane_prefill(
             model,
@@ -2254,7 +2296,6 @@ def test_enable_survives_warmup_failure(monkeypatch, caplog):
 
 
 def test_prepare_cpu_linear_needs_the_native_symbol(monkeypatch):
-    """Without the CPU qmm symbol the down split stays a clean no-op."""
     linear = nn.QuantizedLinear(128, 256, bias=False, group_size=64, bits=4)
     linear.scales = linear.scales.astype(mx.float16)
     linear.biases = linear.biases.astype(mx.float16)
