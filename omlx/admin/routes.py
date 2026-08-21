@@ -2433,6 +2433,20 @@ async def update_model_settings(
             request.qwen35_ane_prefill_cpu_shared_resource
         )
     if (
+        current_settings.qwen35_ane_prefill_fused_down
+        and current_settings.qwen35_ane_prefill_fraction > 0.50
+    ):
+        # The fused loader reuses the MLP fraction for the down projection and
+        # rejects anything above 0.50 at enable time. Without this check the
+        # save succeeds and the next load silently disables ANE prefill.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Fused MLP/down offload needs an MLP ANE fraction of 0.50 or "
+                "less."
+            ),
+        )
+    if (
         current_settings.qwen35_ane_prefill_cpu_enabled
         and current_settings.qwen35_ane_prefill_fraction
         * (2 if current_settings.qwen35_ane_prefill_fused_down else 1)
