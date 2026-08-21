@@ -126,6 +126,9 @@ class _PrimeCtx:
     # capture requires offset_now - S == expected_offset (contiguity).
     expected_offset: int = 0
     valid: bool = True
+    # The current contiguous timeline exceeded OMLX_MTP_PRIME_WINDOW. Keep a
+    # lightweight marker so later small chunks cannot restart priming.
+    window_exceeded: bool = False
 
 
 def _anchor(cache: Optional[List[Any]]) -> Optional[Any]:
@@ -275,6 +278,9 @@ def maybe_capture(
         # Rewind / trim / request switch / unknown path: never guess.
         drop_ctx(host)
         ctx = None
+    if ctx is not None and ctx.window_exceeded:
+        ctx.expected_offset = offset_after
+        return
     window = prime_window()
     if window:
         # Cap by the primed span (the head-KV the window exists to bound),
@@ -283,8 +289,14 @@ def maybe_capture(
         # small remainder is exactly the cheap case priming is for (#2909).
         folded = ctx.folded if ctx is not None else 0
         if folded + seq_len > window:
-            if ctx is not None:
-                drop_ctx(host)
+            setattr(
+                host,
+                _CTX_ATTR,
+                _PrimeCtx(
+                    expected_offset=offset_after,
+                    window_exceeded=True,
+                ),
+            )
             return
     if ctx is None:
         if seq_len <= 1:
@@ -388,7 +400,7 @@ def take_primed(
 def prime_ctx_stats(model: Any) -> Optional[int]:
     """Folded pair count of a live context (introspection / tests)."""
     ctx = _find_ctx(model)
-    return ctx.folded if ctx is not None else None
+    return ctx.folded if ctx is not None and not ctx.window_exceeded else None
 
 
 __all__ = [
