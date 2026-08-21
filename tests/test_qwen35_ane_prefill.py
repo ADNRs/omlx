@@ -2470,6 +2470,39 @@ def test_ane_prefill_transient_bytes_zero_without_ane():
     assert ane_patch.ane_prefill_transient_bytes(plain) == 0
 
 
+def test_ane_prefill_transient_bytes_prices_fused_and_down_states():
+    """Fused SwiGLU/down banks and ANE down slices hold IOSurfaces too."""
+    seq = 2048
+
+    def _ane_model(input_dim, output_dim):
+        return SimpleNamespace(
+            input_dim=input_dim, output_dim=output_dim, sequence_length=seq
+        )
+
+    fused = SimpleNamespace(
+        _omlx_ane_fused_down_state=SimpleNamespace(
+            model=_ane_model(5120, 5120), model1=_ane_model(5120, 5120)
+        )
+    )
+    down = SimpleNamespace(
+        _omlx_ane_prefill_state=SimpleNamespace(
+            model=_ane_model(5120, 4608),
+            model1=None,
+            down_ane=SimpleNamespace(
+                model=_ane_model(4608, 5120), model1=_ane_model(4608, 5120)
+            ),
+        )
+    )
+    model = SimpleNamespace(modules=lambda: [fused, down])
+
+    expected = (
+        2 * (5120 + 5120) * seq * 2
+        + (5120 + 4608) * seq * 2
+        + 2 * (4608 + 5120) * seq * 2
+    )
+    assert ane_patch.ane_prefill_transient_bytes(model) == expected
+
+
 # --- incremental bank builder staging (issue #2781) ---
 
 
@@ -2718,3 +2751,31 @@ def test_fused_bank_staging_falls_back_without_builder(monkeypatch):
     assert compiled == [(2, 2048, 1), (2, 2048, 2)]
     for module in modules:
         assert module._omlx_ane_fused_down_state.model is not None
+
+
+def test_warm_cpu_sharing_path_dispatches_mlp_and_gdn(monkeypatch):
+    """The shared helper warms MLP and GDN modules with exact-shape zeros."""
+    calls = []
+
+    def _mlp_backend(module, x):
+        calls.append(("mlp", x.shape))
+        return mx.zeros((1,))
+
+    def _gdn_backend(module, x):
+        calls.append(("gdn", x.shape))
+        return (mx.zeros((1,)),)
+
+    monkeypatch.setattr(ane_patch, "_backend", _mlp_backend)
+    monkeypatch.setattr(ane_patch, "_gdn_backend", _gdn_backend)
+
+    linear = SimpleNamespace(
+        weight=mx.zeros((4, 4), dtype=mx.uint32),
+        bits=4,
+        scales=mx.zeros((1,), dtype=mx.float16),
+    )
+    mlp = SimpleNamespace(gate_proj=linear)
+    gdn = SimpleNamespace(in_proj_qkv=linear)
+
+    ane_patch._warm_cpu_sharing_path(64, [mlp], [gdn])
+
+    assert calls == [("mlp", (1, 64, 32)), ("gdn", (1, 64, 32))]

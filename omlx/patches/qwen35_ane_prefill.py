@@ -2172,6 +2172,61 @@ def _warm_ane_models(models: tuple[Any, ...] | list[Any]) -> None:
         )
 
 
+def _warm_cpu_sharing_path(
+    sequence_length: int,
+    cpu_mlps: list[Any],
+    cpu_gdns: list[Any],
+) -> None:
+    """Dispatch one discarded dummy chunk through each CPU-shared module.
+
+    When CPU sharing is on, the first dispatch additionally pays BNNS setup
+    and the first touch of the eagerly dequantized FP16 CPU rows, which
+    measured as a collapsed first request (prefill and decode). One dummy
+    chunk per shared module moves that cost to load time; the merged output
+    is discarded. Same soft-failure contract as the ANE warm loop.
+    """
+    if not cpu_mlps and not cpu_gdns:
+        return
+    warm_start = time.perf_counter()
+    warmed = 0
+    inputs: dict[int, mx.array] = {}
+
+    def _warm_input(linear: Any) -> mx.array:
+        dim = int(linear.weight.shape[1]) * 32 // int(linear.bits)
+        x = inputs.get(dim)
+        if x is None:
+            x = mx.zeros((1, sequence_length, dim), dtype=linear.scales.dtype)
+            mx.eval(x)
+            inputs[dim] = x
+        return x
+
+    try:
+        for module in cpu_mlps:
+            out = _backend(module, _warm_input(module.gate_proj))
+            if out is not None:
+                mx.eval(out)
+                warmed += 1
+        for module in cpu_gdns:
+            out = _gdn_backend(module, _warm_input(module.in_proj_qkv))
+            if out is not None:
+                mx.eval(*out)
+                warmed += 1
+    except Exception:
+        logger.warning(
+            "CPU sharing warmup failed after %d modules; continuing, "
+            "the runtime failure latch handles broken modules at "
+            "first use",
+            warmed,
+            exc_info=True,
+        )
+    if warmed:
+        logger.info(
+            "Warmed the CPU sharing path on %d modules in %.1fs at load",
+            warmed,
+            time.perf_counter() - warm_start,
+        )
+
+
 def _enable_dual_procedure_banks(
     model: Any,
     mlp_candidates: list[Any],
@@ -2529,53 +2584,14 @@ def _enable_dual_procedure_banks(
             for module, state in prepared_mlps
             if getattr(state, "cpu_outputs", 0)
             or getattr(state, "down_cpu", None) is not None
+            or getattr(getattr(state, "down_ane", None), "cpu_outputs", 0)
         ]
         cpu_gdns = [
             module
             for module, state in prepared_gdns
             if getattr(state, "cpu_outputs", 0)
         ]
-        if cpu_mlps or cpu_gdns:
-            warm_start = time.perf_counter()
-            warmed = 0
-            inputs: dict[int, mx.array] = {}
-
-            def _warm_input(linear: Any) -> mx.array:
-                dim = int(linear.weight.shape[1]) * 32 // int(linear.bits)
-                x = inputs.get(dim)
-                if x is None:
-                    x = mx.zeros(
-                        (1, config.sequence_length, dim), dtype=linear.scales.dtype
-                    )
-                    mx.eval(x)
-                    inputs[dim] = x
-                return x
-
-            try:
-                for module in cpu_mlps:
-                    out = _backend(module, _warm_input(module.gate_proj))
-                    if out is not None:
-                        mx.eval(out)
-                        warmed += 1
-                for module in cpu_gdns:
-                    out = _gdn_backend(module, _warm_input(module.in_proj_qkv))
-                    if out is not None:
-                        mx.eval(*out)
-                        warmed += 1
-            except Exception:
-                logger.warning(
-                    "CPU sharing warmup failed after %d modules; continuing, "
-                    "the runtime failure latch handles broken modules at "
-                    "first use",
-                    warmed,
-                    exc_info=True,
-                )
-            if warmed:
-                logger.info(
-                    "Warmed the CPU sharing path on %d modules in %.1fs at load",
-                    warmed,
-                    time.perf_counter() - warm_start,
-                )
+        _warm_cpu_sharing_path(config.sequence_length, cpu_mlps, cpu_gdns)
 
     model._omlx_ane_down_prefill_count = sum(
         state.down_ane is not None for state in assigned_mlp_states
@@ -3041,6 +3057,32 @@ def enable_qwen35_ane_prefill(
                     else "classic Metal"
                 ),
             )
+            cpu_mlps = []
+            for module in candidates:
+                fused_state = getattr(
+                    module, "_omlx_ane_fused_down_state", None
+                )
+                if (
+                    fused_state is not None
+                    and fused_state.cpu_gate_up_weight is not None
+                ):
+                    cpu_mlps.append(module)
+            cpu_gdns = [
+                module
+                for module in (
+                    model.modules() if hasattr(model, "modules") else ()
+                )
+                if getattr(
+                    getattr(module, "_omlx_ane_gdn_state", None),
+                    "cpu_outputs",
+                    0,
+                )
+            ]
+            _warm_cpu_sharing_path(sequence_length, cpu_mlps, cpu_gdns)
+            # Return the staging buffers to the OS; this branch skips the
+            # dual-bank epilogue that normally does this (issue #2781).
+            mx.synchronize()
+            mx.clear_cache()
             return count
 
     banked = _enable_dual_procedure_banks(
@@ -3199,10 +3241,20 @@ def ane_prefill_transient_bytes(model: Any) -> int:
     """
     total = 0
     for module in model.modules() if hasattr(model, "modules") else ():
-        for state_attr in ("_omlx_ane_prefill_state", "_omlx_ane_gdn_state"):
+        states = []
+        for state_attr in (
+            "_omlx_ane_prefill_state",
+            "_omlx_ane_gdn_state",
+            "_omlx_ane_fused_down_state",
+        ):
             state = getattr(module, state_attr, None)
             if state is None:
                 continue
+            states.append(state)
+            down_ane = getattr(state, "down_ane", None)
+            if down_ane is not None:
+                states.append(down_ane)
+        for state in states:
             for ane_model in (state.model, getattr(state, "model1", None)):
                 input_dim = getattr(ane_model, "input_dim", 0)
                 output_dim = getattr(ane_model, "output_dim", 0)
