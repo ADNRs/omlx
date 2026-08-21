@@ -438,6 +438,17 @@ def qwen35_ane_linear_bank_builder(sequence_length: int):
     return _ext.AneLinearBankBuilder(sequence_length)
 
 
+def qwen35_ane_fused_bank_builder(sequence_length: int):
+    """Incremental fused SwiGLU/down bank builder: add() converts one fp32
+    gate/up/down triple at a time so the caller can release each staging
+    array immediately (the issue #2781 recipe applied to fused banks)."""
+    if not qwen35_ane_available() or _ext is None or not hasattr(
+        _ext, "AneFusedBankBuilder"
+    ):
+        raise RuntimeError("Private ANE procedure-bank builder is unavailable")
+    return _ext.AneFusedBankBuilder(sequence_length)
+
+
 def qwen35_ane_affine_qmm_t(
     x: mx.array,
     gpu_weight: mx.array,

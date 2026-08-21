@@ -2605,3 +2605,116 @@ def test_warmup_failure_latches_only_the_owning_module(monkeypatch, caplog):
     assert not getattr(model.layers[2], "_omlx_ane_prefill_failed", False)
     assert sorted(warm_calls) == [0, 0, 2, 2]
     assert "disabling ANE" in caplog.text
+
+
+# --- fused bank streaming + CPU warm helper (post-#2935 follow-up) ---
+
+
+class _RecorderFusedBankBuilder:
+    """Stands in for the native AneFusedBankBuilder."""
+
+    def __init__(self):
+        self.added = []
+        self.compiled_spans = []
+
+    def add(self, gate, up, down):
+        self.added.append((gate, up, down))
+
+    @property
+    def size(self):
+        return len(self.added)
+
+    def compile(self, ane_instance, start, stop):
+        self.compiled_spans.append((ane_instance, start, stop))
+        return [object() for _ in range(stop - start)]
+
+
+def _fused_bank_state():
+    return ane_patch._FusedDownMLPState(
+        model=None,
+        model1=None,
+        gate_up_weight=mx.zeros((4, 1), dtype=mx.uint32),
+        gate_up_scales=mx.zeros((4, 1), dtype=mx.float16),
+        gate_up_biases=mx.zeros((4, 1), dtype=mx.float16),
+        down_weight=mx.zeros((8, 1), dtype=mx.uint32),
+        down_scales=mx.zeros((8, 1), dtype=mx.float16),
+        down_biases=mx.zeros((8, 1), dtype=mx.float16),
+    )
+
+
+def test_fused_bank_staging_streams_through_builder(monkeypatch):
+    """Fused enable stages one gate/up/down triple at a time (issue #2781)."""
+    builders = []
+
+    def _make_builder(sequence_length):
+        assert sequence_length == 2048
+        builder = _RecorderFusedBankBuilder()
+        builders.append(builder)
+        return builder
+
+    monkeypatch.setattr(
+        fast, "qwen35_ane_fused_bank_builder", _make_builder, raising=False
+    )
+    monkeypatch.setattr(
+        ane_patch,
+        "_prepare_fused_down_for_bank",
+        lambda module, config: (
+            _fused_bank_state(),
+            tuple(mx.zeros((2, 2)) for _ in range(6)),
+        ),
+    )
+    monkeypatch.setattr(ane_patch, "_warm_ane_models", lambda models: None)
+
+    config = ane_patch._AnePrefillConfig(
+        2048, 0.3, 8, dual_ane=True, fused_down=True
+    )
+    model = SimpleNamespace()
+    modules = [SimpleNamespace() for _ in range(3)]
+
+    result = ane_patch._enable_fused_down_banks(model, modules, config)
+
+    assert result == (3, 2)
+    assert len(builders) == 2
+    assert [len(builder.added) for builder in builders] == [3, 3]
+    assert builders[0].compiled_spans == [(1, 0, 3)]
+    assert builders[1].compiled_spans == [(2, 0, 3)]
+    for module in modules:
+        assert module._omlx_ane_fused_down_state.model is not None
+        assert module._omlx_ane_fused_down_state.model1 is not None
+    assert model._omlx_ane_down_prefill_count == 3
+
+
+def test_fused_bank_staging_falls_back_without_builder(monkeypatch):
+    """Old extensions without the fused builder keep the one-shot path."""
+    monkeypatch.delattr(fast, "qwen35_ane_fused_bank_builder", raising=False)
+    compiled = []
+
+    def _compile_bank(gates, ups, downs, sequence_length, ane_instance):
+        compiled.append((len(gates), sequence_length, ane_instance))
+        return [object() for _ in gates]
+
+    monkeypatch.setattr(
+        fast, "qwen35_ane_compile_swiglu_down_bank", _compile_bank
+    )
+    monkeypatch.setattr(
+        ane_patch,
+        "_prepare_fused_down_for_bank",
+        lambda module, config: (
+            _fused_bank_state(),
+            tuple(mx.zeros((2, 2)) for _ in range(6)),
+        ),
+    )
+    monkeypatch.setattr(ane_patch, "_warm_ane_models", lambda models: None)
+
+    config = ane_patch._AnePrefillConfig(
+        2048, 0.3, 8, dual_ane=True, fused_down=True
+    )
+    model = SimpleNamespace()
+    modules = [SimpleNamespace() for _ in range(2)]
+
+    result = ane_patch._enable_fused_down_banks(model, modules, config)
+
+    assert result == (2, 2)
+    assert compiled == [(2, 2048, 1), (2, 2048, 2)]
+    for module in modules:
+        assert module._omlx_ane_fused_down_state.model is not None

@@ -50,6 +50,7 @@ private:
   std::unique_ptr<Impl> impl_;
 
   friend class AneLinearBankBuilder;
+  friend class AneFusedBankBuilder;
   friend std::shared_ptr<AneLinearModel>
   qwen35_ane_compile_linear(const mlx::core::array &, int, int);
   friend std::vector<std::shared_ptr<AneLinearModel>>
@@ -81,6 +82,25 @@ public:
   AneLinearBankBuilder &operator=(const AneLinearBankBuilder &) = delete;
 
   void add(const mlx::core::array &weight);
+  int size() const;
+  std::vector<std::shared_ptr<AneLinearModel>>
+  compile(int ane_instance, int start, int stop);
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+class AneFusedBankBuilder {
+public:
+  explicit AneFusedBankBuilder(int sequence_length);
+  ~AneFusedBankBuilder();
+  AneFusedBankBuilder(const AneFusedBankBuilder &) = delete;
+  AneFusedBankBuilder &operator=(const AneFusedBankBuilder &) = delete;
+
+  void add(const mlx::core::array &gate_weight,
+           const mlx::core::array &up_weight,
+           const mlx::core::array &down_weight);
   int size() const;
   std::vector<std::shared_ptr<AneLinearModel>>
   compile(int ane_instance, int start, int stop);

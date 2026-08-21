@@ -1266,40 +1266,77 @@ std::shared_ptr<AneLinearModel> qwen35_ane_compile_swiglu_down(
   return std::shared_ptr<AneLinearModel>(new AneLinearModel(std::move(impl)));
 }
 
-std::vector<std::shared_ptr<AneLinearModel>>
-qwen35_ane_compile_swiglu_down_bank(
-    const std::vector<array> &gate_weights,
-    const std::vector<array> &up_weights,
-    const std::vector<array> &down_weights, int sequence_length,
-    int ane_instance) {
+struct AneFusedBankBuilder::Impl {
+  struct Chunk {
+    std::vector<_Float16> gate;
+    std::vector<_Float16> up;
+    std::vector<_Float16> down;
+    SwiGLUDownShape shape;
+  };
+  int sequence_length = 0;
+  std::vector<Chunk> chunks;
+};
+
+AneFusedBankBuilder::AneFusedBankBuilder(int sequence_length)
+    : impl_(std::make_unique<Impl>()) {
   if (!qwen35_ane_available()) {
     throw std::runtime_error("Private ANE runtime is unavailable.");
   }
-  if (gate_weights.empty() || gate_weights.size() > 256 ||
-      gate_weights.size() != up_weights.size() ||
-      gate_weights.size() != down_weights.size() || sequence_length <= 1) {
+  if (sequence_length <= 1) {
     throw std::invalid_argument("Invalid ANE SwiGLU/down procedure bank.");
   }
+  impl_->sequence_length = sequence_length;
+}
+
+AneFusedBankBuilder::~AneFusedBankBuilder() = default;
+
+void AneFusedBankBuilder::add(const array &gate_weight, const array &up_weight,
+                              const array &down_weight) {
+  for (const auto *weight : {&gate_weight, &up_weight, &down_weight}) {
+    if (weight->dtype() != float32 || weight->ndim() != 2 ||
+        !row_contiguous(*weight) || weight->shape(0) <= 0 ||
+        weight->shape(1) <= 0) {
+      throw std::invalid_argument(
+          "ANE SwiGLU/down bank weights must be contiguous float32 matrices.");
+    }
+  }
+  if (up_weight.shape() != gate_weight.shape() ||
+      down_weight.shape(1) != gate_weight.shape(0)) {
+    throw std::invalid_argument("ANE SwiGLU/down bank shape mismatch.");
+  }
+  // Convert to the fp16 program format now so the caller can drop the fp32
+  // staging arrays immediately; the retained chunk is half their size.
+  const auto to_fp16 = [](const array &weight) {
+    return fp16_rows(weight.data<float>(), static_cast<int>(weight.shape(0)),
+                     static_cast<int>(weight.shape(1)));
+  };
+  Impl::Chunk chunk{
+      to_fp16(gate_weight),
+      to_fp16(up_weight),
+      to_fp16(down_weight),
+      {static_cast<int>(gate_weight.shape(1)),
+       static_cast<int>(gate_weight.shape(0)),
+       static_cast<int>(down_weight.shape(0))},
+  };
+  impl_->chunks.emplace_back(std::move(chunk));
+}
+
+int AneFusedBankBuilder::size() const {
+  return static_cast<int>(impl_->chunks.size());
+}
+
+std::vector<std::shared_ptr<AneLinearModel>>
+AneFusedBankBuilder::compile(int ane_instance, int start, int stop) {
+  const int count = static_cast<int>(impl_->chunks.size());
+  if (start < 0 || stop <= start || stop > count || stop - start > 256) {
+    throw std::invalid_argument(
+        "Invalid ANE SwiGLU/down procedure bank span.");
+  }
+  const int sequence_length = impl_->sequence_length;
   std::vector<SwiGLUDownShape> shapes;
-  shapes.reserve(gate_weights.size());
-  for (size_t index = 0; index < gate_weights.size(); ++index) {
-    const auto &gate = gate_weights[index];
-    const auto &up = up_weights[index];
-    const auto &down = down_weights[index];
-    for (const auto *weight : {&gate, &up, &down}) {
-      if (weight->dtype() != float32 || weight->ndim() != 2 ||
-          !row_contiguous(*weight) || weight->shape(0) <= 0 ||
-          weight->shape(1) <= 0) {
-        throw std::invalid_argument(
-            "ANE SwiGLU/down bank weights must be contiguous float32 matrices.");
-      }
-    }
-    if (up.shape() != gate.shape() || down.shape(1) != gate.shape(0)) {
-      throw std::invalid_argument("ANE SwiGLU/down bank shape mismatch.");
-    }
-    shapes.push_back({static_cast<int>(gate.shape(1)),
-                      static_cast<int>(gate.shape(0)),
-                      static_cast<int>(down.shape(0))});
+  shapes.reserve(stop - start);
+  for (int index = start; index < stop; ++index) {
+    shapes.push_back(impl_->chunks[index].shape);
   }
 
   @autoreleasepool {
@@ -1307,21 +1344,18 @@ qwen35_ane_compile_swiglu_down_bank(
     NSDictionary *execution_options = ane_execution_options(ane_instance);
     NSMutableData *weight_blob = [NSMutableData dataWithLength:64];
     std::vector<std::array<uint64_t, 3>> offsets;
-    offsets.reserve(gate_weights.size());
-    for (size_t index = 0; index < gate_weights.size(); ++index) {
-      const auto append_fp16 = [&](const array &weight) {
-        auto dense = fp16_rows(weight.data<float>(),
-                               static_cast<int>(weight.shape(0)),
-                               static_cast<int>(weight.shape(1)));
+    offsets.reserve(shapes.size());
+    for (int index = start; index < stop; ++index) {
+      const auto append_fp16 = [&](const std::vector<_Float16> &dense) {
         return append_blob_chunk(weight_blob, dense.data(),
                                  dense.size() * sizeof(dense.front()), 1);
       };
-      offsets.push_back({append_fp16(gate_weights[index]),
-                         append_fp16(up_weights[index]),
-                         append_fp16(down_weights[index])});
+      const auto &chunk = impl_->chunks[index];
+      offsets.push_back({append_fp16(chunk.gate), append_fp16(chunk.up),
+                         append_fp16(chunk.down)});
     }
     auto *weight_header = static_cast<uint32_t *>(weight_blob.mutableBytes);
-    weight_header[0] = static_cast<uint32_t>(gate_weights.size() * 3);
+    weight_header[0] = static_cast<uint32_t>(shapes.size() * 3);
     weight_header[1] = 2;
     NSData *mil =
         [fp16_swiglu_down_bank_mil(shapes, offsets, sequence_length)
@@ -1392,6 +1426,24 @@ qwen35_ane_compile_swiglu_down_bank(
     }
     return result;
   }
+}
+
+std::vector<std::shared_ptr<AneLinearModel>>
+qwen35_ane_compile_swiglu_down_bank(
+    const std::vector<array> &gate_weights,
+    const std::vector<array> &up_weights,
+    const std::vector<array> &down_weights, int sequence_length,
+    int ane_instance) {
+  if (gate_weights.empty() || gate_weights.size() > 256 ||
+      gate_weights.size() != up_weights.size() ||
+      gate_weights.size() != down_weights.size()) {
+    throw std::invalid_argument("Invalid ANE SwiGLU/down procedure bank.");
+  }
+  AneFusedBankBuilder builder(sequence_length);
+  for (size_t index = 0; index < gate_weights.size(); ++index) {
+    builder.add(gate_weights[index], up_weights[index], down_weights[index]);
+  }
+  return builder.compile(ane_instance, 0, builder.size());
 }
 
 namespace {

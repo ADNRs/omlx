@@ -2610,39 +2610,66 @@ def _enable_fused_down_banks(
     resident_programs = 0
     for chunk_start in range(0, len(candidates), 32):
         modules = candidates[chunk_start : chunk_start + 32]
-        prepared = []
+        # Stream one gate/up/down triple at a time into the incremental
+        # builders so each layer's fp32 staging arrays are released before
+        # the next layer dequantizes (the issue #2781 recipe; the one-shot
+        # path below kept a whole 32-layer chunk of fp32 alive at once).
+        builder0 = builder1 = None
+        if hasattr(fast, "qwen35_ane_fused_bank_builder"):
+            try:
+                builder0 = fast.qwen35_ane_fused_bank_builder(
+                    config.sequence_length
+                )
+                builder1 = fast.qwen35_ane_fused_bank_builder(
+                    config.sequence_length
+                )
+            except Exception:
+                builder0 = builder1 = None
+        staged: list[tuple[Any, Any]] = []
+        legacy_weights: list[tuple[mx.array, ...]] = []
         for module in modules:
             value = _prepare_fused_down_for_bank(module, config)
-            if value is not None:
-                state, weights = value
-                prepared.append((module, state, *weights))
-        if not prepared:
+            if value is None:
+                continue
+            state, weights = value
+            if builder0 is not None:
+                mx.eval(*weights)
+                builder0.add(weights[0], weights[1], weights[2])
+                builder1.add(weights[3], weights[4], weights[5])
+            else:
+                legacy_weights.append(weights)
+            staged.append((module, state))
+        if not staged:
             continue
-        compile_values = [value for entry in prepared for value in entry[2:]]
-        mx.eval(*compile_values)
-        models0 = fast.qwen35_ane_compile_swiglu_down_bank(
-            [entry[2] for entry in prepared],
-            [entry[3] for entry in prepared],
-            [entry[4] for entry in prepared],
-            config.sequence_length,
-            1,
-        )
-        models1 = fast.qwen35_ane_compile_swiglu_down_bank(
-            [entry[5] for entry in prepared],
-            [entry[6] for entry in prepared],
-            [entry[7] for entry in prepared],
-            config.sequence_length,
-            2,
-        )
+        if builder0 is not None:
+            models0 = builder0.compile(1, 0, builder0.size)
+            models1 = builder1.compile(2, 0, builder1.size)
+        else:
+            mx.eval(*[w for weights in legacy_weights for w in weights])
+            models0 = fast.qwen35_ane_compile_swiglu_down_bank(
+                [weights[0] for weights in legacy_weights],
+                [weights[1] for weights in legacy_weights],
+                [weights[2] for weights in legacy_weights],
+                config.sequence_length,
+                1,
+            )
+            models1 = fast.qwen35_ane_compile_swiglu_down_bank(
+                [weights[3] for weights in legacy_weights],
+                [weights[4] for weights in legacy_weights],
+                [weights[5] for weights in legacy_weights],
+                config.sequence_length,
+                2,
+            )
         _warm_ane_models([*models0, *models1])
-        for index, (module, state, *_weights) in enumerate(prepared):
+        for index, (module, state) in enumerate(staged):
             module._omlx_ane_prefill_config = config
             module._omlx_ane_fused_down_state = replace(
                 state, model=models0[index], model1=models1[index]
             )
-        count += len(prepared)
+        count += len(staged)
         resident_programs += 2
-        del prepared, compile_values
+        del staged, legacy_weights, builder0, builder1
+        mx.clear_cache()
     if not count:
         return None
     model._omlx_ane_down_prefill_count = count

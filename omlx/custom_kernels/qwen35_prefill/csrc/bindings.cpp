@@ -81,6 +81,26 @@ NB_MODULE(_ext, m) {
           "start"_a,
           "stop"_a,
           nb::call_guard<nb::gil_scoped_release>());
+  nb::class_<omlx::qwen35_prefill_kernels::AneFusedBankBuilder>(
+      m, "AneFusedBankBuilder")
+      .def(nb::init<int>(), "sequence_length"_a)
+      .def(
+          "add",
+          &omlx::qwen35_prefill_kernels::AneFusedBankBuilder::add,
+          "gate_weight"_a,
+          "up_weight"_a,
+          "down_weight"_a,
+          nb::call_guard<nb::gil_scoped_release>())
+      .def_prop_ro(
+          "size",
+          &omlx::qwen35_prefill_kernels::AneFusedBankBuilder::size)
+      .def(
+          "compile",
+          &omlx::qwen35_prefill_kernels::AneFusedBankBuilder::compile,
+          "ane_instance"_a,
+          "start"_a,
+          "stop"_a,
+          nb::call_guard<nb::gil_scoped_release>());
   m.def(
       "qwen35_ane_compile_linear",
       static_cast<std::shared_ptr<
