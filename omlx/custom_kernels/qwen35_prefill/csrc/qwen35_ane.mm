@@ -1109,6 +1109,24 @@ static std::string pack_buffer_error(MTL::CommandBuffer *producer_buffer) {
       buffer.error);
 }
 
+struct AneTicketPair {
+  AneLinearModel::Ticket first;
+  AneLinearModel::Ticket second;
+};
+
+static AneTicketPair begin_ane_ticket_pair(
+    const std::shared_ptr<AneLinearModel> &first,
+    const std::shared_ptr<AneLinearModel> &second,
+    MTL::CommandBuffer *producer_buffer) {
+  auto first_ticket = first->begin(producer_buffer);
+  try {
+    return {first_ticket, second->begin(producer_buffer)};
+  } catch (...) {
+    first->cancel_ticket(first_ticket);
+    throw;
+  }
+}
+
 bool qwen35_ane_available() {
   @autoreleasepool {
     try {
@@ -2440,8 +2458,15 @@ public:
 
     auto *producer_buffer = encoder.get_command_buffer();
     producer_buffer->retain();
-    auto ticket0 = model0_->begin(producer_buffer);
-    auto ticket1 = model1_->begin(producer_buffer);
+    AneTicketPair tickets{};
+    try {
+      tickets = begin_ane_ticket_pair(model0_, model1_, producer_buffer);
+    } catch (...) {
+      producer_buffer->release();
+      throw;
+    }
+    const auto ticket0 = tickets.first;
+    const auto ticket1 = tickets.second;
     encoder.commit();
     producer_buffer->waitUntilCompleted();
     if (pack_buffer_failed(producer_buffer)) {
@@ -2776,9 +2801,13 @@ public:
     AneLinearModel::Ticket ticket{};
     AneLinearModel::Ticket ticket1{};
     try {
-      ticket = model_->begin(producer_buffer);
       if (model1_) {
-        ticket1 = model1_->begin(producer_buffer);
+        const auto tickets =
+            begin_ane_ticket_pair(model_, model1_, producer_buffer);
+        ticket = tickets.first;
+        ticket1 = tickets.second;
+      } else {
+        ticket = model_->begin(producer_buffer);
       }
     } catch (...) {
       producer_buffer->release();
