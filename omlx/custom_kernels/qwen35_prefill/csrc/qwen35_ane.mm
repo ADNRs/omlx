@@ -2880,18 +2880,18 @@ public:
       producer_buffer->release();
       throw;
     }
+    // Cancel the tickets and free the buffer if anything below throws before
+    // the detached evaluation threads take ownership (finding C1).
+    AneDispatchGuard ane_guard(producer_buffer, model_, ticket, model1_,
+                               ticket1);
     encoder.commit();
     producer_buffer->waitUntilCompleted();
     if (pack_buffer_failed(producer_buffer)) {
-      const std::string reason = pack_buffer_error(producer_buffer);
-      producer_buffer->release();
-      model_->cancel_ticket(ticket);
-      if (model1_) {
-        model1_->cancel_ticket(ticket1);
-      }
-      throw std::runtime_error(reason);
+      // ane_guard releases the buffer and cancels the tickets on unwind.
+      throw std::runtime_error(pack_buffer_error(producer_buffer));
     }
     producer_buffer->release();
+    ane_guard.producer_released();
     if (profiling) {
       profile_add(profile_category, kPackNs,
                   profile_now_ns() - operation_start);
@@ -2960,6 +2960,9 @@ public:
     [suffix_buffer retain];
     encoder.commit();
     auto model = model_;
+    // The evaluation threads below take ownership of the tickets; the
+    // get_kernel window that could orphan them is now behind us.
+    ane_guard.disarm();
     std::thread([model = std::move(model), ticket, profiling, launch] {
       const uint64_t start = profiling ? profile_now_ns() : 0;
       model->execute(ticket);
