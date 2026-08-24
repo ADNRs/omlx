@@ -859,7 +859,6 @@ def _fsync_parent_dir(path: str | Path) -> None:
     call returned success. Cheap relative to the write itself (one flush
     of already-cached directory metadata, no data to flush), so applied
     at every writer that promotes a temp file into place.
-    See docs/qwen35-hardening-and-optimization.md F1.
     """
     dir_path = os.path.dirname(str(path)) or "."
     try:
@@ -931,7 +930,6 @@ def _write_safetensors_no_mx(
         # power loss between close() and the rename can leave the temp file's
         # data only in the OS page cache -- the rename still lands, but the
         # file it points at can read back as truncated/zero-filled garbage.
-        # See docs/qwen35-hardening-and-optimization.md F1.
         f.flush()
         os.fsync(f.fileno())
 
@@ -4222,8 +4220,7 @@ class PagedSSDCacheManager(CacheManager):
         # caused deadlocks when it contested Metal GPU resources with the
         # calling thread's own inference work (MLX #978 #1040 #1106 #1437
         # #1558). preload_matched_blocks runs inline on that same calling
-        # thread (docs/qwen35-hardening-and-optimization.md F2), so it is
-        # exposed to exactly that contention.
+        # thread, so it is exposed to exactly that contention.
         for block_hash, metadata in to_load:
             if _load_one(block_hash, metadata):
                 loaded_count += 1

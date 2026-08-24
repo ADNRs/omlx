@@ -2103,11 +2103,10 @@ class TestAsyncBackgroundWrite:
         assert mx.allclose(t2, loaded_arrays["tensor_b"]).item()
 
     def test_write_safetensors_no_mx_fsyncs_before_close(self, mx, tmp_path):
-        """F1: the file must be durable on disk before any caller renames it
+        """The file must be durable on disk before any caller renames it
         into place -- otherwise a crash between close() and the rename can
         leave the renamed file pointing at data that was only ever in the
-        OS page cache, reading back as truncated/zero-filled garbage.
-        See docs/qwen35-hardening-and-optimization.md F1."""
+        OS page cache, reading back as truncated/zero-filled garbage."""
         import omlx.cache.paged_ssd_cache as ssd_mod
 
         t1 = mx.ones((4,), dtype=mx.float32)
@@ -2568,13 +2567,12 @@ class TestPreloadMatchedBlocks:
         manager2.close()
 
     def test_preload_mx_load_runs_serially_on_caller_thread(self, tmp_path, mx):
-        """F2: preload must not run mx.load() in worker threads -- a prior
+        """Preload must not run mx.load() in worker threads -- a prior
         ThreadPoolExecutor-based version caused deadlocks contesting Metal
         GPU resources with the calling (inference) thread, the same failure
         mode load_block's own discipline comment already documents. Every
         mx.load() call during preload must happen on the calling thread,
-        one at a time.
-        See docs/qwen35-hardening-and-optimization.md F2."""
+        one at a time."""
         import threading
 
         from omlx.cache import paged_ssd_cache as ssd_mod

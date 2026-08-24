@@ -8024,9 +8024,7 @@ class Scheduler:
                     max_size_bytes=self.config.paged_ssd_cache_max_size,
                     hot_cache_max_bytes=self.config.hot_cache_max_size,
                     hot_cache_only=self.config.hot_cache_only,
-                    hot_cache_write_through=getattr(
-                        self.config, "hot_cache_write_through", False
-                    ),
+                    hot_cache_write_through=self.config.hot_cache_write_through,
                     hot_cache_budget=self.config.hot_cache_budget,
                     expected_model_name=name,
                     expected_num_layers=len(draft_cache_list),
@@ -12469,9 +12467,7 @@ class Scheduler:
                 max_size_bytes=self.config.paged_ssd_cache_max_size,
                 hot_cache_max_bytes=self.config.hot_cache_max_size,
                 hot_cache_only=self.config.hot_cache_only,
-                hot_cache_write_through=getattr(
-                    self.config, "hot_cache_write_through", False
-                ),
+                hot_cache_write_through=self.config.hot_cache_write_through,
                 hot_cache_budget=self.config.hot_cache_budget,
                 gdn_ssd_split_enabled=self.config.gdn_ssd_split_enabled,
                 expected_model_name=self.config.model_name or "",
