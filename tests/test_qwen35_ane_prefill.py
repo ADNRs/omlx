@@ -793,6 +793,147 @@ def test_bank_chunk_spans_respects_byte_cap():
     assert ane_patch._bank_chunk_spans(weights, 1 << 30) == [(0, 4)]
 
 
+def test_ane_bank_memory_headroom_ok_math(monkeypatch):
+    """Regression for a live jetsam kill: process phys_footprint climbed to
+    48.3GB on a 48GB machine across a bounded 4-attempt retry ladder, each
+    attempt individually dropping its own references but racing the ANE
+    driver's asynchronous device-mapping release. The gate compares against
+    total system memory (the same ledger jetsam uses), not oMLX's own
+    configured ceiling, since it has to work even before any ceiling has
+    propagated."""
+    import omlx.utils.hardware as hardware
+    import omlx.utils.proc_memory as proc_memory
+
+    gib = 1024**3
+    monkeypatch.setattr(hardware, "get_total_memory_bytes", lambda: 48 * gib)
+
+    monkeypatch.setattr(proc_memory, "get_phys_footprint", lambda: int(30 * gib))
+    assert ane_patch._ane_bank_memory_headroom_ok() is True  # 62.5% < 70%
+
+    monkeypatch.setattr(proc_memory, "get_phys_footprint", lambda: int(34 * gib))
+    assert ane_patch._ane_bank_memory_headroom_ok() is False  # ~70.8% >= 70%
+
+    # total==0 (measurement unavailable): default to allowing the attempt.
+    monkeypatch.setattr(hardware, "get_total_memory_bytes", lambda: 0)
+    assert ane_patch._ane_bank_memory_headroom_ok() is True
+
+
+def test_ane_bank_memory_headroom_ok_defaults_true_on_error(monkeypatch):
+    import omlx.utils.hardware as hardware
+
+    def boom():
+        raise RuntimeError("sysctl unavailable")
+
+    monkeypatch.setattr(hardware, "get_total_memory_bytes", boom)
+    assert ane_patch._ane_bank_memory_headroom_ok() is True
+
+
+def test_ane_bank_memory_footprint_snapshot_reports_measured_bytes(monkeypatch):
+    """The skip-warning log needs the actual measured numbers, not just the
+    fixed threshold constant, so a future "why is ANE slow on this box" is
+    answerable from one log line."""
+    import omlx.utils.hardware as hardware
+    import omlx.utils.proc_memory as proc_memory
+
+    gib = 1024**3
+    monkeypatch.setattr(proc_memory, "get_phys_footprint", lambda: 34 * gib)
+    monkeypatch.setattr(hardware, "get_total_memory_bytes", lambda: 48 * gib)
+
+    assert ane_patch._ane_bank_memory_footprint_snapshot() == (34 * gib, 48 * gib)
+
+
+def test_ane_bank_memory_footprint_snapshot_defaults_zero_on_error(monkeypatch):
+    import omlx.utils.hardware as hardware
+
+    def boom():
+        raise RuntimeError("sysctl unavailable")
+
+    monkeypatch.setattr(hardware, "get_total_memory_bytes", boom)
+    assert ane_patch._ane_bank_memory_footprint_snapshot() == (0, 0)
+
+
+def test_bank_split_ladder_stops_retrying_when_headroom_runs_out(monkeypatch):
+    """The circuit breaker must stop issuing further compile attempts (not
+    just refuse to start) once memory tightens mid-ladder -- this is what
+    actually prevents a jetsam kill, since a machine can have headroom for
+    the first attempt but not the later, smaller-but-still-compounding
+    ones."""
+    monkeypatch.setattr(ane_patch.time, "sleep", lambda *_a: None)
+    calls = []
+
+    def compile_span(start, stop):
+        calls.append((start, stop))
+        raise RuntimeError("ANE procedure bank load failed: 0x20004")
+
+    headroom_calls = []
+
+    def headroom_ok():
+        headroom_calls.append(True)
+        return len(headroom_calls) == 1  # only the first attempt has headroom
+
+    monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", headroom_ok)
+    monkeypatch.setattr(
+        ane_patch, "_ane_bank_memory_footprint_snapshot", lambda: (0, 0)
+    )
+
+    result = ane_patch._bank_split_ladder([4, 4, 4, 4], compile_span)
+
+    assert result is None
+    assert calls == [(0, 4)]  # only the first (monolithic) attempt ran
+    assert len(headroom_calls) == 2  # gate checked before attempt 1 and 2
+
+
+def test_bank_split_ladder_settles_between_failed_attempts(monkeypatch):
+    """A failed attempt must give the ANE driver's asynchronous device
+    -mapping release a moment before the next attempt's headroom check
+    measures phys_footprint -- otherwise the check races the driver and can
+    under- or over-react to memory that hasn't actually been freed yet."""
+    monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", lambda: True)
+    sleeps = []
+    monkeypatch.setattr(ane_patch.time, "sleep", lambda s: sleeps.append(s))
+    gc_calls = []
+    monkeypatch.setattr(ane_patch.gc, "collect", lambda: gc_calls.append(True))
+
+    def compile_span(start, stop):
+        raise RuntimeError("ANE procedure bank load failed: 0x20004")
+
+    ane_patch._bank_split_ladder([4, 4, 4, 4], compile_span)
+
+    assert len(gc_calls) >= 1
+    assert sleeps and all(s == ane_patch._ANE_BANK_RETRY_SETTLE_SECONDS for s in sleeps)
+
+
+def test_compile_single_banks_stops_retrying_when_headroom_runs_out(monkeypatch):
+    """Same circuit breaker, applied to the not-yet-refactored single-ANE
+    calibration path (which has its own inline copy of the retry ladder)."""
+    monkeypatch.setattr(ane_patch.time, "sleep", lambda *_a: None)
+    calls = []
+
+    def compile_bank(weights, sequence_length, ane_instance):
+        calls.append(len(weights))
+        raise RuntimeError("ANE procedure bank load failed: 0x20004")
+
+    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+
+    headroom_calls = []
+
+    def headroom_ok():
+        headroom_calls.append(True)
+        return len(headroom_calls) == 1
+
+    monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", headroom_ok)
+    monkeypatch.setattr(
+        ane_patch, "_ane_bank_memory_footprint_snapshot", lambda: (0, 0)
+    )
+
+    weights = [mx.zeros((4, 4), dtype=mx.int8) for _ in range(4)]
+    result = ane_patch._compile_single_banks(weights, 2048)
+
+    assert result is None
+    assert calls == [4]
+    assert len(headroom_calls) == 2
+
+
 def test_compile_single_bank_targets_unpinned_instance(monkeypatch):
     weights = [mx.zeros((4, 4), dtype=mx.int8) for _ in range(3)]
     calls = []
@@ -803,6 +944,7 @@ def test_compile_single_bank_targets_unpinned_instance(monkeypatch):
 
     monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
     monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", lambda: True)
 
     result = ane_patch._compile_single_banks(weights, 2048)
 
@@ -822,6 +964,8 @@ def test_enable_splits_banks_when_monolithic_load_fails(monkeypatch):
     )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", lambda: True)
+    monkeypatch.setattr(ane_patch.time, "sleep", lambda *_a: None)
     compiled = []
 
     def compile_bank(weights, sequence_length, ane_instance):
@@ -873,6 +1017,8 @@ def test_enable_first_retry_is_a_near_half_split(monkeypatch):
     )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", lambda: True)
+    monkeypatch.setattr(ane_patch.time, "sleep", lambda *_a: None)
     compiled = []
 
     def compile_bank(weights, sequence_length, ane_instance):
@@ -906,6 +1052,8 @@ def test_enable_env_cap_forces_split_banks(monkeypatch):
     )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", lambda: True)
+    monkeypatch.setattr(ane_patch.time, "sleep", lambda *_a: None)
     compiled = []
 
     def compile_bank(weights, sequence_length, ane_instance):
@@ -938,6 +1086,8 @@ def test_enable_falls_back_to_per_layer_when_split_banks_fail(monkeypatch):
     )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", lambda: True)
+    monkeypatch.setattr(ane_patch.time, "sleep", lambda *_a: None)
 
     def compile_bank(weights, sequence_length, ane_instance):
         raise RuntimeError("ANE procedure bank load failed: 0x20004")
@@ -2546,6 +2696,8 @@ def _builder_test_setup(monkeypatch, builders):
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", lambda: True)
+    monkeypatch.setattr(ane_patch.time, "sleep", lambda *_a: None)
     monkeypatch.setattr(
         fast, "qwen35_ane_linear_bank_builder", lambda seq: builders.pop(0)
     )

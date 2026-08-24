@@ -7,6 +7,7 @@ token counts, dtypes, and decode/verify calls fall through unchanged.
 
 from __future__ import annotations
 
+import gc
 import importlib
 import logging
 import os
@@ -38,6 +39,57 @@ _ANE_RESIDENT_PROGRAM_LIMIT = 120
 # ~4 GiB device address window, so single-die chips reject two monolithic
 # dual banks; 1 GiB spans keep every create well under the window.
 _ANE_BANK_RETRY_MAX_BYTES = 1 << 30
+# A failed compile attempt's already-loaded partial banks are dropped
+# (models cleared to []), but the ANE driver's own device-mapping release
+# is asynchronous and sometimes lags the retry (observed directly: kernel
+# log lines "ReleaseProgramResource: WARN: waitForPendingUpdate failed").
+# Retrying immediately races that cleanup, so a machine with tight headroom
+# can climb across attempts even though each individual attempt drops its
+# references correctly. Gate every attempt (including the first) on real
+# phys_footprint headroom against total system memory -- the same ledger
+# the kernel's jetsam killer uses -- and give the driver a moment to catch
+# up between attempts, instead of shrinking-and-retrying blind. Confirmed
+# necessary live: a 4-attempt retry ladder (each individually bounded)
+# still grew process RSS to 48.3GB on a 48GB machine and was jetsam-killed
+# mid-retry.
+_ANE_BANK_RETRY_MAX_MEMORY_FRACTION = 0.70
+_ANE_BANK_RETRY_SETTLE_SECONDS = 0.5
+
+
+def _ane_bank_memory_headroom_ok() -> bool:
+    """True if phys_footprint has enough room left for another ANE procedure
+    bank compile attempt. Defaults to allowing the attempt (returns True) if
+    either measurement is unavailable, so a query failure never blocks the
+    fast path -- this is a circuit breaker for a known failure mode, not a
+    new hard dependency."""
+    try:
+        from omlx.utils.hardware import get_total_memory_bytes
+        from omlx.utils.proc_memory import get_phys_footprint
+
+        total = get_total_memory_bytes()
+        if total <= 0:
+            return True
+        current = get_phys_footprint()
+        return current < total * _ANE_BANK_RETRY_MAX_MEMORY_FRACTION
+    except Exception:
+        return True
+
+
+def _ane_bank_memory_footprint_snapshot() -> tuple[int, int]:
+    """``(current phys_footprint, total system memory)`` in bytes for the
+    skip-warning log, so "why did ANE bank compile stop retrying on this
+    box" is answerable from one log line instead of just the fixed 70%
+    threshold. Best-effort: returns ``(0, 0)`` if either measurement is
+    unavailable."""
+    try:
+        from omlx.utils.hardware import get_total_memory_bytes
+        from omlx.utils.proc_memory import get_phys_footprint
+
+        return get_phys_footprint(), get_total_memory_bytes()
+    except Exception:
+        return 0, 0
+
+
 @dataclass(frozen=True)
 class _AnePrefillConfig:
     sequence_length: int
@@ -2016,7 +2068,20 @@ def _bank_split_ladder(
     total_bytes = sum(source_bytes)
     largest_bytes = max(source_bytes, default=0)
 
-    for _ in range(4):
+    for attempt in range(4):
+        if not _ane_bank_memory_headroom_ok():
+            current, total = _ane_bank_memory_footprint_snapshot()
+            logger.warning(
+                "Skipping ANE procedure bank compile attempt %d/4: phys "
+                "footprint %.2f GiB / %.2f GiB total already past the "
+                "%.0f%% safety fraction of system memory. Falling back to "
+                "per-layer programs instead of risking a jetsam kill.",
+                attempt + 1,
+                current / (1 << 30),
+                total / (1 << 30),
+                _ANE_BANK_RETRY_MAX_MEMORY_FRACTION * 100,
+            )
+            break
         spans = (
             [(0, len(source_bytes))]
             if cap <= 0
@@ -2031,8 +2096,16 @@ def _bank_split_ladder(
                 models1.extend(span1)
         except Exception:
             # Drop banks that loaded before the failure so their device
-            # mappings are released before the smaller retry.
+            # mappings are released before the smaller retry. The ANE
+            # driver's own release is asynchronous, so force a GC pass and
+            # give it a moment to actually land before the next attempt's
+            # headroom check measures phys_footprint -- otherwise the check
+            # can see this attempt's not-yet-reclaimed memory and either
+            # falsely block the next attempt or (worse) not yet reflect it
+            # and let the next attempt pile on top.
             models0 = models1 = []
+            gc.collect()
+            time.sleep(_ANE_BANK_RETRY_SETTLE_SECONDS)
             logger.warning(
                 "ANE procedure bank compilation failed (%d banks per "
                 "instance, %d procedures, %.2f GiB per instance)",
@@ -2118,7 +2191,20 @@ def _compile_single_banks(
     total_bytes = sum(weight.nbytes for weight in weights)
     largest_bytes = max((weight.nbytes for weight in weights), default=0)
 
-    for _ in range(4):
+    for attempt in range(4):
+        if not _ane_bank_memory_headroom_ok():
+            current, total = _ane_bank_memory_footprint_snapshot()
+            logger.warning(
+                "Skipping single-ANE procedure bank compile attempt %d/4: "
+                "phys footprint %.2f GiB / %.2f GiB total already past the "
+                "%.0f%% safety fraction of system memory. Falling back to "
+                "per-layer programs instead of risking a jetsam kill.",
+                attempt + 1,
+                current / (1 << 30),
+                total / (1 << 30),
+                _ANE_BANK_RETRY_MAX_MEMORY_FRACTION * 100,
+            )
+            break
         spans = (
             [(0, len(weights))] if cap <= 0 else _bank_chunk_spans(weights, cap)
         )
@@ -2132,6 +2218,8 @@ def _compile_single_banks(
                 )
         except Exception:
             models = []
+            gc.collect()
+            time.sleep(_ANE_BANK_RETRY_SETTLE_SECONDS)
             logger.warning(
                 "Single-ANE procedure bank compilation failed (%d banks, "
                 "%d procedures, %.2f GiB)",
