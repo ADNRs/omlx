@@ -850,6 +850,30 @@ def _restore_tensor_from_bytes(
     return arr.reshape(shape)
 
 
+def _fsync_parent_dir(path: str | Path) -> None:
+    """Fsync the containing directory after a rename/replace into it.
+
+    POSIX doesn't guarantee a rename survives a crash until the directory
+    entry itself is flushed -- the renamed file can revert to its prior
+    name (or the new name can point at nothing) even though the rename
+    call returned success. Cheap relative to the write itself (one flush
+    of already-cached directory metadata, no data to flush), so applied
+    at every writer that promotes a temp file into place.
+    See docs/qwen35-hardening-and-optimization.md F1.
+    """
+    dir_path = os.path.dirname(str(path)) or "."
+    try:
+        dir_fd = os.open(dir_path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
+
+
 def _write_safetensors_no_mx(
     path: str,
     tensors_raw: dict[str, tuple[bytes, str, list[int]]],
@@ -900,6 +924,16 @@ def _write_safetensors_no_mx(
         f.write(header_json)
         for d in all_data:
             f.write(d)
+        # Durable before any caller renames this file into place (all four
+        # call sites across paged_ssd_cache.py and boundary_snapshot_store.py
+        # write to a *_tmp.safetensors path and rename/replace it into the
+        # final name right after this returns). Without this, a crash or
+        # power loss between close() and the rename can leave the temp file's
+        # data only in the OS page cache -- the rename still lands, but the
+        # file it points at can read back as truncated/zero-filled garbage.
+        # See docs/qwen35-hardening-and-optimization.md F1.
+        f.flush()
+        os.fsync(f.fileno())
 
     return 8 + len(header_json) + offset
 
@@ -2380,6 +2414,7 @@ class PagedSSDCacheManager(CacheManager):
                     # is restored below and its file remains intact.
                     self._enforce_size_limit_for_new_block(staged_stat.st_size)
                     os.replace(staged_path, final_path)
+                    _fsync_parent_dir(final_path)
                     committed_at = time.time()
                     # os.replace preserves the staging file's timestamps. Stamp
                     # the actual commit/access time so a restart reconstructs LRU
@@ -2955,6 +2990,7 @@ class PagedSSDCacheManager(CacheManager):
             )
 
             os.rename(str(temp_path), str(file_path))
+            _fsync_parent_dir(file_path)
 
             # The block is now durable on disk; bump the persist counter
             # before any cleanup so ``saves_persisted`` reflects rename

@@ -2102,6 +2102,62 @@ class TestAsyncBackgroundWrite:
         assert mx.allclose(t1, loaded_arrays["tensor_a"]).item()
         assert mx.allclose(t2, loaded_arrays["tensor_b"]).item()
 
+    def test_write_safetensors_no_mx_fsyncs_before_close(self, mx, tmp_path):
+        """F1: the file must be durable on disk before any caller renames it
+        into place -- otherwise a crash between close() and the rename can
+        leave the renamed file pointing at data that was only ever in the
+        OS page cache, reading back as truncated/zero-filled garbage.
+        See docs/qwen35-hardening-and-optimization.md F1."""
+        import omlx.cache.paged_ssd_cache as ssd_mod
+
+        t1 = mx.ones((4,), dtype=mx.float32)
+        mx.eval(t1)
+        tensors_raw = {"tensor_a": _extract_tensor_bytes(t1)}
+        out_path = str(tmp_path / "test.safetensors")
+
+        calls = []
+        real_fsync = ssd_mod.os.fsync
+
+        def spy_fsync(fd):
+            calls.append(fd)
+            return real_fsync(fd)
+
+        with patch.object(ssd_mod.os, "fsync", spy_fsync):
+            _write_safetensors_no_mx(out_path, tensors_raw)
+
+        assert len(calls) == 1
+
+    def test_fsync_parent_dir_fsyncs_the_directory(self, tmp_path):
+        """F1: renaming a file into place doesn't guarantee the directory
+        entry itself survives a crash until the containing directory is
+        fsynced too."""
+        from omlx.cache.paged_ssd_cache import _fsync_parent_dir
+
+        target = tmp_path / "sub" / "file.txt"
+        target.parent.mkdir()
+        target.write_text("data")
+
+        import omlx.cache.paged_ssd_cache as ssd_mod
+
+        calls = []
+        real_fsync = ssd_mod.os.fsync
+
+        def spy_fsync(fd):
+            calls.append(fd)
+            return real_fsync(fd)
+
+        with patch.object(ssd_mod.os, "fsync", spy_fsync):
+            _fsync_parent_dir(target)
+
+        assert len(calls) == 1
+
+    def test_fsync_parent_dir_tolerates_missing_directory(self, tmp_path):
+        """Must not raise if the directory vanished (e.g. concurrent
+        eviction) -- this is best-effort durability, not correctness."""
+        from omlx.cache.paged_ssd_cache import _fsync_parent_dir
+
+        _fsync_parent_dir(str(tmp_path / "does-not-exist" / "file.txt"))
+
     def test_write_safetensors_bfloat16_roundtrip(self, mx, tmp_path):
         """Verify bfloat16 safetensors file is loadable by mx.load."""
         original = mx.random.normal((8, 16, 32)).astype(mx.bfloat16)
