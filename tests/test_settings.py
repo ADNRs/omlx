@@ -397,6 +397,7 @@ class TestCacheSettings:
         assert settings.get_gdn_ssd_split_enabled() is True
         assert settings.gdn_ssd_pending_max_size == "512MB"
         assert settings.gdn_sidecar_state_dtype == "fp32"
+        assert settings.ane_compile_cache is False
         assert settings.initial_cache_blocks == 256
 
     def test_get_ssd_cache_dir_default(self):
@@ -442,6 +443,7 @@ class TestCacheSettings:
             "ssd_cache_max_size": "50GB",
             "hot_cache_max_size": "0",
             "hot_cache_write_through": False,
+            "ane_compile_cache": False,
             "initial_cache_blocks": 256,
         }
 
