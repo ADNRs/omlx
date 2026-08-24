@@ -2826,10 +2826,21 @@ def _prepare_fused_down_for_bank(
             ).astype(mx.float32)
         )
 
+    # Only columns [0:gpu_start] of the down matrix are ever consumed below
+    # (down0/down1/cpu_down_weight); the GPU portion reads down.weight
+    # directly, still quantized, at gate_up_weight/down_weight below.
+    # Dequantizing the full matrix wasted a ~(hidden - gpu_start)-column
+    # fp32 transient (~0.5GB/layer) that was computed and immediately
+    # discarded. gpu_start is a multiple of 128 (per_ane/cpu_hidden are
+    # both rounded down to 128 above), so slicing the packed axis at
+    # gpu_start // 8 (4-bit: 8 values/int32) and gpu_start // 128 (the
+    # quantization group_size) yields exactly the first gpu_start
+    # unpacked columns -- same values as before, just without the wasted
+    # suffix. See docs/qwen35-hardening-and-optimization.md C3.
     dense_down = mx.dequantize(
-        down.weight,
-        down.scales,
-        down.biases,
+        down.weight[:, : gpu_start // 8],
+        down.scales[:, : gpu_start // 128],
+        down.biases[:, : gpu_start // 128],
         group_size=128,
         bits=4,
     ).astype(mx.float32)

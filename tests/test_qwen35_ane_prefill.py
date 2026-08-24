@@ -2807,6 +2807,92 @@ def test_warmup_failure_latches_only_the_owning_module(monkeypatch, caplog):
 # --- fused bank streaming + CPU warm helper (post-#2935 follow-up) ---
 
 
+def _dual_ane_down_mlp():
+    return SimpleNamespace(
+        gate_proj=nn.QuantizedLinear(128, 1024, bias=False, group_size=128, bits=4),
+        up_proj=nn.QuantizedLinear(128, 1024, bias=False, group_size=128, bits=4),
+        down_proj=nn.QuantizedLinear(1024, 128, bias=False, group_size=128, bits=4),
+    )
+
+
+def _dual_ane_down_config():
+    # hidden=1024 (gate/up out_features); per_ane=128, total_ane=256,
+    # cpu_hidden=128, gpu_start=384 -- all multiples of 128, and
+    # hidden - gpu_start = 640 is also a multiple of 128, so
+    # _prepare_fused_down_for_bank's validity gate passes.
+    return ane_patch._AnePrefillConfig(
+        1,
+        0.5,
+        8,
+        dual_ane=True,
+        cpu_fraction=0.125,
+        ane_down_fraction=0.125,
+        fused_down=True,
+    )
+
+
+def test_prepare_fused_down_for_bank_only_dequantizes_consumed_down_columns(
+    monkeypatch,
+):
+    """C3: dense_down used to dequantize down_proj's ENTIRE packed weight,
+    even though only columns [0:gpu_start] are ever consumed below
+    (down0/down1/cpu_down_weight) -- the [gpu_start:hidden] suffix was
+    computed and immediately discarded, a pure-waste ~0.5GB/layer fp32
+    transient. The down dequantize call must now receive only the
+    gpu_start-wide packed slice, not the full matrix.
+    See docs/qwen35-hardening-and-optimization.md C3."""
+    mlp = _dual_ane_down_mlp()
+    config = _dual_ane_down_config()
+    real_dequantize = mx.dequantize
+    captured_shapes = []
+
+    def spy_dequantize(w, *args, **kwargs):
+        captured_shapes.append(tuple(w.shape))
+        return real_dequantize(w, *args, **kwargs)
+
+    monkeypatch.setattr(ane_patch.mx, "dequantize", spy_dequantize)
+
+    result = ane_patch._prepare_fused_down_for_bank(mlp, config)
+    assert result is not None
+
+    # down's dequantize call is issued first, before any gate/up dense_rows
+    # calls. It must only see the gpu_start-wide packed slice (384 // 8 =
+    # 48 columns), not the full 1024 // 8 = 128 columns of down_proj's
+    # packed weight.
+    full_packed_width = mlp.down_proj.weight.shape[1]
+    assert full_packed_width == 128
+    assert captured_shapes[0][1] == 48
+    assert captured_shapes[0][1] < full_packed_width
+
+
+def test_prepare_fused_down_for_bank_sliced_dequant_matches_full_dequant():
+    """Correctness check for the C3 optimization: dequantizing only the
+    consumed prefix of the down matrix must be bit-identical to the old
+    dequantize-the-whole-thing-then-slice behavior, not merely faster."""
+    mlp = _dual_ane_down_mlp()
+    config = _dual_ane_down_config()
+
+    result = ane_patch._prepare_fused_down_for_bank(mlp, config)
+    assert result is not None
+    state, (gate0, up0, down0, gate1, up1, down1) = result
+
+    down = mlp.down_proj
+    reference = mx.dequantize(
+        down.weight, down.scales, down.biases, group_size=128, bits=4
+    ).astype(mx.float32)
+    per_ane, total_ane, gpu_start = 128, 256, 384
+    assert bool(mx.array_equal(down0, mx.contiguous(reference[:, :per_ane])))
+    assert bool(
+        mx.array_equal(down1, mx.contiguous(reference[:, per_ane:total_ane]))
+    )
+    assert bool(
+        mx.array_equal(
+            state.cpu_down_weight,
+            mx.contiguous(reference[:, total_ane:gpu_start]).astype(mx.float16),
+        )
+    )
+
+
 class _RecorderFusedBankBuilder:
     """Stands in for the native AneFusedBankBuilder."""
 
