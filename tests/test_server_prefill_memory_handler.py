@@ -189,6 +189,98 @@ class TestPostCommitPrefillMemorySurface:
         assert body["error"]["omlx_code"] == "prefill_memory_exceeded"
 
 
+class TestJsonResponseOrKeepaliveFastPath:
+    """Regression for the bug where a request aborted mid-prefill by the
+    memory guard still reported HTTP 200: ``_with_json_keepalive`` yields a
+    keepalive space (committing the ASGI response to whatever status
+    ``StreamingResponse`` was built with, always 200) before it knows the
+    wrapped task will fail. ``_json_response_or_keepalive`` races the task
+    against a short grace period so fast failures -- the common case for a
+    memory-guard rejection -- get a real status code instead.
+    """
+
+    class _Request:
+        async def is_disconnected(self):
+            return False
+
+    @pytest.mark.asyncio
+    async def test_fast_failure_returns_400_not_200(self):
+        import omlx.server as srv
+
+        async def _raise_fast():
+            raise PrefillMemoryExceededError(
+                message="Prefill context too large for available memory",
+                request_id="req-fast",
+                estimated_bytes=123,
+                limit_bytes=100,
+            )
+
+        resp = await srv._json_response_or_keepalive(self._Request(), _raise_fast())
+        assert resp.status_code == 400
+        import json
+
+        body = json.loads(resp.body)
+        assert body["error"]["code"] == "prefill_memory_exceeded"
+        assert body["error"]["estimated_bytes"] == 123
+
+    @pytest.mark.asyncio
+    async def test_fast_success_returns_200_with_body(self):
+        import omlx.server as srv
+
+        async def _succeed_fast():
+            return '{"ok": true}'
+
+        resp = await srv._json_response_or_keepalive(
+            self._Request(), _succeed_fast()
+        )
+        assert resp.status_code == 200
+        assert resp.body == b'{"ok": true}'
+
+    @pytest.mark.asyncio
+    async def test_fast_failure_releases_lease(self):
+        import omlx.server as srv
+
+        released = []
+
+        class _FakeLease:
+            async def release(self):
+                released.append(True)
+
+        async def _raise_fast():
+            raise PrefillMemoryExceededError(
+                message="Prefill context too large for available memory",
+                request_id="req-lease",
+            )
+
+        resp = await srv._json_response_or_keepalive(
+            self._Request(), _raise_fast(), lease=_FakeLease()
+        )
+        assert resp.status_code == 400
+        assert released == [True]
+
+    @pytest.mark.asyncio
+    async def test_slow_task_falls_back_to_streaming_response(self, monkeypatch):
+        import asyncio
+
+        import omlx.server as srv
+
+        monkeypatch.setattr(srv, "_JSON_KEEPALIVE_GRACE_S", 0.01)
+
+        async def _raise_slow():
+            await asyncio.sleep(0.05)
+            raise PrefillMemoryExceededError(
+                message="Prefill context too large for available memory",
+                request_id="req-slow",
+            )
+
+        resp = await srv._json_response_or_keepalive(self._Request(), _raise_slow())
+        assert isinstance(resp, srv.StreamingResponse)
+        # A task still running past the grace period necessarily commits to
+        # 200 once the stream starts -- this is the acknowledged, unfixable
+        # remainder of the bug for genuinely long-running failures.
+        assert resp.status_code == 200
+
+
 class TestResponsesEndpointReaches400:
     """End-to-end regression for ``/v1/responses``. The handler-shape tests
     above use a synthetic ``/v1/raise`` route, which proves the handler
