@@ -7819,11 +7819,16 @@
             aneTuningRecommendationText() {
                 const recommendation = this.aneTuning.status?.recommendation;
                 if (!recommendation) return '';
+                const measured = recommendation.processing_tps !== null
+                    && recommendation.processing_tps !== undefined;
                 const speed = Number(recommendation.processing_tps || 0).toFixed(1);
                 const speedup = Number(recommendation.speedup_percent || 0);
                 const speedupText = `${speedup >= 0 ? '+' : ''}${speedup.toFixed(1)}%`;
+                const speedSuffix = measured
+                    ? ` · ${speed} prompt tok/s · ${speedupText}`
+                    : '';
                 if (!recommendation.enabled) {
-                    return `GPU only · ${speed} prompt tok/s · ${speedupText}`;
+                    return `GPU only${speedSuffix}`;
                 }
                 const parts = [
                     `${recommendation.fused_down ? 'Fused MLP per ANE' : 'MLP'} ${Math.round(Number(recommendation.mlp_fraction) * 100)}%`,
@@ -7847,7 +7852,7 @@
                         `Pad tails ≥${Number(recommendation.tail_padding_min_tokens)}`
                     );
                 }
-                return `${parts.join(' · ')} · ${speed} prompt tok/s · ${speedupText}`;
+                return `${parts.join(' · ')}${speedSuffix}`;
             },
 
             aneTuningResultText(result) {
