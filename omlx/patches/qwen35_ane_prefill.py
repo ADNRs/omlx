@@ -22,6 +22,8 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.activations import swiglu
 
+from omlx.utils import hardware, proc_memory
+
 logger = logging.getLogger(__name__)
 
 _COMPILE_LOCK = threading.RLock()
@@ -56,38 +58,28 @@ _ANE_BANK_RETRY_MAX_MEMORY_FRACTION = 0.70
 _ANE_BANK_RETRY_SETTLE_SECONDS = 0.5
 
 
+def _ane_bank_memory_footprint_snapshot() -> tuple[int, int]:
+    """``(current phys_footprint, total system memory)`` in bytes for the
+    headroom gate and its skip-warning log, so "why did ANE bank compile
+    stop retrying on this box" is answerable from one log line instead of
+    just the fixed 70% threshold. Best-effort: returns ``(0, 0)`` if either
+    measurement is unavailable."""
+    try:
+        return proc_memory.get_phys_footprint(), hardware.get_total_memory_bytes()
+    except Exception:
+        return 0, 0
+
+
 def _ane_bank_memory_headroom_ok() -> bool:
     """True if phys_footprint has enough room left for another ANE procedure
     bank compile attempt. Defaults to allowing the attempt (returns True) if
-    either measurement is unavailable, so a query failure never blocks the
-    fast path -- this is a circuit breaker for a known failure mode, not a
-    new hard dependency."""
-    try:
-        from omlx.utils.hardware import get_total_memory_bytes
-        from omlx.utils.proc_memory import get_phys_footprint
-
-        total = get_total_memory_bytes()
-        if total <= 0:
-            return True
-        current = get_phys_footprint()
-        return current < total * _ANE_BANK_RETRY_MAX_MEMORY_FRACTION
-    except Exception:
+    the measurement is unavailable, so a query failure never blocks the fast
+    path -- this is a circuit breaker for a known failure mode, not a new
+    hard dependency."""
+    current, total = _ane_bank_memory_footprint_snapshot()
+    if total <= 0:
         return True
-
-
-def _ane_bank_memory_footprint_snapshot() -> tuple[int, int]:
-    """``(current phys_footprint, total system memory)`` in bytes for the
-    skip-warning log, so "why did ANE bank compile stop retrying on this
-    box" is answerable from one log line instead of just the fixed 70%
-    threshold. Best-effort: returns ``(0, 0)`` if either measurement is
-    unavailable."""
-    try:
-        from omlx.utils.hardware import get_total_memory_bytes
-        from omlx.utils.proc_memory import get_phys_footprint
-
-        return get_phys_footprint(), get_total_memory_bytes()
-    except Exception:
-        return 0, 0
+    return current < total * _ANE_BANK_RETRY_MAX_MEMORY_FRACTION
 
 
 @dataclass(frozen=True)
@@ -2081,7 +2073,7 @@ def _bank_split_ladder(
                 total / (1 << 30),
                 _ANE_BANK_RETRY_MAX_MEMORY_FRACTION * 100,
             )
-            break
+            return None
         spans = (
             [(0, len(source_bytes))]
             if cap <= 0
@@ -2204,7 +2196,7 @@ def _compile_single_banks(
                 total / (1 << 30),
                 _ANE_BANK_RETRY_MAX_MEMORY_FRACTION * 100,
             )
-            break
+            return None
         spans = (
             [(0, len(weights))] if cap <= 0 else _bank_chunk_spans(weights, cap)
         )
