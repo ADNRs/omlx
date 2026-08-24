@@ -29,7 +29,6 @@ import struct
 import threading
 import time
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -4145,11 +4144,8 @@ class PagedSSDCacheManager(CacheManager):
         if len(to_load) < 4:
             return 0
 
-        # Cap workers to limit peak memory (each load allocates ~122-275MB).
-        # 8 workers ≈ 1.4GB peak, vs 2.8GB at 16. CPD-accepted (G1/Q3).
         start = time.perf_counter()
         loaded_count = 0
-        max_workers = min(8, len(to_load))
 
         def _load_one(block_hash: bytes, metadata: PagedSSDBlockMetadata) -> bool:
             file_path = metadata.file_path
@@ -4170,14 +4166,17 @@ class PagedSSDCacheManager(CacheManager):
                 logger.warning(f"Preload failed for block {block_hash.hex()[:16]}: {e}")
                 return False
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(_load_one, bh, meta): bh for bh, meta in to_load}
-            for future in as_completed(futures):
-                try:
-                    if future.result():
-                        loaded_count += 1
-                except Exception:
-                    pass
+        # Serialized, matching load_block's discipline (see the comment at
+        # the top of this file's single-block load path, ~3773-3778): a
+        # ThreadPoolExecutor running mx.load() in worker threads previously
+        # caused deadlocks when it contested Metal GPU resources with the
+        # calling thread's own inference work (MLX #978 #1040 #1106 #1437
+        # #1558). preload_matched_blocks runs inline on that same calling
+        # thread (docs/qwen35-hardening-and-optimization.md F2), so it is
+        # exposed to exactly that contention.
+        for block_hash, metadata in to_load:
+            if _load_one(block_hash, metadata):
+                loaded_count += 1
 
         elapsed_ms = (time.perf_counter() - start) * 1000
         self._stats["preload_calls"] += 1
@@ -4187,7 +4186,7 @@ class PagedSSDCacheManager(CacheManager):
         if loaded_count > 0:
             logger.info(
                 f"Preloaded {loaded_count}/{len(to_load)} blocks into hot cache "
-                f"(workers={max_workers}, time={elapsed_ms:.1f}ms)"
+                f"(time={elapsed_ms:.1f}ms)"
             )
         return loaded_count
 

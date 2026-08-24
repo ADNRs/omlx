@@ -2511,6 +2511,51 @@ class TestPreloadMatchedBlocks:
 
         manager2.close()
 
+    def test_preload_mx_load_runs_serially_on_caller_thread(self, tmp_path, mx):
+        """F2: preload must not run mx.load() in worker threads -- a prior
+        ThreadPoolExecutor-based version caused deadlocks contesting Metal
+        GPU resources with the calling (inference) thread, the same failure
+        mode load_block's own discipline comment already documents. Every
+        mx.load() call during preload must happen on the calling thread,
+        one at a time.
+        See docs/qwen35-hardening-and-optimization.md F2."""
+        import threading
+
+        from omlx.cache import paged_ssd_cache as ssd_mod
+
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        manager2, hashes = self._save_test_blocks(manager, mx, count=4)
+
+        caller_thread = threading.current_thread()
+        seen_threads = []
+        concurrent_calls = {"active": 0, "max_active": 0}
+        original_load = ssd_mod.mx.load
+
+        def spy_load(*args, **kwargs):
+            seen_threads.append(threading.current_thread())
+            concurrent_calls["active"] += 1
+            concurrent_calls["max_active"] = max(
+                concurrent_calls["max_active"], concurrent_calls["active"]
+            )
+            try:
+                return original_load(*args, **kwargs)
+            finally:
+                concurrent_calls["active"] -= 1
+
+        with patch.object(ssd_mod.mx, "load", spy_load):
+            loaded = manager2.preload_matched_blocks(hashes)
+
+        assert loaded == 4
+        assert len(seen_threads) == 4
+        assert all(t is caller_thread for t in seen_threads)
+        assert concurrent_calls["max_active"] == 1
+
+        manager2.close()
+
     def test_load_promotion_failure_counts_and_warns(self, tmp_path, mx, caplog):
         """A failed promotion is surfaced in stats and a throttled warning."""
         manager = PagedSSDCacheManager(
