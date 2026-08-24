@@ -2118,7 +2118,13 @@ class EnginePool:
             )
             return 0
         freed = max(0, before - get_phys_footprint())
-        logger.info(
+        # The load-time admission reservation priced these I/O surfaces; drop
+        # it so later passes stop pausing for memory that no longer exists.
+        # The next load re-prices it from the rebuilt banks.
+        monitor = getattr(getattr(core, "scheduler", None), "memory_monitor", None)
+        if monitor is not None and hasattr(monitor, "clear_ane_prefill_transient"):
+            monitor.clear_ane_prefill_transient()
+        logger.warning(
             "Released ANE prefill banks on '%s' for prefill headroom "
             "(request=%s, %d modules, %d programs, freed %s); the model "
             "serves GPU-only prefill until its next load",

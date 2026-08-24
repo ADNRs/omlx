@@ -3008,6 +3008,9 @@ def enable_qwen35_ane_prefill(
         raise ValueError("ANE prefill max_layers must be positive")
     if not 0.05 <= gdn_fraction <= 0.90:
         raise ValueError("ANE GDN prefill fraction must be between 0.05 and 0.90")
+    if getattr(model, "_omlx_ane_prefill_shed", False):
+        # A fresh enable supersedes a runtime shed on this object.
+        model._omlx_ane_prefill_shed = False
     if gdn_max_layers < 0:
         raise ValueError("ANE GDN prefill max_layers must be non-negative")
     if not 0.0 <= cpu_fraction <= 0.25:
@@ -3384,6 +3387,7 @@ def qwen35_ane_prefill_status(model: Any) -> dict:
     return {
         "attempted": attempted,
         "configured": bool(mlp or gdn),
+        "shed": bool(getattr(model, "_omlx_ane_prefill_shed", False)),
         "mlp_layers": mlp,
         "gdn_layers": gdn,
         "dual_ane_layers": int(
@@ -3433,8 +3437,11 @@ def release_qwen35_ane_prefill(model: Any) -> tuple[int, int]:
             setattr(module, state_attr, None)
             modules_released += 1
     if modules_released:
-        # Zero (not delete) the status counters so /api/status keeps
-        # reporting attempted=True but configured=False — "was on, shed".
+        # Zero (not delete) the status counters and set the shed marker:
+        # attempted=True/configured=False alone is indistinguishable from a
+        # load-time compile failure, and a shed changes serving behavior
+        # until the next load.
+        model._omlx_ane_prefill_shed = True
         for counter in (
             "_omlx_ane_mlp_prefill_count",
             "_omlx_ane_gdn_prefill_count",

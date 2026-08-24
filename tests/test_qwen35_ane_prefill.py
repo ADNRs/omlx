@@ -2437,6 +2437,7 @@ def test_prefill_status_reports_configured_layers():
     assert ane_patch.qwen35_ane_prefill_status(model) == {
         "attempted": True,
         "configured": True,
+        "shed": False,
         "mlp_layers": 12,
         "gdn_layers": 4,
         "dual_ane_layers": 8,
@@ -3073,6 +3074,7 @@ def test_release_latches_modules_drops_states_and_zeroes_counters():
     status = ane_patch.qwen35_ane_prefill_status(model)
     assert status["attempted"] is True
     assert status["configured"] is False
+    assert status["shed"] is True
     assert status["resident_programs"] == 0
 
 
