@@ -4715,7 +4715,16 @@ class PagedSSDCacheManager(CacheManager):
         if self._hot_cache_budget is not None:
             self._hot_cache_budget.forget_owner(self)
         flushed = 0
-        for block_hash, entry in entries:
+        for i, (block_hash, entry) in enumerate(entries):
+            if self._writer_thread and not self._writer_thread.is_alive():
+                # A dead writer never drains the queue, so enqueued entries
+                # would stay pinned in the pending-write buffers forever.
+                # Drop the rest instead, which is the pre-flush behavior.
+                logger.warning(
+                    "Writer thread dead during hot cache clear, dropping "
+                    f"{len(entries) - i} remaining entries unflushed"
+                )
+                break
             if entry.get("dirty", True) and self._enqueue_ssd_write(
                 block_hash, entry
             ):
