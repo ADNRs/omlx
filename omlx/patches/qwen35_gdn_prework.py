@@ -214,6 +214,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         # except branch always has the pre-mutation state to restore, even
         # if the failure happens before this point is normally reached.
         conv_state = cache[0]
+        sink_len = len(gdn_sink) if gdn_sink is not None else 0
         try:
             B = 1
             mixed_qkv, z, b, a = q35._target_verify_linears(
@@ -296,6 +297,12 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             # expects the pre-call state, so restore it before falling back
             # -- otherwise it silently double-applies the conv step.
             cache[0] = conv_state
+            # A failure after the sink append (norm/out_proj) would leave
+            # the fused entry in place while orig_call appends the stock
+            # one -- two entries for one layer call shifts every later
+            # layer's rollback capture. Drop anything this call appended.
+            if gdn_sink is not None:
+                del gdn_sink[sink_len:]
             logger.warning(
                 "gdn prework fused arm failed; reverting to stock for the "
                 "rest of the process",
