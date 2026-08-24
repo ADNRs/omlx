@@ -477,6 +477,12 @@ def _settings_for_candidate(base: Any, request: ANETuningRequest, candidate: _Ca
     # engine exposes no _model and would skew every measurement (issue #2914).
     if hasattr(settings, "dflash_enabled"):
         settings.dflash_enabled = False
+    # SpecPrefill compresses the measurement prompt to a sparse subset before
+    # prefill, so delivered chunks run narrower than the compiled ANE tile
+    # width: the ANE never executes and the idle guard aborts the run. Tune
+    # against the full dense prefill the ANE path is compiled for.
+    if hasattr(settings, "specprefill_enabled"):
+        settings.specprefill_enabled = False
     return settings
 
 
