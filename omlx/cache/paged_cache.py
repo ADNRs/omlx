@@ -1203,11 +1203,18 @@ class PagedCacheManager(CacheManager):
         extra_keys: Optional[Tuple[Any, ...]] = None,
         extra_key_token_start: Optional[int] = None,
         extra_key_ranges: Optional[List[Tuple[int, Tuple[Any, ...]]]] = None,
-    ) -> Tuple[List[int], List[int]]:
+    ) -> Tuple[List[int], List[Optional[BlockHash]], List[int]]:
         """
         Find shared prefix blocks for a token sequence.
 
-        Uses get_computed_blocks for consistent chain-hash lookup.
+        Uses get_computed_blocks for consistent chain-hash lookup. Returns
+        each block's hash as observed at lookup time alongside its id, so
+        the caller can acquire it with acquire_cached_block(id, hash)
+        instead of a membership-only increment_ref -- closing the TOCTOU
+        window between this lookup (outside any lock the caller holds) and
+        the caller taking a reference, where a concurrent eviction +
+        reallocation could otherwise splice a foreign block's content into
+        the returned chain (docs/qwen35-hardening-and-optimization.md A2).
         """
         cached_blocks, num_cached_tokens = self.get_computed_blocks(
             tokens,
@@ -1217,9 +1224,10 @@ class PagedCacheManager(CacheManager):
         )
 
         shared_block_ids = [b.block_id for b in cached_blocks]
+        shared_block_hashes = [b.block_hash for b in cached_blocks]
         remaining_tokens = tokens[num_cached_tokens:]
 
-        return shared_block_ids, remaining_tokens
+        return shared_block_ids, shared_block_hashes, remaining_tokens
 
     def fork_block_table(
         self,

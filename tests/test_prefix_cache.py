@@ -194,6 +194,51 @@ class TestBlockAwarePrefixCache:
         result = prefix_cache.store_cache("req-001", [], [])
         assert result is None
 
+    def test_shared_prefix_hit_rejects_reassigned_block(self, prefix_cache):
+        """A2 regression: a block reassigned to different content between
+        find_shared_prefix's lookup and the caller acquiring it must not be
+        spliced into the returned chain. The race is injected at
+        acquire_cached_block itself -- the one point genuinely between the
+        two steps -- by mutating the block's hash there, as a concurrent
+        eviction + reallocation would, before delegating to the real
+        implementation."""
+        import mlx.core as mx
+
+        tokens = list(range(8))  # 2 full blocks at block_size=4
+        keys = mx.arange(8, dtype=mx.float32).reshape(1, 1, 8, 1)
+        values = (keys + 100).astype(mx.float32)
+        cache_data = [{"state": (keys, values), "cache_type": "KVCache",
+                       "class_name": "KVCache"}]
+
+        table = prefix_cache.store_cache("req-store", tokens, cache_data)
+        assert table is not None
+        assert len(table.block_ids) == 2
+        prefix_cache.clear_request_entry("req-store")
+
+        second_block_id = table.block_ids[1]
+        second_block = prefix_cache.paged_cache.allocated_blocks[second_block_id]
+        paged_cache = prefix_cache.paged_cache
+        real_acquire = paged_cache.acquire_cached_block
+
+        def racy_acquire(block_id, expected_hash):
+            if block_id == second_block_id:
+                # Concurrent eviction + reallocation lands here, between
+                # find_shared_prefix's lookup and this acquire.
+                second_block.block_hash = b"reassigned-to-other-content__"
+            return real_acquire(block_id, expected_hash)
+
+        paged_cache.acquire_cached_block = racy_acquire
+        try:
+            hit_table, remaining = prefix_cache.fetch_cache("req-fetch", tokens)
+        finally:
+            paged_cache.acquire_cached_block = real_acquire
+
+        # Chain stops at the first mismatch: only the still-valid first
+        # block is returned, never the reassigned second block.
+        assert hit_table is not None
+        assert hit_table.block_ids == [table.block_ids[0]]
+        assert remaining == tokens[4:]
+
     def test_exact_prefix_survives_ssd_manager_restart(self, tmp_path):
         """An exact static prefix includes its partial terminal block on SSD."""
         import mlx.core as mx
@@ -2218,7 +2263,7 @@ class TestArraysCacheLastBlockOnly:
 
         # Explicitly prove shared-hash path cannot succeed in this fixture.
         assert paged_cache._paged_ssd_cache_manager is None
-        shared_block_ids, _ = paged_cache.find_shared_prefix(tokens)
+        shared_block_ids, _, _ = paged_cache.find_shared_prefix(tokens)
         assert shared_block_ids == []
 
         expected_ids = retry_result.block_ids.copy()

@@ -615,7 +615,7 @@ class BlockAwarePrefixCache(CacheManager):
             return None, tokens
 
         # Try to find shared prefix blocks
-        shared_block_ids, remaining = self.paged_cache.find_shared_prefix(
+        shared_block_ids, shared_block_hashes, _ = self.paged_cache.find_shared_prefix(
             tokens,
             extra_keys=extra_keys,
             extra_key_token_start=extra_key_token_start,
@@ -626,26 +626,47 @@ class BlockAwarePrefixCache(CacheManager):
             # Create block table for this request with shared blocks
             block_table = self.paged_cache.create_block_table(request_id)
 
-            for block_id in shared_block_ids:
-                # Increment ref count for sharing
-                self.paged_cache.increment_ref(block_id)
-                block = self.paged_cache.allocated_blocks.get(block_id)
-                if block:
-                    block_table.block_ids.append(block_id)
-                    block_table.num_tokens += block.token_count
+            for block_id, expected_hash in zip(
+                shared_block_ids, shared_block_hashes
+            ):
+                # Acquire atomically under the paged-cache lock, re-checking
+                # the hash this block still holds -- closes the TOCTOU
+                # window between find_shared_prefix's lookup (outside any
+                # lock the caller holds) and this reference, where a
+                # concurrent eviction + reallocation could otherwise splice
+                # a foreign block's content into the returned chain
+                # (docs/qwen35-hardening-and-optimization.md A2). Stop at
+                # the first mismatch rather than skipping it: skip-and-
+                # continue would leave a hole mid-chain while still
+                # reporting the full prefix length.
+                block = self.paged_cache.acquire_cached_block(
+                    block_id, expected_hash
+                )
+                if block is None:
+                    break
+                block_table.block_ids.append(block.block_id)
+                block_table.num_tokens += block.token_count
 
-            num_prefix_tokens = len(tokens) - len(remaining)
-            self._hits += 1
-            self._tokens_saved += num_prefix_tokens
-            self._tokens_matched_total += num_prefix_tokens
-            self._tokens_requested_total += len(tokens)
+            if block_table.block_ids:
+                num_prefix_tokens = block_table.num_tokens
+                remaining = tokens[num_prefix_tokens:]
+                self._hits += 1
+                self._tokens_saved += num_prefix_tokens
+                self._tokens_matched_total += num_prefix_tokens
+                self._tokens_requested_total += len(tokens)
 
-            logger.debug(
-                f"Cache hit for {request_id}: "
-                f"{len(shared_block_ids)} blocks, {num_prefix_tokens} tokens"
-            )
+                logger.debug(
+                    f"Cache hit for {request_id}: "
+                    f"{len(block_table.block_ids)} blocks, {num_prefix_tokens} tokens"
+                )
 
-            return block_table, remaining
+                return block_table, remaining
+
+            # Every shared block was already gone or reassigned by the time
+            # we tried to acquire it -- discard the empty table and fall
+            # through to the prefix-index path below instead of returning
+            # a hollow hit.
+            self.paged_cache.delete_block_table(request_id)
 
         # Try prefix index for longer matches
         best_match = self._find_best_prefix_match(tokens, extra_keys=extra_keys)
