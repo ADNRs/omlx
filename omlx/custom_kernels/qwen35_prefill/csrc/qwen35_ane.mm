@@ -1360,6 +1360,12 @@ public:
   // The producer command buffer is released mid-dispatch once packing has
   // completed; tell the guard so it does not double-release on unwind.
   void producer_released() { producer_buffer_ = nullptr; }
+  // Transfer one ticket only after its detached evaluation thread exists.
+  // Keeping ownership per ticket lets a later thread-constructor failure
+  // cancel the tickets that have not acquired a worker yet without racing
+  // workers that are already running.
+  void transfer_ticket0() noexcept { model0_.reset(); }
+  void transfer_ticket1() noexcept { model1_.reset(); }
   void disarm() { armed_ = false; }
   ~AneDispatchGuard() {
     if (!armed_) {
@@ -2748,9 +2754,6 @@ public:
 
     auto model0 = model0_;
     auto model1 = model1_;
-    // The evaluation threads below take ownership of the tickets; the qmm
-    // get_kernel window that could orphan them is now behind us.
-    ane_guard.disarm();
     std::thread([model0, ticket0, profiling, profile_category, launch] {
       const uint64_t start = profiling ? profile_now_ns() : 0;
       model0->execute(ticket0);
@@ -2760,6 +2763,7 @@ public:
         profile_add(profile_category, kAne0EvalNs, end - start);
       }
     }).detach();
+    ane_guard.transfer_ticket0();
     std::thread([model1, ticket1, profiling, profile_category, launch] {
       const uint64_t start = profiling ? profile_now_ns() : 0;
       model1->execute(ticket1);
@@ -2769,6 +2773,8 @@ public:
         profile_add(profile_category, kAne1EvalNs, end - start);
       }
     }).detach();
+    ane_guard.transfer_ticket1();
+    ane_guard.disarm();
     try {
       if (cpu_weight) {
         const uint64_t cpu_start = profiling ? profile_now_ns() : 0;
@@ -3111,9 +3117,6 @@ public:
     [suffix_buffer retain];
     encoder.commit();
     auto model = model_;
-    // The evaluation threads below take ownership of the tickets; the
-    // get_kernel window that could orphan them is now behind us.
-    ane_guard.disarm();
     std::thread([model = std::move(model), ticket, profiling, launch] {
       const uint64_t start = profiling ? profile_now_ns() : 0;
       model->execute(ticket);
@@ -3123,6 +3126,7 @@ public:
         profile_add(profile_category, kAne0EvalNs, end - start);
       }
     }).detach();
+    ane_guard.transfer_ticket0();
     if (model1_) {
       auto model1 = model1_;
       std::thread([model1 = std::move(model1), ticket1, profiling, launch] {
@@ -3134,7 +3138,9 @@ public:
           profile_add(profile_category, kAne1EvalNs, end - start);
         }
       }).detach();
+      ane_guard.transfer_ticket1();
     }
+    ane_guard.disarm();
     try {
       if (cpu_fp16_) {
         const uint64_t cpu_start = profiling ? profile_now_ns() : 0;

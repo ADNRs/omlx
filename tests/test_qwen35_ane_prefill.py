@@ -42,6 +42,34 @@ def test_dual_ane_ticket_acquisition_rolls_back_the_first_ticket():
     assert source.count("begin_ane_ticket_pair(") == 3
 
 
+def test_ane_dispatch_guard_transfers_each_ticket_after_thread_spawn():
+    """A thread-constructor failure must leave every unowned ticket guarded."""
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "omlx/custom_kernels/qwen35_prefill/csrc/qwen35_ane.mm"
+    ).read_text(encoding="utf-8")
+    dual = source.split("class DualAneHybridPrimitive", 1)[1]
+    dual = dual.split("class AneHybridQ4SwiGLUDownPrimitive", 1)[0]
+    fused = source.split("class AneHybridQ4SwiGLUDownPrimitive", 1)[1]
+
+    assert "void transfer_ticket0() noexcept" in source
+    assert "void transfer_ticket1() noexcept" in source
+    assert dual.index("std::thread([model0") < dual.index(
+        "ane_guard.transfer_ticket0();"
+    )
+    assert dual.index("std::thread([model1") < dual.index(
+        "ane_guard.transfer_ticket1();"
+    )
+    assert fused.index("std::thread([model =") < fused.index(
+        "ane_guard.transfer_ticket0();"
+    )
+    assert fused.index("std::thread([model1 =") < fused.index(
+        "ane_guard.transfer_ticket1();"
+    )
+    assert source.count("ane_guard.transfer_ticket0();") == 2
+    assert source.count("ane_guard.transfer_ticket1();") == 2
+
+
 @pytest.fixture(autouse=True)
 def _restore_lm_gdn_backend():
     import omlx.patches.qwen35_q4_mlp as q4_patch
