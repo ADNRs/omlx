@@ -1283,10 +1283,15 @@ class TestArraysCacheLastBlockOnly:
             paged_cache_manager=paged_cache,
         )
 
-    def test_extract_block_arrays_cache_last_block_stores_full_state(
+    def test_extract_block_arrays_cache_last_block_without_snapshot_is_placeholder(
         self, prefix_cache, mx
     ):
-        """Last block should store the full ArraysCache state."""
+        """A1 fix: is_last_block alone no longer justifies storing live
+        ArraysCache state -- store_cache's last FULL block may sit behind
+        trailing tokens the live state has already ingested (skipped
+        partial block), so a missing boundary snapshot falls to the
+        placeholder even on the last block. See
+        docs/qwen35-hardening-and-optimization.md A1."""
         conv_state = mx.ones((1, 3, 64))
         ssm_state = mx.ones((1, 32, 128, 128))
         cache_data = [
@@ -1308,9 +1313,43 @@ class TestArraysCacheLastBlockOnly:
         assert result is not None
         assert len(result) == 1
         keys, values = result[0]
-        # Should be full state, not placeholder
+        assert keys.shape == (1,)
+        assert values.shape == (1,)
+
+    def test_extract_block_arrays_cache_last_block_with_snapshot_stores_it(
+        self, prefix_cache, mx
+    ):
+        """With a matching boundary snapshot, the last block stores real
+        state -- sourced from the snapshot, never from live cache_data."""
+        conv_state = mx.ones((1, 3, 64))
+        ssm_state = mx.ones((1, 32, 128, 128))
+        cache_data = [
+            {
+                "state": (conv_state, ssm_state),
+                "cache_type": "ArraysCache",
+                "class_name": "ArraysCache",
+            },
+        ]
+        snapshot_conv_state = mx.zeros((1, 3, 64))
+        snapshot_ssm_state = mx.zeros((1, 32, 128, 128))
+        snapshot_cache_data = [
+            {"state": (snapshot_conv_state, snapshot_ssm_state)},
+        ]
+
+        result = prefix_cache._extract_block_tensor_slice(
+            cache_data,
+            0,
+            4,
+            model_cache_config=None,
+            is_last_block=True,
+            snapshot_cache_data=snapshot_cache_data,
+        )
+
+        assert result is not None
+        keys, values = result[0]
         assert keys.shape == (1, 3, 64)
         assert values.shape == (1, 32, 128, 128)
+        assert bool((keys == snapshot_conv_state).all().item())
 
     def test_extract_block_arrays_cache_non_last_block_stores_placeholder(
         self, prefix_cache, mx
@@ -1396,8 +1435,9 @@ class TestArraysCacheLastBlockOnly:
         assert len(result) == 2
         # KVCache layer should be sliced
         assert result[0][0].shape[2] == 4
-        # ArraysCache layer should have full state
-        assert result[1][0].shape == (1, 3, 64)
+        # ArraysCache layer: placeholder, no snapshot provided (A1 fix --
+        # is_last_block alone is not enough, see the test above)
+        assert result[1][0].shape == (1,)
 
     def test_reconstruct_arrays_cache_partial_match_returns_none(
         self, prefix_cache, mx
@@ -1582,10 +1622,17 @@ class TestArraysCacheLastBlockOnly:
         assert stats.last_partial_tokens_skipped == 2
         assert stats.last_tokens_to_next_block == 2
 
-    def test_store_cache_arrayscache_partial_trailing_uses_last_full_block_state(
+    def test_store_cache_arrayscache_partial_trailing_stores_placeholder(
         self, mx
     ):
-        """ArraysCache with trailing partial tokens stores only full blocks safely."""
+        """A1 regression: 7 tokens / block_size=4 stores 1 full block (4
+        tokens) and skips 3 trailing partial tokens -- but the ArraysCache
+        conv/ssm state passed in is the LIVE state after all 7 tokens, not
+        just the first 4. Storing it as this block's boundary state would
+        make a later restore replay tokens 4-6 against a state that has
+        already seen them (silent GDN corruption). Without a boundary
+        snapshot, this must store a placeholder instead.
+        See docs/qwen35-hardening-and-optimization.md A1."""
         from omlx.cache.hybrid_cache import ModelCacheConfig
 
         block_size = 4
@@ -1634,6 +1681,69 @@ class TestArraysCacheLastBlockOnly:
 
         saved_data = mock_ssd.save_block.call_args.kwargs["cache_data"]
         saved_conv_state, saved_ssm_state = saved_data[0]
+        assert saved_conv_state.shape == (1,)  # placeholder, not live state
+        assert saved_ssm_state.shape == (1,)
+
+    def test_store_cache_arrayscache_exact_multiple_stores_live_state(self, mx):
+        """A1 companion case: 8 tokens / block_size=4 has NO trailing
+        partial tokens skipped -- the live ArraysCache state genuinely IS
+        this (only, last) block's boundary state, so live_state_at_true_end
+        lets it be stored directly instead of a placeholder. Distinguishes
+        this safe case from the unsafe partial-trailing case above.
+        See docs/qwen35-hardening-and-optimization.md A1."""
+        from omlx.cache.hybrid_cache import ModelCacheConfig
+
+        block_size = 4
+        paged_cache = PagedCacheManager(
+            block_size=block_size,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        mock_ssd = MagicMock()
+        mock_ssd.save_block.return_value = True
+
+        model = MockModel(num_layers=1)
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        # 8 tokens = 2 full blocks (4+4), no trailing partial.
+        tokens = list(range(8))
+        conv_state = mx.ones((1, 3, 64))
+        ssm_state = mx.ones((1, 32, 128, 128))
+        cache_data = [
+            {
+                "state": (conv_state, ssm_state),
+                "cache_type": "ArraysCache",
+                "class_name": "ArraysCache",
+            }
+        ]
+        model_cache_config = ModelCacheConfig.from_type_list(
+            ["ArraysCache"], model_name="test-model"
+        )
+
+        result = cache.store_cache(
+            "req-002",
+            tokens,
+            cache_data,
+            model_cache_config=model_cache_config,
+        )
+
+        assert result is not None
+        assert len(result.block_ids) == 2
+        assert result.num_tokens == 8
+        assert mock_ssd.save_block.call_count == 2
+
+        # Block 0 (non-last): placeholder regardless.
+        block0_data = mock_ssd.save_block.call_args_list[0].kwargs["cache_data"]
+        assert block0_data[0][0].shape == (1,)
+
+        # Block 1 (last, no trailing partial skipped): live state stored.
+        block1_data = mock_ssd.save_block.call_args_list[1].kwargs["cache_data"]
+        saved_conv_state, saved_ssm_state = block1_data[0]
         assert saved_conv_state.shape == conv_state.shape
         assert saved_ssm_state.shape == ssm_state.shape
 
