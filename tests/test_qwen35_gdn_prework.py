@@ -60,8 +60,8 @@ def test_fused_prework_bit_exact(seq):
 class _FakeCache:
     """Minimal cache[0]/cache[1]/advance duck-type for patched_call."""
 
-    def __init__(self, conv_state):
-        self._store = {0: conv_state, 1: None}
+    def __init__(self, conv_state, recurrent_state=None):
+        self._store = {0: conv_state, 1: recurrent_state}
         self.lengths = None
         self.advance_calls = 0
 
@@ -136,7 +136,7 @@ def test_patched_call_restores_conv_state_and_skips_advance_on_failure(monkeypat
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-def test_patched_call_discards_own_sink_entry_on_late_failure(monkeypatch):
+def test_patched_call_restores_state_and_discards_sink_on_late_failure(monkeypatch):
     """A failure AFTER the fused arm has appended its gdn_sink entry (e.g.
     in norm/out_proj) falls back to orig_call, and the stock path appends
     its own sink entry for the same layer call. The fused entry must be
@@ -147,11 +147,15 @@ def test_patched_call_discards_own_sink_entry_on_late_failure(monkeypatch):
 
     original_conv_state = mx.full((1, 3, 4), 1.0, dtype=mx.bfloat16)
     new_conv_state = mx.full((1, 3, 4), 2.0, dtype=mx.bfloat16)
+    original_recurrent_state = mx.full((1, 1), 3.0, dtype=mx.float32)
+    new_recurrent_state = mx.full((1, 1), 4.0, dtype=mx.float32)
+    stock_recurrent_states = []
 
     def fake_orig_call(self, inputs, mask=None, cache=None, gdn_sink=None,
                         target_verify=False):
         # Mirror the stock path: it appends its own rollback entry when a
         # sink is present.
+        stock_recurrent_states.append(cache[1])
         gdn_sink.append("stock-entry")
         return "stock-result"
 
@@ -162,7 +166,7 @@ def test_patched_call_discards_own_sink_entry_on_late_failure(monkeypatch):
 
     def fake_delta_update(*args, **kwargs):
         out = mx.zeros((1, 4, HV, DV), dtype=mx.bfloat16)
-        return out, mx.zeros((1, 1)), None
+        return out, new_recurrent_state, None
 
     def _raise(*args, **kwargs):
         raise RuntimeError("boom in out_proj")
@@ -187,7 +191,7 @@ def test_patched_call_discards_own_sink_entry_on_late_failure(monkeypatch):
         A_log=None, dt_bias=None, training=False, conv_kernel_size=4,
         norm=lambda out, z: out, out_proj=None,
     )
-    cache = _FakeCache(original_conv_state)
+    cache = _FakeCache(original_conv_state, original_recurrent_state)
     inputs = mx.zeros((1, 4, 1), dtype=mx.bfloat16)
     sink = []
 
@@ -199,3 +203,7 @@ def test_patched_call_discards_own_sink_entry_on_late_failure(monkeypatch):
         f"sink must hold exactly the stock entry, got {len(sink)} entries: "
         "the fused arm's entry was not discarded on fallback"
     )
+    assert len(stock_recurrent_states) == 1
+    assert bool(
+        (stock_recurrent_states[0] == original_recurrent_state).all().item()
+    ), "stock fallback must see the pre-call recurrent state"

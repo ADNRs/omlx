@@ -214,6 +214,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         # except branch always has the pre-mutation state to restore, even
         # if the failure happens before this point is normally reached.
         conv_state = cache[0]
+        recurrent_state = cache[1]
         sink_len = len(gdn_sink) if gdn_sink is not None else 0
         try:
             B = 1
@@ -246,7 +247,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             )
             cache[0] = new_conv_state
 
-            state = cache[1]
+            state = recurrent_state
             if state is not None and state.shape[0] != B:
                 state = None
             initial_state = state
@@ -297,6 +298,11 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             # expects the pre-call state, so restore it before falling back
             # -- otherwise it silently double-applies the conv step.
             cache[0] = conv_state
+            # A late failure can also happen after the recurrent delta state
+            # has been committed to cache[1]. The stock fallback consumes the
+            # same tokens again, so it must start from the original recurrent
+            # state as well or silently double-apply the delta update.
+            cache[1] = recurrent_state
             # A failure after the sink append (norm/out_proj) would leave
             # the fused entry in place while orig_call appends the stock
             # one -- two entries for one layer call shifts every later
