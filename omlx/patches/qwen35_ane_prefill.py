@@ -1210,6 +1210,62 @@ def _compile_gdn(gdn: Any, config: _AneGDNConfig) -> _CombinedGDNState | None:
         return state
 
 
+def _min_viable_gdn_fraction(gdn: Any, alignment: int) -> float | None:
+    """Smallest gdn_fraction whose aligned slice engages the ANE on ``gdn``.
+
+    Mirrors the rule in ``_prepare_gdn_for_bank`` below: the aligned slice
+    ``(int(total * f) // alignment) * alignment`` has to cover the z
+    projection, otherwise every GDN layer is rejected and no GDN procedure
+    compiles at all (issue #2899). ``None`` when z alone exceeds the whole
+    projection, i.e. no fraction can work.
+    """
+    qkv, z, _, _ = _gdn_linears(gdn)
+    if qkv is None or z is None:
+        return None
+    z_outputs = int(z.weight.shape[0])
+    total_outputs = z_outputs + int(qkv.weight.shape[0])
+    if total_outputs <= 0:
+        return None
+    ane_min = ((z_outputs + alignment - 1) // alignment) * alignment
+    if ane_min > total_outputs:
+        return None
+    fraction = ane_min / total_outputs
+    if (int(total_outputs * fraction) // alignment) * alignment < ane_min:
+        fraction = (ane_min + 1) / total_outputs
+    return fraction
+
+
+def _warn_gdn_below_floor(
+    model: Any, requested: bool, gdn_count: int, gdn_fraction: float, dual_ane: bool
+) -> None:
+    """Name the floor when a too-small fraction compiled no GDN procedure.
+
+    Without this the only symptom of a below-floor fraction is gdn_layers=0
+    in the status payload, which reads the same as a compile failure.
+    """
+    if not requested or gdn_count:
+        return
+    gdn = next(
+        (
+            module
+            for module in (model.modules() if hasattr(model, "modules") else ())
+            if _eligible_gdn(module)
+        ),
+        None,
+    )
+    if gdn is None:
+        return
+    floor = _min_viable_gdn_fraction(gdn, 128 if dual_ane else 64)
+    if floor is None or gdn_fraction >= floor:
+        return
+    logger.warning(
+        "ANE GDN prefill fraction %.3f is below this model's %.3f floor, so "
+        "no GDN procedure could be compiled and GDN prefill stays on GPU",
+        gdn_fraction,
+        floor,
+    )
+
+
 def _prepare_gdn_for_bank(
     gdn: Any, config: _AneGDNConfig
 ) -> tuple[_CombinedGDNState, mx.array, mx.array | None] | None:
@@ -3155,6 +3211,13 @@ def enable_qwen35_ane_prefill(
             model._omlx_ane_dual_prefill_count = count
             model._omlx_ane_resident_program_count = resident_programs
             model._omlx_ane_procedure_count = count + gdn_count
+            _warn_gdn_below_floor(
+                model,
+                bool(gdn and gdn_max_layers),
+                gdn_count,
+                gdn_fraction,
+                dual_ane,
+            )
             logger.info(
                 "Eagerly compiled %d fused MLP/down and %d GDN procedures "
                 "into %d "
@@ -3215,6 +3278,9 @@ def enable_qwen35_ane_prefill(
         model._omlx_ane_resident_program_count = resident_programs
         down_count = int(getattr(model, "_omlx_ane_down_prefill_count", 0))
         model._omlx_ane_procedure_count = count + gdn_count + down_count
+        _warn_gdn_below_floor(
+            model, bool(gdn and gdn_max_layers), gdn_count, gdn_fraction, dual_ane
+        )
         if count or gdn_count:
             logger.info(
                 "Eagerly compiled %d MLP and %d GDN procedures into %d "
@@ -3302,6 +3368,9 @@ def enable_qwen35_ane_prefill(
     model._omlx_ane_down_prefill_count = 0
     model._omlx_ane_resident_program_count = resident_programs
     model._omlx_ane_procedure_count = count + gdn_count
+    _warn_gdn_below_floor(
+        model, bool(gdn and gdn_max_layers), gdn_count, gdn_fraction, dual_ane
+    )
 
     if count:
         logger.info(

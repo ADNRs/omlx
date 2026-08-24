@@ -713,22 +713,10 @@ def _balanced_fractions(
 def _min_viable_gdn_fraction(patch: Any, gdn: Any, alignment: int) -> float | None:
     """Smallest gdn_fraction that engages the ANE on ``gdn``.
 
-    Mirrors the bank rule: the aligned slice ``(int(total * f) // alignment)
-    * alignment`` must cover the z projection, otherwise every GDN layer is
-    rejected and 0 procedures compile, silently (issue #2899).
+    Delegates to the patch module, which owns the bank rule this mirrors, so
+    the tuner's floor and the one the enable path warns about cannot drift.
     """
-    qkv, z, _, _ = patch._gdn_linears(gdn)
-    z_outputs = int(z.weight.shape[0])
-    total = z_outputs + int(qkv.weight.shape[0])
-    if total <= 0:
-        return None
-    ane_min = ((z_outputs + alignment - 1) // alignment) * alignment
-    if ane_min > total:
-        return None
-    fraction = ane_min / total
-    if (int(total * fraction) // alignment) * alignment < ane_min:
-        fraction = (ane_min + 1) / total
-    return fraction
+    return patch._min_viable_gdn_fraction(gdn, alignment)
 
 
 def _profile_refinement(
