@@ -162,8 +162,10 @@ std::string error_text(NSString *prefix, NSError *error);
 constexpr std::chrono::milliseconds kAneCacheLockTimeout{30000};
 constexpr std::chrono::milliseconds kAneCacheLockRetry{50};
 
-// One rendezvous file per cache entry, beside the entry directory. Shared by
-// the lock and its cleanup so the two can never disagree on the path.
+// One stable rendezvous file per cache entry, beside the entry directory.
+// Never unlink this path while the process is running: a waiter may already
+// hold the old inode open, and recreating the path would let a later process
+// lock a different inode and enter the same staging directory concurrently.
 NSString *ane_compile_cache_lock_path(NSString *entry_directory) {
   return [entry_directory stringByAppendingString:@".lock"];
 }
@@ -259,12 +261,6 @@ void remove_ane_staging_directory(NSString *directory) noexcept {
     // Compile/load and cleanup mutate the same shared staging path.
     ScopedAneCacheLock cache_lock(directory);
     [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
-    // The entry is gone, so its rendezvous file has nothing left to guard;
-    // dropping it here keeps one 0-byte file per compiled procedure from
-    // accumulating forever. Safe under the lock: this process has no
-    // remaining work to serialize, and a later compile of the same
-    // identifier recreates both the lock file and the entry.
-    unlink(ane_compile_cache_lock_path(directory).fileSystemRepresentation);
   } catch (const std::exception &failure) {
     // Cleanup must not make model teardown fail. Leaving staging behind is
     // safer than deleting another process's in-progress compile inputs.

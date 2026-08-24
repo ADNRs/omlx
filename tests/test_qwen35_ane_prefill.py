@@ -3074,15 +3074,16 @@ def test_compile_cache_cleanup_refuses_paths_resolving_outside_root(ane_mm):
     assert "stringByResolvingSymlinksInPath" in body.group()
 
 
-def test_compile_cache_cleanup_drops_the_entry_lock_file(ane_mm):
-    """The 0-byte rendezvous file goes with its entry, under the same lock,
-    and both sides derive the path from one helper."""
+def test_compile_cache_cleanup_keeps_the_entry_lock_file_stable(ane_mm):
+    """Never unlink a lock path while waiters may hold its old inode open.
+
+    Recreating the pathname would establish a second lock domain and allow
+    two processes to mutate the same staging directory concurrently.
+    """
     assert "NSString *ane_compile_cache_lock_path(NSString *entry_directory)" in ane_mm
-    assert ane_mm.count("ane_compile_cache_lock_path(") == 3
-    assert (
-        "unlink(ane_compile_cache_lock_path(directory).fileSystemRepresentation);"
-        in ane_mm
-    )
+    assert ane_mm.count("ane_compile_cache_lock_path(") == 2
+    assert "unlink(ane_compile_cache_lock_path" not in ane_mm
+    assert "Never unlink this path" in ane_mm
 
 
 def test_compile_cache_keeps_historical_delete_on_unload(ane_mm):
