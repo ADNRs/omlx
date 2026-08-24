@@ -1178,6 +1178,27 @@ class BlockAwarePrefixCache(CacheManager):
                     live_state_at_true_end=live_state_at_true_end,
                 )
 
+                if block_kv_data and not self._block_token_count_matches_slices(
+                    block_kv_data, block.token_count
+                ):
+                    # A3: a sliceable layer's own tensor length disagrees
+                    # with what this block claims to hold -- persisting it
+                    # would silently corrupt a later restore. Stop here,
+                    # keeping the already-stored valid prefix, the same
+                    # discipline the continuity-break path above uses.
+                    logger.warning(
+                        "Rejecting block for %s: token_count=%d does not "
+                        "match stored tensor length (global [%d:%d])",
+                        request_id,
+                        block.token_count,
+                        global_start,
+                        global_end,
+                    )
+                    self.paged_cache.free_block(block.block_id)
+                    block_table.block_ids.pop()
+                    block_table.num_tokens -= len(block_tokens)
+                    break
+
                 if block_kv_data and block.block_hash:
                     # Use per-block meta_states from boundary snapshot when
                     # available. The shared layer_meta_states comes from the
@@ -1555,6 +1576,33 @@ class BlockAwarePrefixCache(CacheManager):
             return restored_cache
         finally:
             self.release_cache(request_id)
+
+    @staticmethod
+    def _block_token_count_matches_slices(
+        block_kv_data: list[tuple[Any, Any]] | None, expected_token_count: int
+    ) -> bool:
+        """Reject a block whose stated token_count disagrees with what its
+        own sliceable tensors actually hold (A3: a bug anywhere upstream of
+        this point could otherwise silently persist a mismatched block,
+        with no error until some later restore replays the wrong number of
+        tokens against it). Only sliceable (keys, values) 4D tensor entries
+        carry a real per-block sequence length to check against; markers
+        (__cache_list__, __nstate__) and placeholders ((1,)-shaped) don't,
+        so their presence alone is not a mismatch -- this only rejects when
+        a sliceable entry's own length actively disagrees.
+        """
+        if not block_kv_data:
+            return True
+        for entry in block_kv_data:
+            if (
+                isinstance(entry, tuple)
+                and len(entry) == 2
+                and hasattr(entry[0], "shape")
+                and len(entry[0].shape) == 4
+            ):
+                if entry[0].shape[2] != expected_token_count:
+                    return False
+        return True
 
     def _get_cache_seq_len(self, cache_data: list[dict[str, Any]]) -> int:
         """

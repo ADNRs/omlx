@@ -10,7 +10,7 @@ import sys
 import time
 import types
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -2130,6 +2130,79 @@ class TestArraysCacheLastBlockOnly:
         assert fetched_partial.block_ids == expected_partial_ids
         assert fetched_partial.num_tokens == 8
         assert remaining_partial == tokens[8:12]
+
+    def test_store_cache_rejects_block_whose_slice_length_disagrees_with_token_count(
+        self, mx
+    ):
+        """A3: a bug anywhere upstream of _extract_block_tensor_slice (wrong
+        start/end indices, a stale cache_data snapshot, etc.) could silently
+        produce a sliced tensor whose sequence length doesn't match the
+        block's own token_count -- persisting that would corrupt a later
+        restore with no error until it's replayed. Simulate such a bug by
+        monkeypatching _extract_block_tensor_slice to return a 3-token
+        slice for what store_cache believes is a 4-token block, and confirm
+        the block is rejected (not persisted) while the valid prefix before
+        it survives -- the same discipline test_store_cache_keeps_valid_
+        prefix_when_later_ssd_save_fails already establishes for SSD
+        write failures.
+        See docs/qwen35-hardening-and-optimization.md A3."""
+        block_size = 4
+        paged_cache = PagedCacheManager(
+            block_size=block_size,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        mock_ssd = MagicMock()
+        mock_ssd.save_block.return_value = True
+
+        model = MockModel(num_layers=1)
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        tokens = list(range(8))  # 2 full blocks
+        keys = mx.arange(8, dtype=mx.float32).reshape(1, 1, 8, 1)
+        values = (keys + 100).astype(mx.float32)
+        cache_data = [
+            {"state": (keys, values), "cache_type": "KVCache", "class_name": "KVCache"}
+        ]
+
+        original_extract = cache._extract_block_tensor_slice
+        call_index = {"n": 0}
+
+        def buggy_extract(*args, **kwargs):
+            call_index["n"] += 1
+            result = original_extract(*args, **kwargs)
+            if call_index["n"] == 2:
+                # Simulate an upstream indexing bug on the second block:
+                # truncate to 3 tokens instead of the real 4.
+                bad_keys, bad_values = result[0]
+                result = [(bad_keys[:, :, :3, :], bad_values[:, :, :3, :])]
+            return result
+
+        with patch.object(cache, "_extract_block_tensor_slice", buggy_extract):
+            result = cache.store_cache("req-mismatch", tokens, cache_data)
+
+        assert result is not None
+        # Only the first (correct) block is kept; the mismatched second
+        # block is rejected, not persisted.
+        assert len(result.block_ids) == 1
+        assert result.num_tokens == 4
+        assert mock_ssd.save_block.call_count == 1
+        saved_keys, saved_values = mock_ssd.save_block.call_args.kwargs["cache_data"][0]
+        assert saved_keys.tolist() == keys[:, :, 0:4, :].tolist()
+        assert saved_values.tolist() == values[:, :, 0:4, :].tolist()
+
+        # The rejected block must not linger as an allocated/hashed block.
+        allocated_non_null_ids = {
+            block.block_id
+            for block in paged_cache.allocated_blocks.values()
+            if not block.is_null
+        }
+        assert allocated_non_null_ids == set(result.block_ids)
 
     def test_store_cache_retry_after_partial_failure_saves_only_missing_tail(self, mx):
         """Retry should preserve valid prefix and only save the missing tail block."""
