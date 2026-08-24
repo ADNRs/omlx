@@ -110,6 +110,12 @@ def serve_command(args):
     # Initialize global settings first (to get log_level from file if not specified)
     settings = init_settings(base_path=args.base_path, cli_args=args)
 
+    # The native ANE compile-cache gate reads this env var once, at the first
+    # compile, so it must be exported before any engine loads. setdefault
+    # keeps an explicit env override authoritative.
+    if settings.cache.ane_compile_cache:
+        os.environ.setdefault("OMLX_QWEN35_ANE_COMPILE_CACHE", "1")
+
     # Register TRACE level (5) — includes full message content
     TRACE = 5
     logging.addLevelName(TRACE, "TRACE")

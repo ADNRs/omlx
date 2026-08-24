@@ -3171,3 +3171,37 @@ def test_release_is_idempotent_and_noop_without_slices():
     model.mlp._omlx_ane_prefill_state = NS(model=_NativeHandle())
     ane_patch.release_qwen35_ane_prefill(model)
     assert ane_patch.release_qwen35_ane_prefill(model) == (0, 0)
+
+
+# --- dashboard toggle for the compile cache ---
+
+
+def test_compile_cache_setting_round_trips_and_defaults_off():
+    """The advanced-settings toggle must persist in settings.json and stay
+    off for installs that predate it."""
+    from omlx.settings import CacheSettings
+
+    cache = CacheSettings(ane_compile_cache=True)
+    assert CacheSettings.from_dict(cache.to_dict()).ane_compile_cache is True
+
+    assert CacheSettings.from_dict({}).ane_compile_cache is False
+    assert CacheSettings().ane_compile_cache is False
+
+
+def test_compile_cache_setting_exports_the_native_env_gate(monkeypatch):
+    """serve exports the env var the native gate reads once at the first
+    compile; an explicit env override wins."""
+    import os
+
+    source = (
+        Path(__file__).resolve().parents[1] / "omlx/cli.py"
+    ).read_text(encoding="utf-8")
+    assert 'os.environ.setdefault("OMLX_QWEN35_ANE_COMPILE_CACHE", "1")' in source
+
+    monkeypatch.delenv("OMLX_QWEN35_ANE_COMPILE_CACHE", raising=False)
+    os.environ.setdefault("OMLX_QWEN35_ANE_COMPILE_CACHE", "1")
+    assert os.environ["OMLX_QWEN35_ANE_COMPILE_CACHE"] == "1"
+
+    monkeypatch.setenv("OMLX_QWEN35_ANE_COMPILE_CACHE", "0")
+    os.environ.setdefault("OMLX_QWEN35_ANE_COMPILE_CACHE", "1")
+    assert os.environ["OMLX_QWEN35_ANE_COMPILE_CACHE"] == "0"

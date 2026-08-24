@@ -327,6 +327,10 @@ class CacheSettings:
     # RAM AND persisted to SSD immediately — RAM-speed resume for recent
     # sessions without losing SSD durability for old ones.
     hot_cache_write_through: bool = False
+    # Reuse Apple's AOT-compiled ANE programs across server restarts
+    # (OMLX_QWEN35_ANE_COMPILE_CACHE=1). The native gate reads the env var
+    # once, at the first ANE compile, so a change applies on restart.
+    ane_compile_cache: bool = False
     initial_cache_blocks: int = 256  # Starting blocks (grows dynamically)
     # None selects the policy automatically: use an SSD sidecar when the SSD
     # cache is enabled, otherwise keep GDN state embedded with the main cache.
@@ -423,6 +427,7 @@ class CacheSettings:
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
             "hot_cache_write_through": self.hot_cache_write_through,
+            "ane_compile_cache": self.ane_compile_cache,
             "initial_cache_blocks": self.initial_cache_blocks,
         }
 
@@ -472,6 +477,7 @@ class CacheSettings:
             hot_cache_write_through=bool(
                 data.get("hot_cache_write_through", False)
             ),
+            ane_compile_cache=bool(data.get("ane_compile_cache", False)),
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
         )
 
