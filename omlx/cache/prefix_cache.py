@@ -1185,7 +1185,7 @@ class BlockAwarePrefixCache(CacheManager):
                 )
 
                 if block_kv_data and not self._block_token_count_matches_slices(
-                    block_kv_data, block.token_count
+                    block_kv_data, block.token_count, layer_cache_types
                 ):
                     # A3: a sliceable layer's own tensor length disagrees
                     # with what this block claims to hold -- persisting it
@@ -1585,21 +1585,39 @@ class BlockAwarePrefixCache(CacheManager):
 
     @staticmethod
     def _block_token_count_matches_slices(
-        block_kv_data: list[tuple[Any, Any]] | None, expected_token_count: int
+        block_kv_data: list[tuple[Any, Any]] | None,
+        expected_token_count: int,
+        layer_cache_types: list[str] | None = None,
     ) -> bool:
         """Reject a block whose stated token_count disagrees with what its
         own sliceable tensors actually hold (A3: a bug anywhere upstream of
         this point could otherwise silently persist a mismatched block,
         with no error until some later restore replays the wrong number of
-        tokens against it). Only sliceable (keys, values) 4D tensor entries
-        carry a real per-block sequence length to check against; markers
-        (__cache_list__, __nstate__) and placeholders ((1,)-shaped) don't,
-        so their presence alone is not a mismatch -- this only rejects when
-        a sliceable entry's own length actively disagrees.
+        tokens against it). Only block-sliced (keys, values) 4D tensor
+        entries carry a real per-block sequence length to check against;
+        markers (__cache_list__, __nstate__) and placeholders ((1,)-shaped)
+        don't. Non-sliceable layers (RotatingKVCache, ArraysCache) store
+        full window/recurrent state whose length is legitimately unrelated
+        to token_count -- the aligned block size is a MULTIPLE of the
+        rotating window, not the window itself -- so when layer types are
+        known, only layers whose handler supports block slicing are
+        checked. When entry count and layer types disagree (an abnormal
+        extraction already dropped entries), attribution is ambiguous and
+        the check is skipped rather than risking a false reject.
         """
         if not block_kv_data:
             return True
-        for entry in block_kv_data:
+        if layer_cache_types is not None and len(layer_cache_types) != len(
+            block_kv_data
+        ):
+            return True
+        for layer_idx, entry in enumerate(block_kv_data):
+            if layer_cache_types is not None:
+                handler = CacheTypeRegistry.get_handler_by_class_name(
+                    layer_cache_types[layer_idx]
+                )
+                if not handler.supports_block_slicing:
+                    continue
             if (
                 isinstance(entry, tuple)
                 and len(entry) == 2

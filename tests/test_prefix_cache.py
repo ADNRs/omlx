@@ -2257,6 +2257,67 @@ class TestArraysCacheLastBlockOnly:
         }
         assert allocated_non_null_ids == set(result.block_ids)
 
+    def test_store_cache_rotating_window_state_passes_token_count_check(self, mx):
+        """The A3 length check must not reject non-sliceable layers whose
+        real state length is legitimately unrelated to token_count: the
+        aligned block size is a MULTIPLE of the rotating window (e.g.
+        window 128 -> block 512), so a rotating layer's last-block window
+        state is shorter than the block's token span by design."""
+        from omlx.cache.hybrid_cache import ModelCacheConfig
+
+        block_size = 4
+        paged_cache = PagedCacheManager(
+            block_size=block_size,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        mock_ssd = MagicMock()
+        mock_ssd.save_block.return_value = True
+
+        model = MockModel(num_layers=1)
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        # 8 tokens = 2 full blocks, no trailing partial (live state at true
+        # end). Window 2, block 4 = 2x window, as production alignment
+        # produces.
+        tokens = list(range(8))
+        window = 2
+        rot_keys = mx.ones((1, 8, window, 64))
+        rot_values = mx.ones((1, 8, window, 64))
+        cache_data = [
+            {
+                "state": (rot_keys, rot_values),
+                "cache_type": "RotatingKVCache",
+                "class_name": "RotatingKVCache",
+                "meta_state": (0, window, 8, 0),
+            }
+        ]
+        model_cache_config = ModelCacheConfig.from_type_list(
+            ["RotatingKVCache"], model_name="test-model"
+        )
+
+        result = cache.store_cache(
+            "req-rot",
+            tokens,
+            cache_data,
+            model_cache_config=model_cache_config,
+        )
+
+        assert result is not None
+        # Both blocks survive: block 0 = placeholder, block 1 (last) = the
+        # real rotating window state, its window-length shape intact.
+        assert len(result.block_ids) == 2
+        assert result.num_tokens == 8
+        assert mock_ssd.save_block.call_count == 2
+        block1_data = mock_ssd.save_block.call_args_list[1].kwargs["cache_data"]
+        saved_keys, _saved_values = block1_data[0]
+        assert saved_keys.shape == (1, 8, window, 64)
+
     def test_store_cache_retry_after_partial_failure_saves_only_missing_tail(self, mx):
         """Retry should preserve valid prefix and only save the missing tail block."""
         block_size = 4
