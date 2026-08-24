@@ -2427,7 +2427,23 @@ async def _json_response_or_keepalive(
     HTTP/ASGI constraint, not a choice.
     """
     task = asyncio.ensure_future(coro)
-    done, _pending = await asyncio.wait({task}, timeout=_JSON_KEEPALIVE_GRACE_S)
+    try:
+        done, _pending = await asyncio.wait(
+            {task}, timeout=_JSON_KEEPALIVE_GRACE_S
+        )
+    except BaseException:
+        # The handler can unwind during the grace period (server shutdown,
+        # middleware cancellation, or another request-level abort). The task
+        # was scheduled independently by ensure_future(), so cancellation does
+        # not propagate into it automatically. Drain it before releasing the
+        # lease; otherwise inference can continue after ModelRegistry considers
+        # the engine idle and eligible for unload.
+        task.cancel()
+        with suppress(BaseException):
+            await task
+        if lease is not None:
+            await lease.release()
+        raise
     if done:
         if lease is not None:
             await lease.release()

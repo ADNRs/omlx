@@ -259,6 +259,45 @@ class TestJsonResponseOrKeepaliveFastPath:
         assert released == [True]
 
     @pytest.mark.asyncio
+    async def test_grace_period_cancellation_drains_task_before_releasing_lease(
+        self, monkeypatch
+    ):
+        import asyncio
+
+        import omlx.server as srv
+
+        monkeypatch.setattr(srv, "_JSON_KEEPALIVE_GRACE_S", 10.0)
+        started = asyncio.Event()
+        child_cancelled = asyncio.Event()
+        released = []
+
+        class _FakeLease:
+            async def release(self):
+                released.append(True)
+
+        async def _wait_forever():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                child_cancelled.set()
+                raise
+
+        response_task = asyncio.create_task(
+            srv._json_response_or_keepalive(
+                self._Request(), _wait_forever(), lease=_FakeLease()
+            )
+        )
+        await started.wait()
+        response_task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await response_task
+
+        assert child_cancelled.is_set()
+        assert released == [True]
+
+    @pytest.mark.asyncio
     async def test_slow_task_falls_back_to_streaming_response(self, monkeypatch):
         import asyncio
 
