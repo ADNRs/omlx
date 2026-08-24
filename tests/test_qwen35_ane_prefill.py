@@ -3061,6 +3061,30 @@ def test_compile_cache_covers_all_four_native_compile_sites(ane_mm):
     assert ane_mm.count("@selector(compileWithQoS:options:error:)") == 1
 
 
+def test_compile_cache_cleanup_refuses_paths_resolving_outside_root(ane_mm):
+    """A cache-rooted path that resolves elsewhere must be left alone, while
+    the historical temp path still deletes directly."""
+    body = re.search(
+        r"void remove_ane_staging_directory\(NSString \*directory\) noexcept \{.*?\n\}",
+        ane_mm,
+        re.S,
+    )
+    assert body, "remove_ane_staging_directory() is absent from qwen35_ane.mm"
+    assert "ANE compile cache cleanup skipped" in body.group()
+    assert "stringByResolvingSymlinksInPath" in body.group()
+
+
+def test_compile_cache_cleanup_drops_the_entry_lock_file(ane_mm):
+    """The 0-byte rendezvous file goes with its entry, under the same lock,
+    and both sides derive the path from one helper."""
+    assert "NSString *ane_compile_cache_lock_path(NSString *entry_directory)" in ane_mm
+    assert ane_mm.count("ane_compile_cache_lock_path(") == 3
+    assert (
+        "unlink(ane_compile_cache_lock_path(directory).fileSystemRepresentation);"
+        in ane_mm
+    )
+
+
 def test_compile_cache_keeps_historical_delete_on_unload(ane_mm):
     """Apple owns the compiled AOT cache; oMLX staging files remain temporary."""
     assert "persistent_" not in ane_mm

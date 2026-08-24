@@ -162,6 +162,12 @@ std::string error_text(NSString *prefix, NSError *error);
 constexpr std::chrono::milliseconds kAneCacheLockTimeout{30000};
 constexpr std::chrono::milliseconds kAneCacheLockRetry{50};
 
+// One rendezvous file per cache entry, beside the entry directory. Shared by
+// the lock and its cleanup so the two can never disagree on the path.
+NSString *ane_compile_cache_lock_path(NSString *entry_directory) {
+  return [entry_directory stringByAppendingString:@".lock"];
+}
+
 class ScopedAneCacheLock {
 public:
   explicit ScopedAneCacheLock(NSString *entry_directory) {
@@ -175,7 +181,7 @@ public:
       throw std::runtime_error(
           error_text(@"ANE compile cache parent creation failed", error));
     }
-    NSString *lock_path = [entry_directory stringByAppendingString:@".lock"];
+    NSString *lock_path = ane_compile_cache_lock_path(entry_directory);
     fd_ = open(lock_path.fileSystemRepresentation, O_CREAT | O_RDWR, 0600);
     if (fd_ < 0) {
       throw std::runtime_error("ANE compile cache lock open failed.");
@@ -226,13 +232,26 @@ void remove_ane_staging_directory(NSString *directory) noexcept {
   // Resolve before the prefix check: a symlink under the cache root could
   // otherwise redirect the delete outside it while the textual prefix still
   // matched. The resolved path is what removeItemAtPath: will actually touch.
+  NSString *root = ane_compile_cache_root_directory();
   NSString *resolved =
       [directory stringByResolvingSymlinksInPath];
-  NSString *cache_root =
-      [ane_compile_cache_root_directory() stringByResolvingSymlinksInPath];
+  NSString *cache_root = [root stringByResolvingSymlinksInPath];
   NSString *cache_prefix = [cache_root stringByAppendingString:@"/"];
-  if (!ane_compile_cache_enabled() ||
-      ![resolved hasPrefix:cache_prefix]) {
+  if (![resolved hasPrefix:cache_prefix]) {
+    if ([directory hasPrefix:[root stringByAppendingString:@"/"]]) {
+      // A path that sits under the cache root but resolves outside it is not
+      // ours to delete: following it would take the delete somewhere this
+      // process never staged anything. The temp-directory path below is a
+      // different case, it never claimed to be a cache entry.
+      NSLog(@"oMLX: ANE compile cache cleanup skipped, %@ resolves outside "
+            @"the cache root",
+            directory);
+      return;
+    }
+    [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
+    return;
+  }
+  if (!ane_compile_cache_enabled()) {
     [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
     return;
   }
@@ -240,6 +259,12 @@ void remove_ane_staging_directory(NSString *directory) noexcept {
     // Compile/load and cleanup mutate the same shared staging path.
     ScopedAneCacheLock cache_lock(directory);
     [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
+    // The entry is gone, so its rendezvous file has nothing left to guard;
+    // dropping it here keeps one 0-byte file per compiled procedure from
+    // accumulating forever. Safe under the lock: this process has no
+    // remaining work to serialize, and a later compile of the same
+    // identifier recreates both the lock file and the entry.
+    unlink(ane_compile_cache_lock_path(directory).fileSystemRepresentation);
   } catch (const std::exception &failure) {
     // Cleanup must not make model teardown fail. Leaving staging behind is
     // safer than deleting another process's in-progress compile inputs.
