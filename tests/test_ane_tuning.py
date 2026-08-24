@@ -936,3 +936,23 @@ def test_settings_for_candidate_disables_dflash():
 
     assert settings.dflash_enabled is False
     assert base.dflash_enabled is True
+
+
+def test_settings_for_candidate_disables_specprefill():
+    """Tuner measurement must prefill the full prompt, never sparse.
+
+    SpecPrefill compresses the measurement prompt below the compiled ANE
+    tile width, so the ANE never executes and the idle guard aborts the run.
+    """
+    from omlx.model_settings import ModelSettings
+
+    base = ModelSettings(
+        specprefill_enabled=True, specprefill_draft_model="draft-model"
+    )
+    request = ane_tuning.ANETuningRequest(model_id="m")
+    candidate = ane_tuning._Candidate("GPU only", False)
+
+    settings = ane_tuning._settings_for_candidate(base, request, candidate)
+
+    assert settings.specprefill_enabled is False
+    assert base.specprefill_enabled is True
