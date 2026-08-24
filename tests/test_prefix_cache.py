@@ -6,6 +6,7 @@ This module tests the block-aware prefix caching system that uses
 PagedCacheManager for block-based storage with SSD persistence.
 """
 
+import logging
 import sys
 import time
 import types
@@ -1828,6 +1829,58 @@ class TestArraysCacheLastBlockOnly:
         assert stats.partial_tokens_skipped == 3
         assert stats.last_partial_tokens_skipped == 3
         assert stats.last_tokens_to_next_block == 1
+
+    def test_store_cache_degrades_gracefully_when_out_of_blocks(self, mx, caplog):
+        """F3: handle_memory_pressure/evict_lru_blocks were removed --
+        they only ever recycled blocks already in the free queue (ref_count
+        == 0), never anything held by a live request, so they could never
+        gain capacity beyond what a bare retry already sees. Confirm the
+        simplified retry-once-then-give-up path still degrades gracefully
+        (keeps the valid prefix, logs a warning, doesn't raise) when
+        allocation genuinely has nothing left to give.
+        See docs/qwen35-hardening-and-optimization.md F3."""
+        block_size = 4
+        paged_cache = PagedCacheManager(
+            block_size=block_size,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        model = MockModel(num_layers=1)
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+        )
+
+        # 8 tokens = 2 full blocks; force the underlying allocator to
+        # simulate genuinely running out of blocks after the first one.
+        tokens = list(range(8))
+        keys = mx.arange(8, dtype=mx.float32).reshape(1, 1, 8, 1)
+        values = (keys + 100).astype(mx.float32)
+        cache_data = [
+            {"state": (keys, values), "cache_type": "KVCache", "class_name": "KVCache"}
+        ]
+
+        real_allocate = paged_cache.allocate_block
+        call_index = {"n": 0}
+
+        def flaky_allocate():
+            call_index["n"] += 1
+            if call_index["n"] > 1:
+                return None
+            return real_allocate()
+
+        with patch.object(paged_cache, "allocate_block", flaky_allocate):
+            with caplog.at_level(logging.WARNING):
+                result = cache.store_cache("req-out-of-blocks", tokens, cache_data)
+
+        assert result is not None
+        assert len(result.block_ids) == 1
+        assert result.num_tokens == 4
+        assert any(
+            "Cannot allocate block for req-out-of-blocks" in r.getMessage()
+            for r in caplog.records
+        )
 
     def test_store_cache_exact_multiple_creates_all_blocks(self, mx):
         """Tokens exactly divisible by block_size should create all blocks."""

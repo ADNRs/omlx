@@ -1060,12 +1060,18 @@ class BlockAwarePrefixCache(CacheManager):
                 first_new_block_idx = len(block_table.block_ids)
             block = self.paged_cache.allocate_block()
             if not block:
-                # Handle memory pressure
-                if not self.paged_cache.handle_memory_pressure(1):
-                    logger.warning(f"Cannot allocate block for {request_id}")
-                    break
+                # Retry once: a concurrent free() could have returned a
+                # block to the pool between the first attempt and here.
+                # There is no other source of capacity to fall back to --
+                # the free_block_queue only ever holds blocks already
+                # eligible for allocation, so a bare retry sees everything
+                # the old handle_memory_pressure/evict_lru_blocks pair
+                # could (they only recycled blocks already in that same
+                # free queue, never anything held by a live request).
+                # See docs/qwen35-hardening-and-optimization.md F3.
                 block = self.paged_cache.allocate_block()
                 if not block:
+                    logger.warning(f"Cannot allocate block for {request_id}")
                     break
 
             # Set block metadata

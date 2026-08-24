@@ -828,14 +828,6 @@ class TestPagedCacheManager:
         # Should get blocks from free queue in LRU order
         assert len(evictable) <= 3
 
-    def test_handle_memory_pressure(self):
-        """Test handling memory pressure."""
-        manager = PagedCacheManager(block_size=64, max_blocks=100, initial_blocks=100)
-
-        # Should return True when enough blocks available
-        result = manager.handle_memory_pressure(5)
-        assert result is True
-
     def test_allocate_blocks_for_tokens(self):
         """Test allocating blocks for a given number of tokens."""
         manager = PagedCacheManager(block_size=64, max_blocks=100, initial_blocks=100)

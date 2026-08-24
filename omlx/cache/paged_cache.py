@@ -1322,43 +1322,6 @@ class PagedCacheManager(CacheManager):
     # Eviction
     # =========================================================================
 
-    def evict_lru_blocks(self, num_blocks: int) -> int:
-        """
-        Evict least recently used blocks.
-
-        With the doubly linked list, LRU blocks are already at the front
-        of the free queue. We just need to pop from front.
-        """
-        with self._lock:
-            evicted = 0
-
-            # Get evictable blocks from free queue (they're already LRU ordered)
-            for _ in range(min(num_blocks, self.free_block_queue.num_free_blocks)):
-                try:
-                    block = self.free_block_queue.popleft()
-                    self._maybe_evict_cached_block(block)
-                    # Put back at end (now available for allocation)
-                    self.free_block_queue.append(block)
-                    evicted += 1
-                except ValueError:
-                    break
-
-            if evicted > 0:
-                logger.info(f"Evicted {evicted} LRU blocks from cache")
-
-            return evicted
-
-    def handle_memory_pressure(self, requested_blocks: int) -> bool:
-        """Handle memory pressure by evicting blocks."""
-        with self._lock:
-            if self.free_block_queue.num_free_blocks >= requested_blocks:
-                return True
-
-            needed = requested_blocks - self.free_block_queue.num_free_blocks
-            self.evict_lru_blocks(needed)
-
-            return self.free_block_queue.num_free_blocks >= requested_blocks
-
     # =========================================================================
     # Statistics and Properties
     # =========================================================================
@@ -1410,28 +1373,6 @@ class PagedCacheManager(CacheManager):
             self.stats.misses = 0
             self.stats.cow_copies = 0
             self.stats.evictions = 0
-
-    def reset_prefix_cache(self) -> bool:
-        """Reset the prefix cache."""
-        with self._lock:
-            num_used = self.max_blocks - self.free_block_queue.num_free_blocks
-            if num_used > 1:  # null_block is always "used"
-                logger.warning(f"Cannot reset cache: {num_used - 1} blocks in use")
-                return False
-
-            self.cached_block_hash_to_block.clear()
-            if self.on_hash_map_cleared is not None:
-                self.on_hash_map_cleared()
-
-            for block in self.blocks:
-                block.reset_hash()
-
-            self.stats.evictions = 0
-            self.stats.hits = 0
-            self.stats.misses = 0
-
-            logger.info("Prefix cache reset successfully")
-            return True
 
     def clear(self) -> int:
         """
