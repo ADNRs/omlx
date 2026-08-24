@@ -454,6 +454,8 @@
   "settings.cache.enabled": "启用缓存",
   "settings.cache.hot_cache_only": "仅 Hot Cache",
   "settings.cache.hot_cache_only_hint": "仅在 RAM 中保留 KV 缓存。不写入 SSD，重启后清除。",
+  "settings.cache.hot_cache_write_through": "Write-Through Hot Cache",
+  "settings.cache.hot_cache_write_through_hint": "Keep blocks in RAM AND write them to SSD immediately. Old sessions survive restarts and crashes; recent sessions resume at RAM speed.",
   "settings.cache.ssd_directory": "SSD 缓存目录",
   "settings.generation.section_label": "生成默认值",
   "settings.generation.max_context_window": "备用上下文窗口",

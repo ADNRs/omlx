@@ -1592,6 +1592,7 @@ class PagedSSDCacheManager(CacheManager):
         max_size_bytes: int,
         hot_cache_max_bytes: int = 0,
         hot_cache_only: bool = False,
+        hot_cache_write_through: bool = False,
         hot_cache_budget: SharedHotCacheBudget | None = None,
         expected_model_name: str = "",
         expected_num_layers: int = 0,
@@ -1613,6 +1614,11 @@ class PagedSSDCacheManager(CacheManager):
             hot_cache_only: When True, skip directory init and writer thread.
                 All data is stored exclusively in the hot cache (RAM only).
                 No SSD I/O is performed.
+            hot_cache_write_through: When True (and hot cache is enabled, not
+                hot_cache_only), every saved block is retained in the hot cache
+                AND enqueued for immediate SSD persistence. Combines RAM-speed
+                resume for recent sessions with SSD durability for all
+                sessions, at the cost of one background write per block.
             hot_cache_budget: Optional process-wide hot cache budget shared
                 by all loaded model cache managers.
             expected_model_name: Current model name. Blocks saved for a
@@ -1732,6 +1738,7 @@ class PagedSSDCacheManager(CacheManager):
             else hot_cache_max_bytes
         )
         self._hot_cache_enabled = self._hot_cache_max_bytes > 0
+        self._hot_cache_write_through = bool(hot_cache_write_through)
         self._hot_cache: OrderedDict[bytes, dict] = OrderedDict()
         self._hot_cache_total_bytes: int = 0
         self._hot_cache_lock = threading.Lock()
@@ -3473,6 +3480,13 @@ class PagedSSDCacheManager(CacheManager):
                 # SSD index entry is created later when block is evicted or
                 # flushed to SSD (in _enqueue_ssd_write).
                 self._hot_cache_put(block_hash, cache_entry)
+                if self._hot_cache_write_through and not self._hot_cache_only:
+                    # Write-through mode: also persist to SSD immediately so a
+                    # crash or force-quit loses nothing. The block stays in the
+                    # hot cache for RAM-speed reads; the background writer
+                    # marks the retained entry clean once the file commits, so
+                    # a later LRU eviction can simply drop it.
+                    self._enqueue_ssd_write(block_hash, cache_entry)
                 self._stats["saves"] += 1
                 return True
 
@@ -4687,18 +4701,32 @@ class PagedSSDCacheManager(CacheManager):
     def clear_hot_cache(self) -> int:
         """Clear all in-memory (hot) cache entries.
 
+        Dirty entries (never persisted to SSD) are flushed through the
+        background writer before being dropped, so clearing the hot cache
+        frees memory without losing blocks that exist nowhere else.
+
         Returns:
             Number of entries cleared.
         """
         with self._hot_cache_lock:
-            count = len(self._hot_cache)
+            entries = list(self._hot_cache.items())
             self._hot_cache.clear()
             self._hot_cache_total_bytes = 0
         if self._hot_cache_budget is not None:
             self._hot_cache_budget.forget_owner(self)
-        if count:
-            logger.info("Cleared %d hot cache entries", count)
-        return count
+        flushed = 0
+        for block_hash, entry in entries:
+            if entry.get("dirty", True) and self._enqueue_ssd_write(
+                block_hash, entry
+            ):
+                flushed += 1
+        if entries:
+            logger.info(
+                "Cleared %d hot cache entries (%d flushed to SSD first)",
+                len(entries),
+                flushed,
+            )
+        return len(entries)
 
     def shrink_hot_cache_to(
         self,

@@ -454,6 +454,8 @@
   "settings.cache.enabled": "啟用快取",
   "settings.cache.hot_cache_only": "僅 Hot Cache",
   "settings.cache.hot_cache_only_hint": "僅在 RAM 中保留 KV 快取。不寫入 SSD，重新啟動後清除。",
+  "settings.cache.hot_cache_write_through": "Write-Through Hot Cache",
+  "settings.cache.hot_cache_write_through_hint": "Keep blocks in RAM AND write them to SSD immediately. Old sessions survive restarts and crashes; recent sessions resume at RAM speed.",
   "settings.cache.ssd_directory": "SSD 快取目錄",
   "settings.generation.section_label": "生成預設值",
   "settings.generation.max_context_window": "備用上下文視窗",

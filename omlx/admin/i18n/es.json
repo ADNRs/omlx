@@ -454,6 +454,8 @@
   "settings.cache.enabled": "Caché Habilitada",
   "settings.cache.hot_cache_only": "Solo Caché Activa",
   "settings.cache.hot_cache_only_hint": "Mantener la caché KV solo en RAM. Sin escrituras SSD, caché se borra al reiniciar.",
+  "settings.cache.hot_cache_write_through": "Write-Through Hot Cache",
+  "settings.cache.hot_cache_write_through_hint": "Keep blocks in RAM AND write them to SSD immediately. Old sessions survive restarts and crashes; recent sessions resume at RAM speed.",
   "settings.cache.ssd_directory": "Directorio de Caché SSD",
   "settings.generation.section_label": "Valores predeterminados de generación",
   "settings.generation.max_context_window": "Ventana de contexto de respaldo",

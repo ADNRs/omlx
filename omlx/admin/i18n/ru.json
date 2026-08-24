@@ -454,6 +454,8 @@
   "settings.cache.enabled": "Кэш включен",
   "settings.cache.hot_cache_only": "Только горячий кэш",
   "settings.cache.hot_cache_only_hint": "Храните KV-кэш только в RAM. Без записи на SSD, кэш очищается при перезагрузке.",
+  "settings.cache.hot_cache_write_through": "Write-Through Hot Cache",
+  "settings.cache.hot_cache_write_through_hint": "Keep blocks in RAM AND write them to SSD immediately. Old sessions survive restarts and crashes; recent sessions resume at RAM speed.",
   "settings.cache.ssd_directory": "Каталог SSD-кэша",
   "settings.generation.section_label": "Параметры генерации по умолчанию",
   "settings.generation.max_context_window": "Резервное окно контекста",

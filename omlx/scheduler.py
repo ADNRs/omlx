@@ -1504,6 +1504,10 @@ class SchedulerConfig:
         None  # Path for paged SSD cache storage (None = disabled)
     )
     hot_cache_only: bool = False
+    # When True (and the hot cache is enabled), every saved block is kept in
+    # RAM *and* persisted to SSD immediately, instead of deferring the SSD
+    # write to hot-cache eviction or shutdown.
+    hot_cache_write_through: bool = False
     paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
     hot_cache_budget: Any | None = None  # Shared process-wide hot cache budget
@@ -8020,6 +8024,9 @@ class Scheduler:
                     max_size_bytes=self.config.paged_ssd_cache_max_size,
                     hot_cache_max_bytes=self.config.hot_cache_max_size,
                     hot_cache_only=self.config.hot_cache_only,
+                    hot_cache_write_through=getattr(
+                        self.config, "hot_cache_write_through", False
+                    ),
                     hot_cache_budget=self.config.hot_cache_budget,
                     expected_model_name=name,
                     expected_num_layers=len(draft_cache_list),
@@ -12462,6 +12469,9 @@ class Scheduler:
                 max_size_bytes=self.config.paged_ssd_cache_max_size,
                 hot_cache_max_bytes=self.config.hot_cache_max_size,
                 hot_cache_only=self.config.hot_cache_only,
+                hot_cache_write_through=getattr(
+                    self.config, "hot_cache_write_through", False
+                ),
                 hot_cache_budget=self.config.hot_cache_budget,
                 gdn_ssd_split_enabled=self.config.gdn_ssd_split_enabled,
                 expected_model_name=self.config.model_name or "",
