@@ -1618,13 +1618,21 @@ class BlockAwarePrefixCache(CacheManager):
                 )
                 if not handler.supports_block_slicing:
                     continue
-            if (
-                isinstance(entry, tuple)
-                and len(entry) == 2
-                and hasattr(entry[0], "shape")
-                and len(entry[0].shape) == 4
-            ):
-                if entry[0].shape[2] != expected_token_count:
+            if isinstance(entry, tuple) and len(entry) == 2:
+                keys, values = entry
+                keys_are_sliced = hasattr(keys, "shape") and len(keys.shape) == 4
+                values_are_sliced = hasattr(values, "shape") and len(values.shape) == 4
+                if not keys_are_sliced and not values_are_sliced:
+                    continue
+                # A sliceable KV entry must contain a matched 4D key/value
+                # pair. Checking only keys lets an independently truncated
+                # value tensor persist and fail much later during restore.
+                if not keys_are_sliced or not values_are_sliced:
+                    return False
+                if (
+                    keys.shape[2] != expected_token_count
+                    or values.shape[2] != expected_token_count
+                ):
                     return False
         return True
 

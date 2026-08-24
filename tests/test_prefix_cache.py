@@ -2184,8 +2184,9 @@ class TestArraysCacheLastBlockOnly:
         assert fetched_partial.num_tokens == 8
         assert remaining_partial == tokens[8:12]
 
-    def test_store_cache_rejects_block_whose_slice_length_disagrees_with_token_count(
-        self, mx
+    @pytest.mark.parametrize("truncated_side", ["keys", "values"])
+    def test_store_cache_rejects_block_when_either_kv_slice_length_disagrees(
+        self, mx, truncated_side
     ):
         """A3: a bug anywhere upstream of _extract_block_tensor_slice (wrong
         start/end indices, a stale cache_data snapshot, etc.) could silently
@@ -2193,11 +2194,11 @@ class TestArraysCacheLastBlockOnly:
         block's own token_count -- persisting that would corrupt a later
         restore with no error until it's replayed. Simulate such a bug by
         monkeypatching _extract_block_tensor_slice to return a 3-token
-        slice for what store_cache believes is a 4-token block, and confirm
-        the block is rejected (not persisted) while the valid prefix before
-        it survives -- the same discipline test_store_cache_keeps_valid_
-        prefix_when_later_ssd_save_fails already establishes for SSD
-        write failures.
+        slice on either side of the KV pair for what store_cache believes is
+        a 4-token block, and confirm the block is rejected (not persisted)
+        while the valid prefix before it survives -- the same discipline
+        test_store_cache_keeps_valid_prefix_when_later_ssd_save_fails already
+        establishes for SSD write failures.
         See docs/qwen35-hardening-and-optimization.md A3."""
         block_size = 4
         paged_cache = PagedCacheManager(
@@ -2231,9 +2232,13 @@ class TestArraysCacheLastBlockOnly:
             result = original_extract(*args, **kwargs)
             if call_index["n"] == 2:
                 # Simulate an upstream indexing bug on the second block:
-                # truncate to 3 tokens instead of the real 4.
+                # truncate one side to 3 tokens instead of the real 4.
                 bad_keys, bad_values = result[0]
-                result = [(bad_keys[:, :, :3, :], bad_values[:, :, :3, :])]
+                if truncated_side == "keys":
+                    bad_keys = bad_keys[:, :, :3, :]
+                else:
+                    bad_values = bad_values[:, :, :3, :]
+                result = [(bad_keys, bad_values)]
             return result
 
         with patch.object(cache, "_extract_block_tensor_slice", buggy_extract):
