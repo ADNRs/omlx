@@ -121,6 +121,161 @@ def test_qwen4_exp_sanitize_keeps_converted_norm_values():
     assert mx.array_equal(result["language_model.model.norm.weight"], norm).item()
 
 
+def _qwen4_rmsnorm_sanitize_fixture(*, include_mtp=False):
+    from mlx_vlm.models.qwen4_exp.language import (
+        Qwen4ExpRMSNorm,
+        Qwen4ExpRMSNormGated,
+    )
+
+    modules = []
+    weights = {}
+    target_keys = set()
+    anchor_residuals = (
+        -0.30,
+        -0.20,
+        -0.10,
+        -0.05,
+        0.00,
+        0.05,
+        0.10,
+        0.15,
+        0.20,
+        0.25,
+        0.30,
+        0.75,
+    )
+    for layer_idx, residual in enumerate(anchor_residuals):
+        path = (
+            f"language_model.model.layers.{layer_idx}."
+            "attn_hyper_connection.hc_norm"
+        )
+        modules.append((path, Qwen4ExpRMSNorm(4)))
+        key = f"{path}.weight"
+        weights[key] = mx.full((4,), residual, dtype=mx.bfloat16)
+        target_keys.add(key)
+
+    path = "language_model.model.hyper_connection_mixer.hc_norm"
+    modules.append((path, Qwen4ExpRMSNorm(4)))
+    weights[f"{path}.weight"] = mx.array([-0.25, 0.0, 0.25, 0.5], dtype=mx.bfloat16)
+    target_keys.add(f"{path}.weight")
+
+    gated_path = "language_model.model.layers.0.linear_attn.norm"
+    modules.append((gated_path, Qwen4ExpRMSNormGated(4, eps=1e-6, activation="silu")))
+    weights[f"{gated_path}.weight"] = mx.array(
+        [0.95, 1.0, 1.05, 1.1], dtype=mx.bfloat16
+    )
+
+    if include_mtp:
+        for path, values in (
+            (
+                "mtp.hyper_connection_mixer.hc_norm",
+                [3.75, 3.875, 4.0, 4.125],
+            ),
+            (
+                "mtp.pre_fc_norm_embedding",
+                [-0.8, -0.75, -0.7, -0.65],
+            ),
+        ):
+            modules.append((path, Qwen4ExpRMSNorm(4)))
+            weights[f"{path}.weight"] = mx.array(values, dtype=mx.bfloat16)
+            target_keys.add(f"{path}.weight")
+
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(
+                tie_word_embeddings=False,
+                num_hidden_layers=0,
+                num_experts=0,
+                ple_layer_ids=(),
+            )
+        ),
+        named_modules=lambda: iter(modules),
+    )
+    return model, modules, weights, target_keys
+
+
+def test_qwen4_exp_sanitize_keeps_zero_centered_rmsnorms():
+    from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
+
+    model, _, weights, target_keys = _qwen4_rmsnorm_sanitize_fixture()
+    result = Model.sanitize(model, dict(weights))
+
+    for key in target_keys:
+        assert mx.array_equal(result[key], weights[key]).item()
+        assert result[key].dtype == mx.bfloat16
+
+
+def test_qwen4_exp_sanitize_recenters_ones_centered_base_and_mtp(tmp_path, caplog):
+    from mlx_vlm.models.qwen4_exp.language import configure_mtp_runtime
+    from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
+
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"mtp.fc_hidden.weight": "model.safetensors"}}),
+        encoding="utf-8",
+    )
+    configure_mtp_runtime(tmp_path, enabled=True)
+    try:
+        model, modules, canonical, target_keys = _qwen4_rmsnorm_sanitize_fixture(
+            include_mtp=True
+        )
+        shifted = {
+            key: (
+                value + mx.array(1.0, dtype=value.dtype)
+                if key in target_keys
+                else value
+            )
+            for key, value in canonical.items()
+        }
+
+        with caplog.at_level("INFO"):
+            result = Model.sanitize(model, dict(shifted))
+
+        for key in target_keys:
+            assert result[key].dtype == mx.float32
+            assert mx.array_equal(
+                1.0 + result[key], shifted[key].astype(mx.float32)
+            ).item()
+
+        gated_key = "language_model.model.layers.0.linear_attn.norm.weight"
+        assert mx.array_equal(result[gated_key], shifted[gated_key]).item()
+        assert "Canonicalized 15 ones-centered" in caplog.text
+
+        mtp_norm = dict(modules)["mtp.pre_fc_norm_embedding"]
+        mtp_norm.weight = result["mtp.pre_fc_norm_embedding.weight"]
+        x = mx.array([[1.0, -2.0, 3.0, -4.0]], dtype=mx.float32)
+        actual = mtp_norm(x)
+        rms = x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + 1e-6)
+        expected = rms * shifted["mtp.pre_fc_norm_embedding.weight"].astype(mx.float32)
+        assert mx.array_equal(actual, expected).item()
+
+        second = Model.sanitize(model, dict(result))
+        for key in target_keys:
+            assert mx.array_equal(second[key], result[key]).item()
+    finally:
+        configure_mtp_runtime(tmp_path, enabled=False)
+
+
+def test_qwen4_exp_sanitize_leaves_ambiguous_rmsnorms_unchanged(caplog):
+    from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
+
+    model, _, weights, target_keys = _qwen4_rmsnorm_sanitize_fixture()
+    for index, key in enumerate(
+        sorted(key for key in target_keys if ".layers." in key)
+    ):
+        weights[key] = mx.full(
+            weights[key].shape,
+            0.0 if index < 6 else 1.0,
+            dtype=mx.bfloat16,
+        )
+
+    with caplog.at_level("WARNING"):
+        result = Model.sanitize(model, dict(weights))
+
+    for key in target_keys:
+        assert mx.array_equal(result[key], weights[key]).item()
+    assert "RMSNorm checkpoint centering is ambiguous" in caplog.text
+
+
 def test_qwen4_exp_sanitize_keeps_converted_ple_shared_scale():
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.qwen4_exp import Model

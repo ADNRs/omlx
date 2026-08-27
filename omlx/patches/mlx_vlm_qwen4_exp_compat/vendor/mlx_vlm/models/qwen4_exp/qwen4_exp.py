@@ -1,3 +1,4 @@
+import logging
 import re
 
 import mlx.core as mx
@@ -11,10 +12,13 @@ from .config import ModelConfig
 from .language import (
     LanguageModel,
     Qwen4ExpMTPModule,
+    Qwen4ExpRMSNorm,
     get_mtp_runtime,
     get_ple_runtime_mode,
 )
 from .vision import VisionModel
+
+logger = logging.getLogger(__name__)
 
 _NGRAM_SHARD_RE = re.compile(r"\.ngram_embedding\.shard_(\d+)(?=\.)")
 _NGRAM_STORAGE_RE = re.compile(
@@ -27,6 +31,101 @@ _MTP_PREFIXES = (
     "model.mtp.",
     "mtp.",
 )
+_RMSNORM_CENTER_ANCHOR_RE = re.compile(
+    r"^language_model\.model\.layers\.\d+"
+    r"\.attn_hyper_connection\.hc_norm\.weight$"
+)
+_RMSNORM_CENTER_MIN_ANCHORS = 8
+_RMSNORM_ONES_CENTERED_VOTE = 0.9
+_RMSNORM_ONES_CENTERED_MEDIAN_MIN = 0.75
+_RMSNORM_ONES_CENTERED_MEDIAN_MAX = 1.5
+_RMSNORM_ZERO_CENTERED_VOTE = 0.1
+_RMSNORM_ZERO_CENTERED_MEDIAN_MIN = -0.5
+_RMSNORM_ZERO_CENTERED_MEDIAN_MAX = 0.25
+
+
+def _normalize_ones_centered_rmsnorm_weights(model, weights):
+    """Canonicalize legacy direct-gamma Qwen4 RMSNorm checkpoints.
+
+    Qwen4 stores most RMSNorm parameters as a residual around zero and applies
+    ``1 + weight`` at runtime. Some early community MLX conversions instead
+    stored the direct gamma around one. Use the stable per-layer attention
+    hyper-connection norms to identify that checkpoint-wide conversion, then
+    recenter only modules backed by :class:`Qwen4ExpRMSNorm`.
+
+    The MTP head is normalized using the base-model decision. Its trained norm
+    means are not independently centered near zero, so sampling the MTP head
+    alone would be ambiguous.
+    """
+    named_modules = getattr(model, "named_modules", None)
+    if named_modules is None:
+        return
+
+    anchors = [
+        value
+        for key, value in weights.items()
+        if _RMSNORM_CENTER_ANCHOR_RE.fullmatch(key)
+        and isinstance(value, mx.array)
+        and mx.issubdtype(value.dtype, mx.floating)
+    ]
+    if len(anchors) < _RMSNORM_CENTER_MIN_ANCHORS:
+        return
+
+    means = mx.stack([mx.mean(value.astype(mx.float32)) for value in anchors])
+    median = mx.median(means)
+    ones_vote = mx.mean((means > 0.5).astype(mx.float32))
+    mx.eval(median, ones_vote)
+    median_value = float(median.item())
+    ones_vote_value = float(ones_vote.item())
+
+    ones_centered = (
+        ones_vote_value >= _RMSNORM_ONES_CENTERED_VOTE
+        and _RMSNORM_ONES_CENTERED_MEDIAN_MIN
+        <= median_value
+        <= _RMSNORM_ONES_CENTERED_MEDIAN_MAX
+    )
+    zero_centered = (
+        ones_vote_value <= _RMSNORM_ZERO_CENTERED_VOTE
+        and _RMSNORM_ZERO_CENTERED_MEDIAN_MIN
+        <= median_value
+        <= _RMSNORM_ZERO_CENTERED_MEDIAN_MAX
+    )
+    if not ones_centered:
+        if not zero_centered:
+            logger.warning(
+                "Qwen4-Exp RMSNorm checkpoint centering is ambiguous "
+                "(%d anchors, median %.4f, ones-centered vote %.1f%%); "
+                "leaving weights unchanged",
+                len(anchors),
+                median_value,
+                ones_vote_value * 100.0,
+            )
+        return
+
+    target_keys = {
+        f"{path}.weight"
+        for path, module in named_modules()
+        if isinstance(module, Qwen4ExpRMSNorm)
+    }
+    normalized = 0
+    for key in target_keys:
+        value = weights.get(key)
+        if not isinstance(value, mx.array) or not mx.issubdtype(
+            value.dtype, mx.floating
+        ):
+            continue
+        # Keep the residual in FP32. Subtracting in BF16 can lose information
+        # for direct gamma values below 0.5, which occur in the trained MTP head.
+        weights[key] = value.astype(mx.float32) - 1.0
+        normalized += 1
+
+    logger.info(
+        "Canonicalized %d ones-centered Qwen4-Exp RMSNorm tensors "
+        "(%d anchors, median %.4f)",
+        normalized,
+        len(anchors),
+        median_value,
+    )
 
 
 class Model(Qwen3_5Model):
@@ -153,6 +252,7 @@ class Model(Qwen3_5Model):
             if "conv1d.weight" in key and value.shape[-1] != 1:
                 value = value.moveaxis(2, 1)
             sanitized[key] = value
+        _normalize_ones_centered_rmsnorm_weights(self, sanitized)
         return sanitized
 
     def close(self):
