@@ -214,6 +214,9 @@ class Glm5NextLinearAttention(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, S, _ = inputs.shape
+        has_right_padding = cache is not None and cache.lengths is not None
+        if has_right_padding:
+            mask = mx.arange(S)[None] < cache.lengths[:, None]
         if self.fuse_in:
             q_o, k_o, v_o, fa_o, ga_o, b_o = self._fused_in_proj(inputs)
             mixed = mx.concatenate([q_o, k_o, v_o], axis=-1)
@@ -235,7 +238,19 @@ class Glm5NextLinearAttention(nn.Module):
             )
         conv_input = mx.concatenate([conv_state, mixed], axis=1)
         if cache is not None:
-            cache[0] = mx.contiguous(conv_input[:, -(self.conv_kernel_size - 1) :, :])
+            state_size = self.conv_kernel_size - 1
+            if has_right_padding:
+                valid_lengths = mx.sum(mask, axis=-1).astype(mx.int32)
+                state_indices = valid_lengths[:, None] + mx.arange(state_size)[None]
+                state_indices = mx.broadcast_to(
+                    state_indices[..., None],
+                    (B, state_size, self.conv_dim),
+                )
+                cache[0] = mx.contiguous(
+                    mx.take_along_axis(conv_input, state_indices, axis=1)
+                )
+            else:
+                cache[0] = mx.contiguous(conv_input[:, -state_size:, :])
         conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = mx.split(conv_out, [self.qkv_dim, 2 * self.qkv_dim], axis=-1)

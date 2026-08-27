@@ -320,6 +320,48 @@ def test_variable_length_batch_matches_single_request_greedy_tokens():
     assert batched == single
 
 
+def test_variable_length_batch_logits_match_single_requests():
+    from mlx_lm.generate import BatchGenerator
+    from mlx_vlm.models.glm5_next import Model
+
+    from omlx.models.vlm import VLMModelAdapter
+
+    mx.random.seed(3184)
+    model = VLMModelAdapter(Model(_tiny_config()))
+
+    def first_logits(prompts):
+        captured = []
+
+        def sampler(logits):
+            mx.eval(logits)
+            captured.append(logits)
+            return mx.argmax(logits, axis=-1)
+
+        generator = BatchGenerator(
+            model,
+            max_tokens=3,
+            prefill_batch_size=len(prompts),
+            completion_batch_size=len(prompts),
+            sampler=sampler,
+        )
+        generator.insert(prompts, max_tokens=[3] * len(prompts))
+        for _ in range(4):
+            generator.next()
+            if captured:
+                break
+        assert len(captured) == 1
+        return captured[0]
+
+    short_prompt = [2, 3, 4]
+    long_prompt = [2, 3, 4, 5]
+    short_logits = first_logits([short_prompt])[0]
+    long_logits = first_logits([long_prompt])[0]
+    batch_logits = first_logits([short_prompt, long_prompt])
+
+    assert mx.allclose(batch_logits[0], short_logits, atol=3e-4, rtol=3e-4).item()
+    assert mx.allclose(batch_logits[1], long_logits, atol=3e-4, rtol=3e-4).item()
+
+
 def test_late_join_batch_matches_single_request_greedy_tokens():
     from mlx_lm.generate import BatchGenerator
     from mlx_vlm.models.glm5_next import Model
