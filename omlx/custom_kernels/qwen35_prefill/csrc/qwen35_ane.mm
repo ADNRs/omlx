@@ -2418,6 +2418,7 @@ public:
     id<MTLCommandBuffer> qmm_buffer =
         (__bridge id<MTLCommandBuffer>)(static_cast<void *>(
             encoder.get_command_buffer()));
+    [qmm_buffer retain];
     if (profiling) {
       [qmm_buffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
         const double duration = completed.GPUEndTime - completed.GPUStartTime;
@@ -2429,12 +2430,6 @@ public:
                     profile_now_ns() - launch);
       }];
     }
-    id<MTLCommandBuffer> cpu_gpu_buffer = nil;
-    if (cpu_weight) {
-      cpu_gpu_buffer = qmm_buffer;
-      [cpu_gpu_buffer retain];
-    }
-
     // Keep the wait in a third command buffer. Metal may hold an entire
     // command buffer at an encoded wait, even when compute encoders precede
     // it, which serializes the otherwise independent GPU remainder behind
@@ -2479,20 +2474,29 @@ public:
       // the GPU is still writing. The detached ANE thread holds its own
       // model reference and signals the ticket on its own.
       [qmm_buffer waitUntilCompleted];
-      if (cpu_gpu_buffer != nil) {
-        [cpu_gpu_buffer release];
-      }
+      [qmm_buffer release];
       throw;
     }
-    if (cpu_gpu_buffer != nil) {
-      [cpu_gpu_buffer waitUntilCompleted];
-      [cpu_gpu_buffer release];
+    // ANE completion does not order an independently committed GPU suffix
+    // command buffer before the merge encoder. This is observable on the
+    // first qmm dispatch, when pipeline setup lets ANE finish first: the merge
+    // can otherwise read a partially written suffix. Preserve ANE/GPU overlap,
+    // then join both branches explicitly before consuming either output.
+    const bool gpu_finished_at_ane_done =
+        qmm_buffer.status == MTLCommandBufferStatusCompleted;
+    [qmm_buffer waitUntilCompleted];
+    if (qmm_buffer.status == MTLCommandBufferStatusError) {
+      const std::string error = error_text(
+          @"ANE hybrid GPU suffix command buffer failed", qmm_buffer.error);
+      [qmm_buffer release];
+      throw std::runtime_error(error);
     }
+    [qmm_buffer release];
     if (profiling) {
       const uint64_t done = profile_now_ns();
       profile_add(profile_category, kAneRegionNs, done - launch);
       g_previous_ane_done_ns.store(done, std::memory_order_relaxed);
-      if (qmm_buffer.status == MTLCommandBufferStatusCompleted) {
+      if (gpu_finished_at_ane_done) {
         profile_add(profile_category, kAneLast, 1);
       } else {
         profile_add(profile_category, kGpuLast, 1);
@@ -2734,6 +2738,7 @@ public:
     id<MTLCommandBuffer> qmm_buffer =
         (__bridge id<MTLCommandBuffer>)(static_cast<void *>(
             encoder.get_command_buffer()));
+    [qmm_buffer retain];
     if (profiling) {
       [qmm_buffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
         const double duration = completed.GPUEndTime - completed.GPUStartTime;
@@ -2744,11 +2749,6 @@ public:
         profile_add(profile_category, kGpuCompletionNs,
                     profile_now_ns() - launch);
       }];
-    }
-    id<MTLCommandBuffer> cpu_gpu_buffer = nil;
-    if (cpu_weight) {
-      cpu_gpu_buffer = qmm_buffer;
-      [cpu_gpu_buffer retain];
     }
     encoder.commit();
 
@@ -2793,20 +2793,28 @@ public:
       // qmm before this frame's MLX arrays can be recycled. The detached ANE
       // threads hold their own model references.
       [qmm_buffer waitUntilCompleted];
-      if (cpu_gpu_buffer != nil) {
-        [cpu_gpu_buffer release];
-      }
+      [qmm_buffer release];
       throw;
     }
-    if (cpu_gpu_buffer != nil) {
-      [cpu_gpu_buffer waitUntilCompleted];
-      [cpu_gpu_buffer release];
+    // ANE completion does not order the separately committed GPU suffix
+    // before this primitive's merge. Join the already-overlapped branches so
+    // the merge cannot observe an in-flight qmm output on its first dispatch.
+    const bool gpu_finished_at_ane_done =
+        qmm_buffer.status == MTLCommandBufferStatusCompleted;
+    [qmm_buffer waitUntilCompleted];
+    if (qmm_buffer.status == MTLCommandBufferStatusError) {
+      const std::string error = error_text(
+          @"Dual ANE hybrid GPU suffix command buffer failed",
+          qmm_buffer.error);
+      [qmm_buffer release];
+      throw std::runtime_error(error);
     }
+    [qmm_buffer release];
     if (profiling) {
       const uint64_t done = profile_now_ns();
       profile_add(profile_category, kAneRegionNs, done - launch);
       g_previous_ane_done_ns.store(done, std::memory_order_relaxed);
-      if (qmm_buffer.status == MTLCommandBufferStatusCompleted) {
+      if (gpu_finished_at_ane_done) {
         profile_add(profile_category, kAneLast, 1);
       } else {
         profile_add(profile_category, kGpuLast, 1);
