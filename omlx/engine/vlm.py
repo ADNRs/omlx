@@ -1653,6 +1653,7 @@ class VLMBatchedEngine(BaseEngine):
                 ):
                     loaded = vlm_load(
                         self._model_name,
+                        lazy=True,
                         trust_remote_code=self._trust_remote_code,
                     )
                     return loaded
