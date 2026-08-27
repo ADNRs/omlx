@@ -5078,7 +5078,7 @@ def _source_imatrix_signature(
     elif str(config.get("model_type", "")).lower() == "glm5_next":
         # GLM-5.3 needs its mHC-expanded layer walk plus the untied output-head
         # capture. Older caches completed without either and must not be reused.
-        signature["layer_walk"] = "glm5_next_hc_moe_lm_head_v3"
+        signature["layer_walk"] = "glm5_next_hc_moe_lm_head_v4"
     return signature
 
 
@@ -5280,6 +5280,22 @@ def _lookup_imatrix_importance(
 
     base = tensor_name[: -len(".weight")]
     entry = imatrix.entries.get(base)
+    if entry is None and config is not None:
+        text_config = config.get("text_config")
+        text_model_type = (
+            text_config.get("model_type") if isinstance(text_config, dict) else None
+        )
+        if (
+            config.get("model_type") == "glm5_next"
+            or text_model_type == "glm5_next_text"
+        ) and base.endswith(".self_attn.indexer.weights_proj"):
+            # The GLM-5.3 indexer feeds the same hidden-state input to wk and
+            # weights_proj. Short calibration sequences bypass sparse scoring
+            # after wk, before weights_proj is called, so its wrapper cannot
+            # collect a separate entry. Reuse the mathematically identical wk
+            # input-channel statistics instead of weakening strict coverage.
+            wk_base = base[: -len("weights_proj")] + "wk"
+            entry = imatrix.entries.get(wk_base)
     if entry is None:
         if report is not None:
             report["missing"].append(base)
@@ -7250,7 +7266,10 @@ class _ImatrixCaptureWrapper(nn.Module):
                 )
             else:
                 self._collector.collect_dense(self._name, self._module, args[0])
-        return self._module(*args, **kwargs)
+        result = self._module(*args, **kwargs)
+        if args and self._name.endswith(".self_attn.q_b_proj"):
+            self._collector.collect_glm5_next_embed_q(self._name, result)
+        return result
 
 
 class OQImatrixCollector:
@@ -7381,6 +7400,32 @@ class OQImatrixCollector:
             entry.counts += per_head.shape[1]
         except Exception as e:
             logger.debug("oQe imatrix multi capture skipped for %s: %s", name, e)
+
+    def collect_glm5_next_embed_q(self, q_b_name: str, q) -> None:
+        """Capture the GLM-5.3 embed_q input from q_b_proj's exact output.
+
+        Short calibration sequences take the algebraically equivalent reverse
+        embed_q path, whose activation width does not match the stored weight's
+        quantization axis. Long sparse-attention requests use the forward path
+        on q_b_proj's reshaped output, so collect that tensor directly without
+        forcing calibration past the production indexer's short-prefix bypass.
+        """
+        embed_name = q_b_name[: -len("q_b_proj")] + "embed_q"
+        module = self._original_modules.get(embed_name)
+        if module is None or type(module).__name__ not in _OQE_MULTI_LINEAR_CLASSES:
+            return
+        try:
+            weight = module.weight
+            n_heads = int(weight.shape[0])
+            in_dim = self._module_in_dim(module)
+            if not getattr(q, "shape", ()) or int(q.shape[-1]) != n_heads * in_dim:
+                return
+            shaped_q = q.reshape(*q.shape[:-1], n_heads, in_dim)
+            self.collect_multi(embed_name, module, shaped_q)
+        except Exception as e:
+            logger.debug(
+                "oQe GLM-5.3 embed_q capture skipped for %s: %s", embed_name, e
+            )
 
     @staticmethod
     def _accumulate_switch(

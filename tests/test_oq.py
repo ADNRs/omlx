@@ -1292,6 +1292,68 @@ class TestStreamingHelpers:
         assert importance is None
         assert report["missing"] == []
 
+    def test_glm5_next_indexer_weights_proj_reuses_wk_imatrix(self):
+        from omlx.oq import OQImatrixData, _lookup_imatrix_importance
+
+        wk_base = "language_model.model.layers.11.self_attn.indexer.wk"
+        values = np.arange(64, dtype=np.float32) + 1
+        imatrix = OQImatrixData(
+            entries={
+                wk_base: OQImatrixEntry(
+                    in_sum2=values * 4,
+                    counts=np.array([4], dtype=np.int64),
+                )
+            },
+            metadata={},
+            path="unused.npz",
+        )
+        report = {"missing": [], "mismatched": [], "applied": []}
+        weights_proj = wk_base[: -len("wk")] + "weights_proj.weight"
+
+        importance = _lookup_imatrix_importance(
+            imatrix,
+            weights_proj,
+            (32, 64),
+            config={
+                "model_type": "glm5_next",
+                "text_config": {"model_type": "glm5_next_text"},
+            },
+            strict=True,
+            report=report,
+        )
+
+        np.testing.assert_array_equal(np.asarray(importance), values)
+        assert report["applied"] == [weights_proj.removesuffix(".weight")]
+        assert report["missing"] == []
+
+    def test_non_glm_weights_proj_still_requires_its_own_imatrix(self):
+        from omlx.oq import OQImatrixData, _lookup_imatrix_importance
+
+        base = "model.layers.0.self_attn.indexer"
+        imatrix = OQImatrixData(
+            entries={
+                f"{base}.wk": OQImatrixEntry(
+                    in_sum2=np.ones(64, dtype=np.float32),
+                    counts=np.ones(1, dtype=np.int64),
+                )
+            },
+            metadata={},
+            path="unused.npz",
+        )
+        report = {"missing": [], "mismatched": [], "applied": []}
+
+        with pytest.raises(RuntimeError, match="missing entry"):
+            _lookup_imatrix_importance(
+                imatrix,
+                f"{base}.weights_proj.weight",
+                (32, 64),
+                config={"model_type": "deepseek_v4"},
+                strict=True,
+                report=report,
+            )
+
+        assert report["missing"] == [f"{base}.weights_proj"]
+
     def test_qwen4_ngram_group32_is_priced_into_budget_plan(self):
         from omlx.oq import _structural_quant_overrides
 
@@ -6575,7 +6637,7 @@ class TestGlm5NextLayerWalk:
             calib_dataset="test",
         )
 
-        assert signature["layer_walk"] == "glm5_next_hc_moe_lm_head_v3"
+        assert signature["layer_walk"] == "glm5_next_hc_moe_lm_head_v4"
 
     def test_hyper_connections_and_moe_imatrix_hooks_execute(self):
         from omlx.patches import mlx_vlm_glm5_next_compat
@@ -6590,6 +6652,7 @@ class TestGlm5NextLayerWalk:
         config.text_config.n_shared_experts = 1
         config.text_config.first_k_dense_replace = 1
         config.text_config.mlp_layer_types = ["dense", "sparse"]
+        config.text_config.index_topk = 2048
         model = Model(config)
         tokens = mx.array([[1, 2, 3, 4, 5, 6]], dtype=mx.int32)
         layers = model.language_model.model.layers
