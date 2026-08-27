@@ -1274,6 +1274,24 @@ class TestStreamingHelpers:
         assert importance is None
         assert report["missing"] == []
 
+    def test_token_embedding_is_exempt_from_strict_imatrix_lookup(self):
+        from omlx.oq import OQImatrixData, _lookup_imatrix_importance
+
+        imatrix = OQImatrixData(entries={}, metadata={}, path="unused.npz")
+        report = {"missing": [], "mismatched": [], "applied": []}
+
+        importance = _lookup_imatrix_importance(
+            imatrix,
+            "language_model.model.embed_tokens.weight",
+            (154_880, 256),
+            config={"model_type": "glm5_next"},
+            strict=True,
+            report=report,
+        )
+
+        assert importance is None
+        assert report["missing"] == []
+
     def test_qwen4_ngram_group32_is_priced_into_budget_plan(self):
         from omlx.oq import _structural_quant_overrides
 
@@ -2641,6 +2659,25 @@ class TestDiscoverSanitizePlan:
         assert "model.embed_tokens.weight" not in plan
         assert len(plan) == len(tensors) - 1
 
+    def test_safetensors_dtype_supports_issubdtype_sanitize(self, sf_file):
+        path, tensors = sf_file
+        idx = _LazyTensorIndex([path])
+
+        def cast_floating_sanitize(weights):
+            return {
+                key: (
+                    value.astype(mx.float32)
+                    if mx.issubdtype(value.dtype, mx.floating)
+                    else value
+                )
+                for key, value in weights.items()
+            }
+
+        plan = _discover_sanitize_plan(cast_floating_sanitize, idx)
+
+        assert set(plan) == set(tensors)
+        assert all(info["transform"] == "astype" for info in plan.values())
+
     def test_swapaxes_sanitize(self, sf_file):
         path, _tensors = sf_file
         idx = _LazyTensorIndex([path])
@@ -2703,6 +2740,26 @@ class TestDiscoverSanitizePlan:
             rtol=1e-3,
             atol=1e-3,
         )
+
+    def test_concatenate_moveaxis_sanitize_replays(self, tmp_path):
+        path = tmp_path / "weights.safetensors"
+        tensors = {
+            f"conv.{index}.weight": np.full((2, 3, 1), index, dtype=np.float16)
+            for index in range(3)
+        }
+        _write_safetensors(str(path), tensors)
+        idx = _LazyTensorIndex([str(path)])
+
+        def sanitize(weights):
+            fused = mx.concatenate(list(weights.values()), axis=1)
+            return {"conv.weight": fused.moveaxis(2, 1)}
+
+        plan = _discover_sanitize_plan(sanitize, idx)
+        assert plan["conv.weight"]["transform"] == "expr"
+        result = _DiscoveredPlan(plan, idx).pop("conv.weight")
+        expected = np.concatenate(list(tensors.values()), axis=1).transpose(0, 2, 1)
+
+        np.testing.assert_array_equal(np.array(result), expected)
 
     def test_expand_dims_sanitize_replays(self, tmp_path):
         path = tmp_path / "weights.safetensors"
@@ -6491,6 +6548,92 @@ class TestQwen4ExpLayerWalk:
                 collector.restore(model)
         finally:
             configure_mtp_runtime(tmp_path, enabled=False)
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestGlm5NextLayerWalk:
+    def test_cache_without_checkpoint_mtp_weights_is_reusable(self, tmp_path):
+        from omlx.oq import OQImatrixData, _oqe_cache_missing_mtp_entries
+
+        cache = OQImatrixData(entries={}, metadata={}, path="unused.npz")
+        config = {
+            "model_type": "glm5_next",
+            "text_config": {"num_nextn_predict_layers": 1},
+        }
+
+        assert not _oqe_cache_missing_mtp_entries(cache, config, str(tmp_path))
+
+    def test_cache_signature_tracks_glm5_next_layer_walk(self, tmp_path):
+        signature = _source_imatrix_signature(
+            tmp_path,
+            {
+                "model_type": "glm5_next",
+                "text_config": {"model_type": "glm5_next_text"},
+            },
+            num_samples=128,
+            seq_length=512,
+            calib_dataset="test",
+        )
+
+        assert signature["layer_walk"] == "glm5_next_hc_moe_lm_head_v3"
+
+    def test_hyper_connections_and_moe_imatrix_hooks_execute(self):
+        from omlx.patches import mlx_vlm_glm5_next_compat
+        from omlx.oq import _collect_glm5_next_lm_head_imatrix
+        from tests.test_mlx_vlm_glm5_next_compat import _tiny_config
+
+        mlx_vlm_glm5_next_compat.apply_mlx_vlm_glm5_next_compat_patch()
+        from mlx_vlm.models.glm5_next import Model
+
+        config = _tiny_config()
+        config.text_config.n_routed_experts = 4
+        config.text_config.n_shared_experts = 1
+        config.text_config.first_k_dense_replace = 1
+        config.text_config.mlp_layer_types = ["dense", "sparse"]
+        model = Model(config)
+        tokens = mx.array([[1, 2, 3, 4, 5, 6]], dtype=mx.int32)
+        layers = model.language_model.model.layers
+        inputs = model.language_model.model.embed_tokens(tokens)
+        inputs, masks, state = _prepare_layer_inputs(model, layers, tokens, inputs)
+
+        assert inputs.shape == (1, 6, 2, 32)
+        assert state["kind"] == "glm5_next"
+        assert masks[0] is None
+        assert masks[1] is not None
+
+        collector = OQImatrixCollector()
+        linear_attention = layers[0].self_attn
+        assert linear_attention.fuse_in
+        assert collector.install(model) > 0
+        assert not linear_attention.fuse_in
+        try:
+            for layer_idx, layer in enumerate(layers):
+                inputs, _ = _forward_layer_result(
+                    layer,
+                    inputs,
+                    masks[layer_idx],
+                    state,
+                    layer_idx=layer_idx,
+                )
+                mx.eval(inputs)
+
+            assert _collect_glm5_next_lm_head_imatrix(model, inputs, collector)
+            switch_entries = {
+                name: entry
+                for name, entry in collector.entries.items()
+                if ".switch_mlp." in name
+            }
+            assert switch_entries
+            assert "language_model.lm_head" in collector.entries
+            assert "language_model.model.layers.0.self_attn.b_proj" in collector.entries
+            embed_q = "language_model.model.layers.1.self_attn.embed_q"
+            assert embed_q in collector.entries
+            assert collector.entries[embed_q].counts.shape == (2,)
+            assert all(entry.counts.shape == (4,) for entry in switch_entries.values())
+            assert all(int(entry.counts.sum()) > 0 for entry in switch_entries.values())
+        finally:
+            collector.restore(model)
+        assert linear_attention.fuse_in
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")

@@ -352,6 +352,18 @@ def _is_qwen4_exp_ngram_embedding_tensor(path: str, config: dict) -> bool:
     return _QWEN4_EXP_NGRAM_SHARD_RE.search(_normalize_quant_path(path)) is not None
 
 
+def _is_token_embedding_tensor(path: str) -> bool:
+    """Return whether a weight is indexed by token id rather than activations."""
+    return path.lower().endswith(
+        (
+            ".embed_tokens.weight",
+            ".tok_embeddings.weight",
+            ".word_embeddings.weight",
+            ".wte.weight",
+        )
+    )
+
+
 def universal_quant_predicate(
     path: str, module, config: dict, oq_level: int = 4
 ) -> Union[bool, dict]:
@@ -2246,12 +2258,25 @@ class _TrackedTensor:
         new_shape = tuple(self.shape[d] for d in dims)
         if self.transform == "nested_unreplayable":
             return self._unreplayable(shape=new_shape)
+        op = ("moveaxis", src_ax, dst_ax)
+        if len(self.sources) > 1:
+            expr = self.as_expr()
+            expr = self._wrap_expr_op(expr, op) if expr is not None else None
+            if expr is None:
+                return self._unreplayable(shape=new_shape)
+            return _TrackedTensor(
+                new_shape,
+                self.dtype,
+                list(self.sources),
+                "expr",
+                expr=expr,
+            )
         return _TrackedTensor(
             new_shape,
             self.dtype,
             list(self.sources),
             f"moveaxis_{src_ax}_{dst_ax}",
-            recipe=list(self.recipe) + [("moveaxis", src_ax, dst_ax)],
+            recipe=list(self.recipe) + [op],
         )
 
     def transpose(self, *axes):
@@ -2406,6 +2431,7 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
         "contiguous": getattr(mx, "contiguous", None),
         "from_fp8": getattr(mx, "from_fp8", None),
         "pad": getattr(mx, "pad", None),
+        "issubdtype": mx.issubdtype,
     }
 
     def _is_plain_source(tensor):
@@ -2549,6 +2575,28 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
     def _noop(*a, **kw):
         pass
 
+    def _fake_issubdtype(dtype, category):
+        if isinstance(dtype, str):
+            dtype = {
+                "BF16": mx.bfloat16,
+                "F16": mx.float16,
+                "F32": mx.float32,
+                "F64": mx.float32,
+                "F8_E4M3": mx.float16,
+                "F8_E5M2": mx.float16,
+                "F8_E8M0": mx.uint8,
+                "I8": mx.int8,
+                "I16": mx.int16,
+                "I32": mx.int32,
+                "I64": mx.int64,
+                "U8": mx.uint8,
+                "U16": mx.uint16,
+                "U32": mx.uint32,
+                "U64": mx.uint64,
+                "BOOL": mx.bool_,
+            }.get(dtype.upper(), dtype)
+        return _orig["issubdtype"](dtype, category)
+
     mx.stack = _fake_stack
     mx.concatenate = _fake_concatenate
     mx.split = _fake_split
@@ -2558,6 +2606,7 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
     mx.moveaxis = _fake_moveaxis
     mx.transpose = _fake_transpose
     mx.expand_dims = _fake_expand_dims
+    mx.issubdtype = _fake_issubdtype
     if _orig["swapaxes"] is not None:
         mx.swapaxes = _fake_swapaxes
     if _orig["contiguous"] is not None:
@@ -5026,6 +5075,10 @@ def _source_imatrix_signature(
         # Invalidate caches produced by the old independent-block walk, which
         # captured only q_proj in the shared-KV tail of E2B/E4B.
         signature["layer_walk"] = "gemma4_shared_kv_v1"
+    elif str(config.get("model_type", "")).lower() == "glm5_next":
+        # GLM-5.3 needs its mHC-expanded layer walk plus the untied output-head
+        # capture. Older caches completed without either and must not be reused.
+        signature["layer_walk"] = "glm5_next_hc_moe_lm_head_v3"
     return signature
 
 
@@ -5219,6 +5272,10 @@ def _lookup_imatrix_importance(
         # The collector measures Linear/SwitchLinear input channels, not
         # embedding rows. Do not turn the intentionally uniform PLE policy
         # into a missing-entry error under imatrix_strict.
+        return None
+    if _is_token_embedding_tensor(tensor_name):
+        # Embedding columns are gathered by token id, not consumed as input
+        # activation channels, so a Linear-style imatrix entry cannot exist.
         return None
 
     base = tensor_name[: -len(".weight")]
@@ -6334,6 +6391,7 @@ _OQE_MAX_ADAPTIVE_SAMPLES = 1024
 _OQE_MIN_EXPERT_COUNT = 16
 _OQE_MIN_EXPERT_COUNT_PERCENTILE = 5
 _OQE_SWITCH_LINEAR_CLASSES = {"SwitchLinear", "QuantizedSwitchLinear"}
+_OQE_MULTI_LINEAR_CLASSES = {"MultiLinear", "QuantizedMultiLinear"}
 _OQ_CODE_MULTILINGUAL_KEYS = (
     "code",
     "en",
@@ -6647,6 +6705,7 @@ def _find_model_layers(model):
 
 _GEMMA4_LAYER_STATE_KIND = "gemma4_shared_kv"
 _QWEN4_EXP_LAYER_STATE_KIND = "qwen4_exp"
+_GLM5_NEXT_LAYER_STATE_KIND = "glm5_next"
 
 
 def _find_layer_model(model, layers):
@@ -6914,6 +6973,20 @@ def _forward_layer_result(block, inputs, mask, position_ids, layer_idx=None):
         if isinstance(result, tuple):
             return result[0], result[1] if len(result) > 1 else None
         return result, None
+    if (
+        isinstance(position_ids, dict)
+        and position_ids.get("kind") == _GLM5_NEXT_LAYER_STATE_KIND
+    ):
+        try:
+            result = block(inputs, mask=mask, cache=None)
+        except (TypeError, ValueError, RuntimeError, AttributeError) as e:
+            suffix = f" at layer {layer_idx}" if layer_idx is not None else ""
+            raise RuntimeError(
+                f"GLM-5.3 calibration forward failed{suffix}: {e}"
+            ) from e
+        if isinstance(result, tuple):
+            return result[0], result[1] if len(result) > 1 else None
+        return result, None
     if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
         try:
             result = block(
@@ -7094,6 +7167,23 @@ def _prepare_layer_inputs(model, layers, calib_data, inputs):
     )
     if qwen4_exp_inputs is not None:
         return qwen4_exp_inputs
+    if model_type == "glm5_next":
+        language_model = getattr(model, "language_model", None)
+        args = getattr(language_model, "args", None)
+        hc_mult = _object_config_int(args, "hc_mult")
+        if hc_mult <= 0:
+            raise RuntimeError("GLM-5.3 calibration requires a positive hc_mult")
+        hidden = mx.broadcast_to(
+            inputs[:, :, None, :],
+            (inputs.shape[0], inputs.shape[1], hc_mult, inputs.shape[2]),
+        )
+        hidden = mx.contiguous(hidden)
+        attention_mask = create_attention_mask(inputs, None, return_array=True)
+        masks = [
+            None if bool(getattr(layer, "is_linear", False)) else attention_mask
+            for layer in layers
+        ]
+        return hidden, masks, {"kind": _GLM5_NEXT_LAYER_STATE_KIND}
     if model_type.startswith("deepseek_v4"):
         args = model.args
         h = mx.broadcast_to(
@@ -7153,6 +7243,11 @@ class _ImatrixCaptureWrapper(nn.Module):
                 self._collector.collect_switch(
                     self._name, self._module, args[0], args[1]
                 )
+            elif type(self._module).__name__ in _OQE_MULTI_LINEAR_CLASSES:
+                transpose = kwargs.get("transpose", args[1] if len(args) >= 2 else True)
+                self._collector.collect_multi(
+                    self._name, self._module, args[0], transpose=transpose
+                )
             else:
                 self._collector.collect_dense(self._name, self._module, args[0])
         return self._module(*args, **kwargs)
@@ -7164,6 +7259,7 @@ class OQImatrixCollector:
     def __init__(self):
         self.entries: dict[str, OQImatrixEntry] = {}
         self._original_modules: dict[str, Any] = {}
+        self._saved_attributes: list[tuple[Any, str, Any]] = []
         self.capture_module_classes: dict[str, int] = {}
         self.switch_capture_modules = 0
 
@@ -7171,6 +7267,8 @@ class OQImatrixCollector:
     def _is_capture_module(module) -> bool:
         cls = type(module).__name__
         if cls in _OQE_SWITCH_LINEAR_CLASSES:
+            return hasattr(module, "weight") and getattr(module.weight, "ndim", 0) == 3
+        if cls in _OQE_MULTI_LINEAR_CLASSES:
             return hasattr(module, "weight") and getattr(module.weight, "ndim", 0) == 3
         # QuantizedLinear capture lets imatrix collection run against
         # already-quantized checkpoints (e.g. deriving a recalibrated MTP
@@ -7192,6 +7290,15 @@ class OQImatrixCollector:
     def install(self, model) -> int:
         replacements = []
         for name, module in model.named_modules():
+            if type(module).__name__ == "Glm5NextLinearAttention" and bool(
+                getattr(module, "fuse_in", False)
+            ):
+                # The fused KDA input projection reads six Linear weights
+                # directly, bypassing their calls and therefore the capture
+                # wrappers. Calibration temporarily takes the equivalent
+                # unfused path so every input-channel statistic is observed.
+                self._saved_attributes.append((module, "fuse_in", module.fuse_in))
+                module.fuse_in = False
             if not name or not self._is_capture_module(module):
                 continue
             cls = type(module).__name__
@@ -7213,6 +7320,9 @@ class OQImatrixCollector:
                 strict=False,
             )
             self._original_modules.clear()
+        for module, attribute, value in self._saved_attributes:
+            setattr(module, attribute, value)
+        self._saved_attributes.clear()
 
     def _ensure_entry(self, name: str, sums_shape, counts_shape) -> OQImatrixEntry:
         entry = self.entries.get(name)
@@ -7238,6 +7348,39 @@ class OQImatrixCollector:
             entry.counts[0] += x_np.shape[0]
         except Exception as e:
             logger.debug("oQe imatrix dense capture skipped for %s: %s", name, e)
+
+    def collect_multi(self, name: str, module, x, *, transpose: bool = True) -> None:
+        """Capture per-head input energy for MLA MultiLinear weights."""
+        try:
+            if not transpose:
+                # The same MLA projection may be used in reverse. Quantization
+                # groups the stored weight's last dimension, whose matching
+                # activation is observed by the normal transpose=True call.
+                return
+            weight = module.weight
+            n_heads = int(weight.shape[0])
+            bits = getattr(module, "bits", None)
+            in_dim = (
+                int(weight.shape[-1] * 32 // int(bits))
+                if bits and weight.dtype == mx.uint32
+                else int(weight.shape[-1])
+            )
+            if not getattr(x, "shape", ()) or int(x.shape[-1]) != in_dim:
+                return
+            mx.eval(x)
+            x_np = np.asarray(x.astype(mx.float32))
+            if x_np.ndim >= 2 and x_np.shape[-2] in (1, n_heads):
+                per_head = np.moveaxis(x_np, -2, 0).reshape(x_np.shape[-2], -1, in_dim)
+                if per_head.shape[0] == 1 and n_heads > 1:
+                    per_head = np.repeat(per_head, n_heads, axis=0)
+            else:
+                shared = x_np.reshape(-1, in_dim)
+                per_head = np.repeat(shared[None], n_heads, axis=0)
+            entry = self._ensure_entry(name, (n_heads, in_dim), (n_heads,))
+            entry.in_sum2 += np.square(per_head, dtype=np.float32).sum(axis=1)
+            entry.counts += per_head.shape[1]
+        except Exception as e:
+            logger.debug("oQe imatrix multi capture skipped for %s: %s", name, e)
 
     @staticmethod
     def _accumulate_switch(
@@ -7312,6 +7455,29 @@ class OQImatrixCollector:
             self._accumulate_switch(entry, idx_flat, x_source, n_experts, token_ids)
         except Exception as e:
             logger.debug("oQe imatrix switch capture skipped for %s: %s", name, e)
+
+
+def _collect_glm5_next_lm_head_imatrix(model, hidden, collector) -> bool:
+    """Capture the untied GLM-5.3 output head without materializing logits."""
+    if str(getattr(model, "model_type", "")) != "glm5_next":
+        return False
+
+    language_model = getattr(model, "language_model", None)
+    core = getattr(language_model, "model", None)
+    norm = getattr(core, "norm", None)
+    if language_model is None or core is None or norm is None:
+        return False
+
+    name = "language_model.lm_head"
+    module = collector._original_modules.get(name)
+    if module is None:
+        # Tied checkpoints project through embed_tokens and have no lm_head.
+        return False
+
+    if getattr(hidden, "ndim", 0) == 4:
+        hidden = hidden.mean(axis=2)
+    collector.collect_dense(name, module, norm(hidden))
+    return name in collector.entries
 
 
 def _collect_mtp_head_imatrix(
@@ -7530,6 +7696,8 @@ def _collect_imatrix_from_model(
                     )
                     mx.synchronize()
                     mx.clear_cache()
+
+                _collect_glm5_next_lm_head_imatrix(model, inputs, collector)
 
                 # MTP-head pass: the layer walk above leaves ``inputs`` as
                 # the final-layer hidden states; feed them (post-norm) plus
@@ -7773,14 +7941,19 @@ def _collect_imatrix(
         mx.clear_cache()
 
 
-def _oqe_cache_missing_mtp_entries(cache: OQImatrixData, config: dict) -> bool:
+def _oqe_cache_missing_mtp_entries(
+    cache: OQImatrixData, config: dict, model_path: str
+) -> bool:
     """True when the model declares MTP heads but the cache predates the
     MTP-head collection pass (no ``mtp.*`` entries) — force a recollect so
     the head gets calibrated quantization instead of landing in "missing"."""
     try:
-        from omlx.utils.model_loading import _has_mtp_heads
+        from omlx.utils.model_loading import (
+            _checkpoint_has_mtp_weights,
+            _has_mtp_heads,
+        )
 
-        if not _has_mtp_heads(config):
+        if not _has_mtp_heads(config) or not _checkpoint_has_mtp_weights(model_path):
             return False
     except Exception:
         return False
@@ -7817,7 +7990,7 @@ def _load_or_collect_imatrix(
     if reuse_cache and path.exists():
         cache = _load_oqe_imatrix(path)
         if _oqe_cache_matches(cache, expected):
-            if _oqe_cache_missing_mtp_entries(cache, config):
+            if _oqe_cache_missing_mtp_entries(cache, config, model_path):
                 logger.info(
                     "oQe imatrix: cache predates MTP-head collection "
                     "(no mtp.* entries), recollecting %s",

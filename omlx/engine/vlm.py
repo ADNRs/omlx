@@ -2479,6 +2479,45 @@ class VLMBatchedEngine(BaseEngine):
                 )
             ):
                 formatted_messages.append(msg)
+            elif model_type == "glm5_next" and msg_num_images > 0:
+                # mlx-vlm does not yet register glm5_next in MODEL_CONFIG, so
+                # get_message_json() treats it as unsupported and its generic
+                # fallback strips image parts.  Preserve their relative order
+                # as template-visible markers; the checkpoint's native chat
+                # template expands each marker to the GLM image token triplet.
+                glm_content: list[Any] = []
+                inserted_images = 0
+                if isinstance(raw_content, list):
+                    for item in raw_content:
+                        if isinstance(item, dict):
+                            item_type = item.get("type", "")
+                            item_text = item.get("text", "")
+                        else:
+                            item_type = getattr(item, "type", "")
+                            item_text = getattr(item, "text", "")
+
+                        if item_type in image_part_types:
+                            if inserted_images < msg_num_images:
+                                glm_content.append({"type": "image"})
+                                inserted_images += 1
+                        elif item_type == "text":
+                            glm_content.append({"type": "text", "text": item_text})
+                        elif isinstance(item, str):
+                            glm_content.append(item)
+
+                if inserted_images < msg_num_images:
+                    glm_content[:0] = [
+                        {"type": "image"}
+                        for _ in range(msg_num_images - inserted_images)
+                    ]
+                if not any(
+                    isinstance(item, str)
+                    or (isinstance(item, dict) and item.get("type") == "text")
+                    for item in glm_content
+                ):
+                    glm_content.append({"type": "text", "text": content})
+
+                formatted_messages.append({"role": role, "content": glm_content})
             else:
                 formatted = get_message_json(
                     model_type,
