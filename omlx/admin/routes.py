@@ -675,8 +675,9 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
     converter actually preserved the MTP tensors, using the loader's
     ``_checkpoint_has_mtp_weights`` so native nextn layouts
     (``model.layers.<num_hidden_layers + i>.*``, e.g. GLM-5.2) count as
-    present (issue #2326). Default mlx-lm converters strip ``mtp.*``;
-    PR 990 ships a separate path that keeps them.
+    present (issue #2326). Qwen4-Exp uses its narrower runtime detector,
+    which accepts only embedded ``mtp.*`` tensors. Default mlx-lm converters
+    strip ``mtp.*``; PR 990 ships a separate path that keeps them.
     """
     import json
     from pathlib import Path
@@ -726,6 +727,11 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
             return False, (
                 "MTPLX side-car detected but not imported. Import it to "
                 "merge the MTP head into the checkpoint index."
+            )
+        if model_type == "qwen4_exp":
+            return False, (
+                "Qwen4-Exp Lightning MTP requires embedded mtp.* tensors; "
+                "native nextn layers are not supported by its dedicated runtime."
             )
         return False, (
             "Config declares MTP layers but the weight files contain neither "
@@ -2708,6 +2714,15 @@ async def update_model_settings(
                     ),
                 )
             if not _checkpoint_has_mtp_weights(entry.model_path):
+                if model_type == "qwen4_exp":
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Qwen4-Exp Lightning MTP requires embedded mtp.* "
+                            "tensors; native nextn layers are not supported by "
+                            "its dedicated runtime."
+                        ),
+                    )
                 raise HTTPException(
                     status_code=400,
                     detail=(

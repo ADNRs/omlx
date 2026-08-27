@@ -32,13 +32,21 @@ QWEN4_EXP_CONFIG = {
 }
 
 
-def _make_checkpoint(tmp_path, config, mtp_weights, name="Qwen3.8-Flash-Next"):
+def _make_checkpoint(
+    tmp_path,
+    config,
+    mtp_weights,
+    name="Qwen3.8-Flash-Next",
+    nextn_weights=False,
+):
     model_dir = tmp_path / name
     model_dir.mkdir()
     (model_dir / "config.json").write_text(json.dumps(config))
     weight_map = {"model.layers.0.mlp.down.weight": "model.safetensors"}
     if mtp_weights:
         weight_map["mtp.fc_hidden.weight"] = "model.safetensors"
+    if nextn_weights:
+        weight_map["model.layers.48.self_attn.q_proj.weight"] = "model.safetensors"
     (model_dir / "model.safetensors.index.json").write_text(
         json.dumps({"metadata": {}, "weight_map": weight_map})
     )
@@ -60,6 +68,19 @@ class TestMtpCompatForModelQwen4Exp:
         # whitelist: the weights check is what the runtime path enforces.
         assert "whitelist" not in reason
         assert "mtp.* tensors" in reason
+
+    def test_qwen4_exp_with_only_nextn_weights_is_blocked(self, tmp_path):
+        config = json.loads(json.dumps(QWEN4_EXP_CONFIG))
+        config["text_config"]["num_nextn_predict_layers"] = 1
+        model_dir = _make_checkpoint(
+            tmp_path,
+            config,
+            mtp_weights=False,
+            nextn_weights=True,
+        )
+        ok, reason = _mtp_compat_for_model({"model_path": str(model_dir)})
+        assert not ok
+        assert "native nextn layers are not supported" in reason
 
     def test_qwen4_exp_without_mtp_heads_is_blocked(self, tmp_path):
         config = {"model_type": "qwen4_exp", "text_config": {}}
