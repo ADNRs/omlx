@@ -34,6 +34,7 @@ except ImportError:
 
 from omlx.model_discovery import (
     MLX_LM_TEXT_ONLY_MODEL_TYPES,
+    VLM_NATIVE_TEXT_MODEL_TYPES,
     _has_vision_subconfig,
 )
 
@@ -146,7 +147,7 @@ def _is_vlm_load(config: dict) -> bool:
     ``mlx_vlm.speculative.drafters.<type>`` lookup and fails.
     """
     model_type = str(config.get("model_type", "")).lower().replace("-", "_")
-    return (
+    return model_type in VLM_NATIVE_TEXT_MODEL_TYPES or (
         _has_vision_subconfig(config)
         and model_type not in MLX_LM_TEXT_ONLY_MODEL_TYPES
     )
@@ -315,7 +316,13 @@ def _glm_indexer_q8_override(path: str, config: dict) -> dict | None:
     while making the saved checkpoint incompatible with the fused Q8 loader.
     Keep backbone and preserved-MTP indexers on the same explicit format.
     """
-    if config.get("model_type") != "glm_moe_dsa":
+    text_config = config.get("text_config")
+    text_model_type = (
+        text_config.get("model_type") if isinstance(text_config, dict) else None
+    )
+    if config.get("model_type") not in ("glm_moe_dsa", "glm5_next") and (
+        text_model_type != "glm5_next_text"
+    ):
         return None
     path = _normalize_quant_path(path)
     if ".self_attn.indexer." not in path:
@@ -3761,6 +3768,7 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
     is_vlm = (
         any("ForConditionalGeneration" in a for a in architectures)
         or _has_vision_subconfig(config)
+        or model_type in VLM_NATIVE_TEXT_MODEL_TYPES
     ) and not (text_only or mlx_lm_text_only)
 
     if is_vlm:
@@ -3793,8 +3801,14 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
                     )
 
                     apply_mlx_vlm_muse_glimmer_compat_patch()
+                if model_type == "glm5_next":
+                    from omlx.patches.mlx_vlm_glm5_next_compat import (
+                        apply_mlx_vlm_glm5_next_compat_patch,
+                    )
+
+                    apply_mlx_vlm_glm5_next_compat_patch()
             except Exception as patch_err:
-                logger.debug(f"MiniMax M3 mlx-vlm patch not applied: {patch_err}")
+                logger.debug(f"mlx-vlm compatibility patch not applied: {patch_err}")
 
             from mlx_vlm.utils import get_model_and_args, sanitize_weights
 
@@ -3886,6 +3900,31 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
                 # discovery works without instantiating the full model.
                 _lm_proxy = type("_LMProxy", (), {})()
                 _lm_proxy.args = text_config
+                if model_type == "glm5_next":
+                    attention_proxy = type("_AttentionProxy", (), {"embed_q": None})
+                    layer_proxy = type(
+                        "_LayerProxy",
+                        (),
+                        {"self_attn": attention_proxy()},
+                    )
+                    _lm_proxy.model = type(
+                        "_ModelProxy",
+                        (),
+                        {
+                            "layers": [
+                                layer_proxy()
+                                for _ in range(text_config.num_hidden_layers)
+                            ]
+                        },
+                    )()
+                    _lm_proxy.sanitize = lambda weights: model_module.LanguageModel.sanitize(
+                        _lm_proxy, weights
+                    )
+                    _vision_proxy = type("_VisionProxy", (), {})()
+                    _vision_proxy.sanitize = (
+                        lambda weights: model_module.VisionModel.sanitize(weights)
+                    )
+                    proxy.vision_model = _vision_proxy
                 proxy.language_model = _lm_proxy
                 # Model.sanitize is an instance method (self, weights) for most
                 # VLMs, but a @staticmethod (weights) for the DeepSeek-OCR family
@@ -3902,12 +3941,19 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
                 # (inkling's __init__ has no VisionModel); a missing class
                 # simply has no per-tower sanitize to run.
                 vision_cls = getattr(model_module, "VisionModel", None)
-                if vision_cls is not None:
+                if vision_cls is not None and model_type != "glm5_next":
                     w = sanitize_weights(vision_cls, w, vision_config)
                 language_cls = getattr(model_module, "LanguageModel", None)
-                if language_cls is not None:
+                if language_cls is not None and model_type != "glm5_next":
                     w = sanitize_weights(language_cls, w, text_config)
                 return w
+
+            if model_type == "glm5_next":
+                from mlx_vlm.models.glm5_next.language import (
+                    glm5_next_cast_predicate,
+                )
+
+                _vlm_sanitize._omlx_cast_predicate = glm5_next_cast_predicate
 
             logger.info(
                 f"Using mlx-vlm full sanitize chain for "
