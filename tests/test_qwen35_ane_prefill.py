@@ -3115,23 +3115,10 @@ def test_compile_cache_native_gate_is_exact_opt_in(ane_mm):
 
 def test_compile_cache_covers_all_four_native_compile_sites(ane_mm):
     """Individual linear, single fused SwiGLU/down, linear banks, and fused
-    banks use one instance-aware cache/fallback implementation."""
+    banks use one content-hash cache/fallback implementation."""
     assert ane_mm.count("load_or_compile_ane_model(") == 5
     assert ane_mm.count("model, identifier, ane_instance") == 4
     assert ane_mm.count("@selector(compileWithQoS:options:error:)") == 1
-
-
-def test_compile_cache_cleanup_refuses_paths_resolving_outside_root(ane_mm):
-    """A cache-rooted path that resolves elsewhere must be left alone, while
-    the historical temp path still deletes directly."""
-    body = re.search(
-        r"void remove_ane_staging_directory\(NSString \*directory\) noexcept \{.*?\n\}",
-        ane_mm,
-        re.S,
-    )
-    assert body, "remove_ane_staging_directory() is absent from qwen35_ane.mm"
-    assert "ANE compile cache cleanup skipped" in body.group()
-    assert "stringByResolvingSymlinksInPath" in body.group()
 
 
 def test_compile_cache_cleanup_keeps_the_entry_lock_file_stable(ane_mm):
@@ -3149,45 +3136,66 @@ def test_compile_cache_cleanup_keeps_the_entry_lock_file_stable(ane_mm):
 def test_compile_cache_keeps_historical_delete_on_unload(ane_mm):
     """Apple owns the compiled AOT cache; oMLX staging files remain temporary."""
     assert "persistent_" not in ane_mm
-    assert ane_mm.count("remove_ane_staging_directory(directory_)") == 2
-    assert "ScopedAneCacheLock cache_lock(directory);" in ane_mm
+    assert ane_mm.count(
+        "remove_ane_staging_directory(directory_, cache_lock_entry_)"
+    ) == 2
+    assert "ScopedAneCacheLock cache_lock(cache_lock_entry);" in ane_mm
     assert "ANE compile cache cleanup deferred" in ane_mm
     assert "NSTemporaryDirectory()" in ane_mm
 
 
 def test_compile_cache_hit_restores_without_recompiling(ane_mm):
-    assert "@selector(setModelURL:)" in ane_mm
+    """The framework-derived URL and descriptor hash must remain authoritative.
+
+    macOS 27 verifies the in-memory model's per-file hashes and rejects the
+    caller-assigned staging URL that rc3 introduced in both cache modes.
+    """
+    assert "setModelURL:" not in ane_mm
+    assert "fileURLWithPath:" not in ane_mm
     assert "@selector(compiledModelExists)" in ane_mm
     assert re.search(r"if \(!restored\) \{\s*compile_fresh\(\);\s*\}", ane_mm)
+    assert re.search(
+        r"return \{\s*staged \? directory : nil,\s*"
+        r"staged \? cache_lock_entry : nil,\s*\};",
+        ane_mm,
+    )
 
 
 def test_compile_cache_hit_load_failure_invalidates_then_compiles_once(ane_mm):
     assert "ANE compile cache fallback" in ane_mm
+    assert "@selector(purgeCompiledModel)" in ane_mm
     assert ane_mm.count("compile_fresh();") == 2
     assert ane_mm.count("@selector(loadWithQoS:options:error:)") == 2
+    fallback = ane_mm.index('NSLog(@"oMLX: ANE compile cache fallback')
+    purge = ane_mm.index("@selector(purgeCompiledModel)", fallback)
+    recompile = ane_mm.index("compile_fresh();", purge)
+    assert fallback < purge < recompile
 
 
-def test_compile_cache_path_is_stable_per_os_and_instance(ane_mm):
+def test_compile_cache_lock_key_matches_native_content_hash(ane_mm):
     assert "NSCachesDirectory" in ane_mm
     assert 'stringByAppendingPathComponent:@"v1"' in ane_mm
     assert "operatingSystemVersionString" in ane_mm
-    assert re.search(r'@"%@\.i%d"', ane_mm)
-    assert "fileURLWithPath:directory" in ane_mm
+    assert "ane_compile_cache_lock_entry(NSString *identifier)" in ane_mm
+    assert '.i%d"' not in ane_mm
+    assert "stringByAppendingPathComponent:identifier" in ane_mm
 
 
 def test_compile_cache_serializes_cross_process_writers(ane_mm):
     assert "#include <sys/file.h>" in ane_mm
     assert re.search(r"flock\(.*LOCK_EX", ane_mm)
-    assert "Hold the entry lock from probe through load" in ane_mm
+    assert "Hold the descriptor-hash lock from probe through load" in ane_mm
 
 
 def test_compile_cache_fails_open_when_root_or_lock_is_unavailable(ane_mm):
     assert "ANE compile cache unavailable" in ane_mm
     assert "temporary" in ane_mm
 
+
 def test_compile_cache_telemetry_uses_native_log_prefix(ane_mm):
     for event in ("hit", "miss", "fallback"):
         assert f'@"oMLX: ANE compile cache {event}' in ane_mm
+
 
 def test_compile_cache_lock_acquisition_is_bounded(ane_mm):
     """A suspended holder must not hang later loads: non-blocking flock with a
@@ -3195,12 +3203,6 @@ def test_compile_cache_lock_acquisition_is_bounded(ane_mm):
     assert "LOCK_EX | LOCK_NB" in ane_mm
     assert "kAneCacheLockTimeout" in ane_mm
     assert "ANE compile cache lock acquisition timed out" in ane_mm
-
-
-def test_compile_cache_staging_delete_resolves_symlinks(ane_mm):
-    """The cache-root prefix check must compare resolved paths so a symlink
-    under the root cannot redirect the delete outside it."""
-    assert "stringByResolvingSymlinksInPath" in ane_mm
 
 class _ReleasableModel(nn.Module):
     def __init__(self):
