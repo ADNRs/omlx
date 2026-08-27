@@ -34,6 +34,13 @@ class ImageURL(BaseModel):
     detail: Optional[str] = "auto"  # "low", "high", "auto"
 
 
+class VideoURL(BaseModel):
+    """Inline base64 video data URI for video-capable VLMs."""
+
+    url: str
+    fps: Optional[float] = 2.0
+
+
 class InputAudio(BaseModel):
     """Audio input data for multimodal models (OpenAI format)."""
 
@@ -69,6 +76,7 @@ class ContentPart(BaseModel):
     type: str  # "text", "image_url", "input_audio", or "file"
     text: Optional[str] = None
     image_url: Optional[ImageURL] = None
+    video_url: Optional[VideoURL] = None
     input_audio: Optional[InputAudio] = None
     file: Optional[FileContent] = None
 

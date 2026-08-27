@@ -73,6 +73,15 @@ class TestContentPart:
         assert part.file.filename == "sample.pdf"
         assert part.file.file_data.endswith("ZA==")
 
+    def test_video_url_content_part(self):
+        part = ContentPart(
+            type="video_url",
+            video_url={"url": "data:video/mp4;base64,AAAA", "fps": 3},
+        )
+
+        assert part.video_url.url.startswith("data:video/mp4")
+        assert part.video_url.fps == 3
+
 
 class TestMessage:
     """Tests for Message model."""

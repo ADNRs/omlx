@@ -419,6 +419,38 @@ class TestExtractImagesFromMessages:
         assert "Describe this image and audio" in text_msgs[0]["content"]
 
 
+def test_extract_inline_video_when_requested():
+    frames = MagicMock(name="frames")
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe"},
+                {
+                    "type": "video_url",
+                    "video_url": {
+                        "url": "data:video/mp4;base64,AAAA",
+                        "fps": 3,
+                    },
+                },
+            ],
+        }
+    ]
+
+    with patch(
+        "omlx.utils.image.load_video_data_uri", return_value=(frames, 3.0)
+    ) as load:
+        text, images, audio, videos = extract_images_from_messages(
+            messages, include_videos=True
+        )
+
+    load.assert_called_once_with("data:video/mp4;base64,AAAA", fps=3)
+    assert text == [{"role": "user", "content": "Describe"}]
+    assert images == []
+    assert audio == []
+    assert videos == [frames]
+
+
 # =============================================================================
 # Tests: compute_image_hash
 # =============================================================================
