@@ -621,9 +621,10 @@ class TestUpdateGlobalSettingsAudioUpload:
         assert gs.server.max_audio_upload_size == "250MB"
         gs.save.assert_called_once()
 
-    def test_rejects_invalid_max_audio_upload_size(self):
+    @pytest.mark.parametrize("value", ["bogus", "1e999MB"])
+    def test_rejects_invalid_max_audio_upload_size(self, value):
         gs = _make_global_settings()
-        request = GlobalSettingsRequest(max_audio_upload_size="bogus")
+        request = GlobalSettingsRequest(max_audio_upload_size=value)
 
         with _patched_global_settings(gs):
             with pytest.raises(HTTPException) as exc_info:

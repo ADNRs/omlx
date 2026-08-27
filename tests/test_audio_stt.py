@@ -409,7 +409,7 @@ class TestSTTEndpointBasic:
                 data={"model": "whisper-tiny"},
             )
         assert response.status_code == 413
-        assert "1024" in response.json()["detail"]
+        assert "1024" in response.json()["error"]["message"]
 
     def test_upload_within_raised_limit_returns_200(self, server_audio_client):
         """Raising the limit allows an upload that the default cap would reject."""
