@@ -60,15 +60,19 @@ def test_qwen4_exp_mlx_metadata_is_hidden_during_load(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_qwen4_exp_loader_defers_parameter_eval_to_materialize(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    ("model_type", "expected_lazy"),
+    [("qwen4_exp", True), ("qwen2_vl", None)],
+)
+async def test_only_qwen4_exp_loader_defers_parameter_eval_to_materialize(
+    tmp_path, monkeypatch, model_type, expected_lazy
 ):
     import mlx_vlm.utils as vlm_utils
 
     from omlx.utils import model_loading
 
     (tmp_path / "config.json").write_text(
-        json.dumps({"model_type": "qwen4_exp"}), encoding="utf-8"
+        json.dumps({"model_type": model_type}), encoding="utf-8"
     )
     captured = {}
 
@@ -90,7 +94,10 @@ async def test_qwen4_exp_loader_defers_parameter_eval_to_materialize(
     with pytest.raises(RuntimeError, match="stop after load"):
         await VLMBatchedEngine(model_name=str(tmp_path)).start()
 
-    assert captured["lazy"] is True
+    if expected_lazy is None:
+        assert "lazy" not in captured
+    else:
+        assert captured["lazy"] is expected_lazy
 
 
 def test_qwen4_exp_loader_enables_adaptive_depth_three_lightning_mtp(tmp_path):

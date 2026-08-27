@@ -1643,7 +1643,8 @@ class VLMBatchedEngine(BaseEngine):
                     model, processor = custom_loaded
                     return model, processor
 
-                if _read_config_model_type(self._model_name) == COHERE2_MOE_MODEL_TYPE:
+                model_type = _read_config_model_type(self._model_name)
+                if model_type == COHERE2_MOE_MODEL_TYPE:
                     return _load_cohere2_moe_text_model(
                         self._model_name,
                         trust_remote_code=self._trust_remote_code,
@@ -1651,10 +1652,14 @@ class VLMBatchedEngine(BaseEngine):
                 with _load_optiq_vision_sidecar_on_load(
                     Path(self._model_name)
                 ):
+                    load_kwargs = {
+                        "trust_remote_code": self._trust_remote_code,
+                    }
+                    if model_type == QWEN4_EXP_MODEL_TYPE:
+                        load_kwargs["lazy"] = True
                     loaded = vlm_load(
                         self._model_name,
-                        lazy=True,
-                        trust_remote_code=self._trust_remote_code,
+                        **load_kwargs,
                     )
                     return loaded
 
