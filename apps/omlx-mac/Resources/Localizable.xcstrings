@@ -20063,6 +20063,42 @@
         }
       }
     },
+    "settings.advanced.qwen4_ssd_offload.forced" : {
+      "comment" : "Sublabel when Qwen4 PLE SSD offload is forced by memory limits",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Required because resident loading exceeds the configured model-memory limit."
+          }
+        }
+      }
+    },
+    "settings.advanced.qwen4_ssd_offload.label" : {
+      "comment" : "Row label for the Qwen4 PLE SSD mmap toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SSD N-gram Offload (Qwen4 only)"
+          }
+        }
+      }
+    },
+    "settings.advanced.qwen4_ssd_offload.sub" : {
+      "comment" : "Sublabel for the Qwen4 PLE SSD mmap toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keep the PLE N-gram table on SSD to save memory. Prefill can be slower after context changes."
+          }
+        }
+      }
+    },
     "settings.advanced.experimental.section" : {
       "comment" : "Section header above the Experimental settings group",
       "extractionState" : "manual",

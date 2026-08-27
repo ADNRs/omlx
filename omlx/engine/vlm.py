@@ -1655,29 +1655,6 @@ class VLMBatchedEngine(BaseEngine):
                         self._model_name,
                         trust_remote_code=self._trust_remote_code,
                     )
-                    if _read_config_model_type(self._model_name) == QWEN4_EXP_MODEL_TYPE:
-                        processor = loaded[1]
-                        if not hasattr(processor, "video_processor"):
-                            from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import (
-                                Qwen3VLVideoProcessor,
-                            )
-
-                            image_processor = processor.image_processor
-                            processor.video_processor = Qwen3VLVideoProcessor(
-                                patch_size=getattr(image_processor, "patch_size", 16),
-                                temporal_patch_size=getattr(
-                                    image_processor, "temporal_patch_size", 2
-                                ),
-                                merge_size=getattr(image_processor, "merge_size", 2),
-                                min_pixels=getattr(
-                                    image_processor, "min_pixels", 128 * 32 * 32
-                                ),
-                                max_pixels=getattr(
-                                    image_processor, "max_pixels", 32 * 32 * 768
-                                ),
-                                image_mean=getattr(image_processor, "image_mean", None),
-                                image_std=getattr(image_processor, "image_std", None),
-                            )
                     return loaded
 
         loop = asyncio.get_running_loop()
@@ -2378,7 +2355,6 @@ class VLMBatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         num_images: int,
         num_audios: int = 0,
-        num_videos: int = 0,
     ) -> tuple[list[dict[str, Any]], list[tuple[int, int]]]:
         """Format VLM messages with image/audio tokens on media-bearing user turns."""
         from mlx_vlm.prompt_utils import extract_text_from_content, get_message_json
@@ -2391,7 +2367,6 @@ class VLMBatchedEngine(BaseEngine):
 
         image_part_types = {"image", "image_url", "input_image"}
         audio_part_types = {"input_audio"}
-        video_part_types = {"video", "video_url", "input_video"}
         has_explicit_images = any(
             isinstance(msg, dict)
             and self._count_content_parts(msg.get("content"), image_part_types) > 0
@@ -2406,10 +2381,8 @@ class VLMBatchedEngine(BaseEngine):
 
         remaining_images = num_images
         remaining_audios = num_audios
-        remaining_videos = num_videos
         assigned_fallback_images = False
         assigned_fallback_audios = False
-        assigned_fallback_videos = False
         formatted_messages: list[dict[str, Any]] = []
         image_message_ranges: list[tuple[int, int]] = []
 
@@ -2423,16 +2396,12 @@ class VLMBatchedEngine(BaseEngine):
 
             msg_num_images = 0
             msg_num_audios = 0
-            msg_num_videos = 0
             if role == "user":
                 explicit_images = self._count_content_parts(
                     raw_content, image_part_types
                 )
                 explicit_audios = self._count_content_parts(
                     raw_content, audio_part_types
-                )
-                explicit_videos = self._count_content_parts(
-                    raw_content, video_part_types
                 )
                 if explicit_images > 0 and remaining_images > 0:
                     msg_num_images = min(explicit_images, remaining_images)
@@ -2457,14 +2426,6 @@ class VLMBatchedEngine(BaseEngine):
                     msg_num_audios = remaining_audios
                     remaining_audios = 0
                     assigned_fallback_audios = True
-
-                if explicit_videos > 0 and remaining_videos > 0:
-                    msg_num_videos = min(explicit_videos, remaining_videos)
-                    remaining_videos -= msg_num_videos
-                elif remaining_videos > 0 and not assigned_fallback_videos:
-                    msg_num_videos = remaining_videos
-                    remaining_videos = 0
-                    assigned_fallback_videos = True
 
             if msg_num_images > 0:
                 image_message_ranges.append((idx, msg_num_images))
@@ -2493,15 +2454,10 @@ class VLMBatchedEngine(BaseEngine):
                     skip_audio_token=role != "user" or msg_num_audios == 0,
                     num_images=msg_num_images,
                     num_audios=msg_num_audios,
-                    video=(
-                        ["inline-video"] * msg_num_videos
-                        if msg_num_videos
-                        else None
-                    ),
                 )
                 # Collapse text-only list content to plain string so that
                 # simplified chat templates (without render_content macro)
-                # can handle it.  Image/audio/video parts stay as list.
+                # can handle it. Image/audio parts stay as a list.
                 fc = formatted.get("content")
                 if isinstance(fc, list) and all(
                     isinstance(p, dict) and p.get("type") == "text" for p in fc
@@ -2594,8 +2550,6 @@ class VLMBatchedEngine(BaseEngine):
         # Strategy 2: qwen-style (vision_tower + grid_thw)
         if model_type in _QWEN_VISION_MODELS:
             grid_thw = extra_model_inputs.get("image_grid_thw")
-            if grid_thw is None:
-                grid_thw = extra_model_inputs.get("video_grid_thw")
             if grid_thw is None:
                 return None
             dtype = model.vision_tower.patch_embed.proj.weight.dtype
@@ -2810,7 +2764,6 @@ class VLMBatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         images: list[Any],
         audio: list | None = None,
-        videos: list | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
         tools: list[dict] | None = None,
         is_partial: bool | None = None,
@@ -2861,7 +2814,6 @@ class VLMBatchedEngine(BaseEngine):
 
         num_images = len(images)
         num_audios = len(audio) if audio else 0
-        num_videos = len(videos) if videos else 0
 
         model_type = self.model_type or ""
         if model_type == COHERE2_MOE_MODEL_TYPE and (
@@ -2874,7 +2826,7 @@ class VLMBatchedEngine(BaseEngine):
             )
         if model_type == QWEN4_EXP_MODEL_TYPE and num_audios > 0:
             raise InvalidRequestError(
-                "Qwen4-Exp supports text, image, and video input but not audio.",
+                "Qwen4-Exp supports text and image input but not audio.",
                 field="messages",
             )
 
@@ -2907,7 +2859,6 @@ class VLMBatchedEngine(BaseEngine):
                     messages,
                     num_images=num_images,
                     num_audios=num_audios,
-                    num_videos=num_videos,
                 )
             )
         except Exception as e:
@@ -3013,14 +2964,11 @@ class VLMBatchedEngine(BaseEngine):
             self._processor,
             images=images if images else None,
             audio=audio if audio else None,
-            videos=videos if videos else None,
             prompts=[prompt] if isinstance(prompt, str) else prompt,
         )
 
         input_ids = inputs["input_ids"]
         pixel_values = inputs.get("pixel_values")
-        if pixel_values is None and num_videos:
-            pixel_values = inputs.get("pixel_values_videos")
         attention_mask = inputs.get("attention_mask")
 
         image_cache_key_start = 0
@@ -3104,16 +3052,13 @@ class VLMBatchedEngine(BaseEngine):
                 "input_ids",
                 "attention_mask",
                 "pixel_values",
-                "pixel_values_videos",
             )
             and v is not None
         }
 
         # Check for any multimodal inputs: images or audio
         has_audio = "input_features" in extra_model_inputs
-        has_multimodal = (
-            pixel_values is not None and (num_images > 0 or num_videos > 0)
-        ) or has_audio
+        has_multimodal = (pixel_values is not None and num_images > 0) or has_audio
 
         if has_multimodal:
             # Build call kwargs from extra_model_inputs (includes input_features
@@ -4045,9 +3990,7 @@ class VLMBatchedEngine(BaseEngine):
             Tuple of (prompt_or_token_ids, vlm_embeds, vlm_kwargs, image_hash)
         """
         # Extract images from messages
-        text_messages, images, audio, videos = extract_images_from_messages(
-            messages, include_videos=True
-        )
+        text_messages, images, audio = extract_images_from_messages(messages)
 
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
@@ -4055,11 +3998,7 @@ class VLMBatchedEngine(BaseEngine):
         # Keep VLM-capable models on one prompt-rendering path, even before the
         # first image arrives. Otherwise the conversation switches prompt families
         # on the first image-bearing turn and invalidates early prefix blocks.
-        vlm_messages = (
-            self._apply_ocr_prompt(messages)
-            if images
-            else (messages if videos else text_messages)
-        )
+        vlm_messages = self._apply_ocr_prompt(messages) if images else text_messages
         template_tools = convert_tools_for_template(tools) if tools else None
         (
             token_ids,
@@ -4072,13 +4011,12 @@ class VLMBatchedEngine(BaseEngine):
             vlm_messages,
             images,
             audio=audio if audio else None,
-            videos=videos if videos else None,
             chat_template_kwargs=ct_kwargs,
             tools=template_tools,
             is_partial=partial,
         )
 
-        if images or videos:
+        if images:
             # Free Metal intermediates from vision encoding.
             mx.synchronize()
             mx.clear_cache()

@@ -70,11 +70,29 @@ def is_applied() -> bool:
 def configure_qwen4_exp_runtime(
     model_path: str | Path,
     mode: str | None = None,
+    *,
+    mtp_enabled: bool = False,
 ) -> str:
-    """Select resident or SSD-backed PLE before model construction."""
+    """Select PLE storage and optional Lightning MTP before construction."""
     apply_mlx_vlm_qwen4_exp_compat_patch()
-    from mlx_vlm.models.qwen4_exp.language import configure_ple_runtime
+    from mlx_vlm.models.qwen4_exp.language import (
+        configure_mtp_runtime,
+        configure_ple_runtime,
+    )
 
     resolved = configure_ple_runtime(model_path, mode=mode)
+    mtp_runtime = configure_mtp_runtime(model_path, enabled=mtp_enabled)
     logger.info("Qwen4-Exp PLE mode for %s: %s", model_path, resolved)
+    if mtp_enabled and not mtp_runtime.enabled:
+        logger.warning(
+            "Qwen4-Exp Lightning MTP was requested for %s, but no embedded "
+            "MTP tensors were found",
+            model_path,
+        )
+    elif mtp_runtime.enabled:
+        logger.info(
+            "Qwen4-Exp Lightning MTP enabled for %s (checkpoint layout: %s)",
+            model_path,
+            mtp_runtime.checkpoint_prefix,
+        )
     return resolved

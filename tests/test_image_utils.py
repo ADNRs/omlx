@@ -419,8 +419,7 @@ class TestExtractImagesFromMessages:
         assert "Describe this image and audio" in text_msgs[0]["content"]
 
 
-def test_extract_inline_video_when_requested():
-    frames = MagicMock(name="frames")
+def test_video_input_is_rejected():
     messages = [
         {
             "role": "user",
@@ -437,18 +436,8 @@ def test_extract_inline_video_when_requested():
         }
     ]
 
-    with patch(
-        "omlx.utils.image.load_video_data_uri", return_value=(frames, 3.0)
-    ) as load:
-        text, images, audio, videos = extract_images_from_messages(
-            messages, include_videos=True
-        )
-
-    load.assert_called_once_with("data:video/mp4;base64,AAAA", fps=3)
-    assert text == [{"role": "user", "content": "Describe"}]
-    assert images == []
-    assert audio == []
-    assert videos == [frames]
+    with pytest.raises(InvalidRequestError, match="Video input is not supported"):
+        extract_images_from_messages(messages)
 
 
 # =============================================================================

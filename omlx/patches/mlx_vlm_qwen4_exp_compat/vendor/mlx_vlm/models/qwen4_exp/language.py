@@ -5,7 +5,9 @@ import math
 import mmap
 import os
 import struct
+import weakref
 from bisect import bisect_right
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -21,12 +23,81 @@ from ..qwen3_5.language import (
     Qwen3_5GatedDeltaNet,
     _create_qwen3_5_attention_mask,
     _create_qwen3_5_ssm_mask,
+    _target_verify_linear,
 )
 from ..qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 from .config import ModelConfig, TextConfig
 
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
+
+
+@dataclass(frozen=True)
+class Qwen4ExpMTPRuntime:
+    """Lightning MTP construction decision for the next model load."""
+
+    enabled: bool = False
+    checkpoint_prefix: str | None = None
+
+
+_MTP_RUNTIME = Qwen4ExpMTPRuntime()
+
+
+def configure_mtp_runtime(
+    model_path: str | Path,
+    *,
+    enabled: bool,
+) -> Qwen4ExpMTPRuntime:
+    """Detect and bind an embedded Qwen4 Lightning MTP checkpoint head."""
+    global _MTP_RUNTIME
+
+    checkpoint_prefix = None
+    if enabled:
+        model_path = Path(model_path)
+        index_path = model_path / "model.safetensors.index.json"
+        if index_path.is_file():
+            try:
+                weight_map = json.loads(index_path.read_text()).get("weight_map") or {}
+            except (OSError, ValueError):
+                weight_map = {}
+            for prefix in (
+                "mtp.",
+                "language_model.mtp.",
+                "model.mtp.",
+                "model.language_model.mtp.",
+            ):
+                if any(key.startswith(prefix) for key in weight_map):
+                    checkpoint_prefix = prefix
+                    break
+        else:
+            try:
+                import safetensors
+
+                for shard in sorted(model_path.glob("*.safetensors")):
+                    with safetensors.safe_open(str(shard), framework="numpy") as file:
+                        for prefix in (
+                            "mtp.",
+                            "language_model.mtp.",
+                            "model.mtp.",
+                            "model.language_model.mtp.",
+                        ):
+                            if any(key.startswith(prefix) for key in file.keys()):
+                                checkpoint_prefix = prefix
+                                break
+                    if checkpoint_prefix is not None:
+                        break
+            except Exception:
+                checkpoint_prefix = None
+
+    _MTP_RUNTIME = Qwen4ExpMTPRuntime(
+        enabled=bool(enabled and checkpoint_prefix),
+        checkpoint_prefix=checkpoint_prefix,
+    )
+    return _MTP_RUNTIME
+
+
+def get_mtp_runtime() -> Qwen4ExpMTPRuntime:
+    return _MTP_RUNTIME
 
 
 def resolve_ple_runtime_mode(
@@ -77,6 +148,10 @@ def configure_ple_runtime(model_path: str | Path, mode: str | None = None) -> st
         physical_memory=physical_memory,
     )
     _PLE_RUNTIME_MODEL_PATH = ple_path
+    return _PLE_RUNTIME_MODE
+
+
+def get_ple_runtime_mode() -> str:
     return _PLE_RUNTIME_MODE
 
 
@@ -639,15 +714,25 @@ class Qwen4ExpQSAIndexer(nn.Module):
         hidden_states: mx.array,
         cache: Optional[QSAKVCache],
         position_ids: Optional[mx.array],
+        target_verify: bool = False,
     ) -> Optional[mx.array]:
-        batch, seq_len, _ = hidden_states.shape
+        projected = _target_verify_linear(
+            self.index_qk_proj, hidden_states, target_verify
+        )
+        return self.from_projected(projected, cache, position_ids)
+
+    def from_projected(
+        self,
+        qk: mx.array,
+        cache: Optional[QSAKVCache],
+        position_ids: Optional[mx.array],
+    ) -> Optional[mx.array]:
+        batch, seq_len, _ = qk.shape
         past_len = cache.offset if cache is not None else 0
         if position_ids is None:
             position_ids = self._default_position_ids(batch, past_len, seq_len)
 
-        qk = self.index_qk_proj(hidden_states).reshape(
-            batch, seq_len, self.n_heads + self.kv_heads, self.head_dim
-        )
+        qk = qk.reshape(batch, seq_len, self.n_heads + self.kv_heads, self.head_dim)
         query = qk[:, :, : self.n_heads]
         raw_keys = qk[:, :, self.n_heads :].squeeze(2)
         query = self.q_layernorm(query).transpose(0, 2, 1, 3)
@@ -746,8 +831,14 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         cache: Optional[Any] = None,
         position_ids: Optional[mx.array] = None,
         position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
+        target_verify: bool = False,
     ) -> mx.array:
-        qsa_mask = self.indexer(x, cache, position_ids)
+        qsa_mask = self.indexer(
+            x,
+            cache,
+            position_ids,
+            target_verify=target_verify,
+        )
         if qsa_mask is not None:
             if mask is None or (isinstance(mask, str) and mask == "causal"):
                 mask = qsa_mask
@@ -766,6 +857,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             cache=cache,
             position_ids=position_ids,
             position_embeddings=position_embeddings,
+            target_verify=target_verify,
         )
 
 
@@ -791,17 +883,35 @@ class Qwen4ExpGatedResidual(nn.Module):
                 hc_hidden_size, self.hc_count, bias=False
             )
 
-    def __call__(self, hyper_input: mx.array):
+    def __call__(self, hyper_input: mx.array, target_verify: bool = False):
         normed = self.hc_norm(hyper_input)
-        mix = nn.silu(self.input_mix_weight_down(normed) / self.hc_count)
-        mix = mx.sigmoid(self.input_mix_weight_up(mix))
+        mix = nn.silu(
+            _target_verify_linear(
+                self.input_mix_weight_down,
+                normed,
+                target_verify,
+            )
+            / self.hc_count
+        )
+        mix = mx.sigmoid(
+            _target_verify_linear(
+                self.input_mix_weight_up,
+                mix,
+                target_verify,
+            )
+        )
         mix = mix.reshape(*mix.shape[:-1], self.hc_count, self.hidden_size)
         streams = normed.reshape(*normed.shape[:-1], self.hc_count, self.hidden_size)
         mixed_input = mx.mean(mix * streams, axis=-2)
         if "block_inject_weight" not in self:
             return mixed_input
         injection_weights = 2 * mx.sigmoid(
-            self.block_inject_weight(normed) / self.hc_count
+            _target_verify_linear(
+                self.block_inject_weight,
+                normed,
+                target_verify,
+            )
+            / self.hc_count
         )
         return mixed_input, hyper_input, injection_weights
 
@@ -855,7 +965,7 @@ def _find_nth_prime_after(start: int, count: int) -> int:
 
 
 class _SafeTensorMMap:
-    """Read sparse BF16 embedding rows without making the table resident."""
+    """Read selected dense or affine-packed rows without resident weights."""
 
     def __init__(self, path: Path):
         self.path = path
@@ -872,23 +982,39 @@ class _SafeTensorMMap:
     def tensor_shape(self, key: str) -> tuple[int, ...]:
         return tuple(self._header[key]["shape"])
 
+    def tensor_dtype(self, key: str) -> str:
+        return str(self._header[key]["dtype"])
+
     def rows(self, key: str, rows: list[int]) -> mx.array:
         entry = self._header[key]
-        if entry["dtype"] != "BF16":
-            raise TypeError(f"SSD-backed Qwen4 PLE requires BF16, got {entry['dtype']}")
         shape = tuple(entry["shape"])
         start, end = entry["data_offsets"]
-        if len(shape) != 2 or end - start != math.prod(shape) * 2:
+        dtype = entry["dtype"]
+        dtype_info = {
+            "BF16": (np.dtype("<u2"), 2),
+            "F16": (np.dtype("<f2"), 2),
+            "F32": (np.dtype("<f4"), 4),
+            "U32": (np.dtype("<u4"), 4),
+            "F8_E4M3": (np.dtype("u1"), 1),
+        }.get(dtype)
+        if dtype_info is None:
+            raise TypeError(f"SSD-backed Qwen4 PLE does not support {dtype}")
+        np_dtype, item_size = dtype_info
+        if len(shape) != 2 or end - start != math.prod(shape) * item_size:
             raise ValueError(f"Invalid sparse PLE tensor layout for {key}")
         view = np.ndarray(
             shape,
-            dtype=np.dtype("<u2"),
+            dtype=np_dtype,
             buffer=self._mapping,
             offset=self._data_start + start,
         )
         copied = np.array(view[np.asarray(rows, dtype=np.intp)], copy=True)
-        values = (copied.astype(np.uint32) << np.uint32(16)).view(np.float32)
-        return mx.array(values).astype(mx.bfloat16)
+        if dtype == "BF16":
+            values = (copied.astype(np.uint32) << np.uint32(16)).view(np.float32)
+            return mx.array(values).astype(mx.bfloat16)
+        if dtype == "F8_E4M3":
+            return mx.from_fp8(mx.array(copied), dtype=mx.bfloat16)
+        return mx.array(copied)
 
     def close(self):
         if self._mapping is not None:
@@ -900,7 +1026,7 @@ class _SafeTensorMMap:
 
 
 class DiskBackedShardedEmbedding(nn.Module):
-    """The official 128-way PLE table, gathered directly from SSD mmap."""
+    """The 128-way dense or oQ-affine PLE table, gathered from SSD mmap."""
 
     def __init__(
         self,
@@ -920,29 +1046,137 @@ class DiskBackedShardedEmbedding(nn.Module):
             offsets.append(offsets[-1] + size)
         self.shard_offsets = tuple(offsets)
         self.dims = dims
+        self.weight_scale = mx.ones((1,), dtype=mx.bfloat16)
         self._prefix = prefix
         self.rows_read = 0
         self.last_touched_shards: tuple[int, ...] = ()
         self._readers: dict[str, _SafeTensorMMap] = {}
         self._tensor_readers: dict[str, _SafeTensorMMap] = {}
+        self._shard_specs: dict[
+            int, tuple[str, str | None, str | None, int | None, int | None]
+        ] = {}
 
         model_path = Path(model_path)
         index_path = model_path / "model.safetensors.index.json"
         weight_map = json.loads(index_path.read_text()).get("weight_map", {})
-        for shard_index, shard_size in enumerate(self.shard_sizes):
-            key = f"{prefix}.shard_{shard_index}.weight"
-            filename = weight_map.get(key)
-            if filename is None:
-                raise KeyError(f"SSD-backed PLE tensor {key!r} is absent")
+
+        def register_reader(key: str) -> _SafeTensorMMap:
+            filename = weight_map[key]
             reader = self._readers.get(filename)
             if reader is None:
                 reader = _SafeTensorMMap(model_path / filename)
                 self._readers[filename] = reader
-            if reader.tensor_shape(key) != (shard_size, dims):
-                raise ValueError(
-                    f"Unexpected shape for {key}: {reader.tensor_shape(key)}"
-                )
             self._tensor_readers[key] = reader
+            return reader
+
+        runtime_prefix = prefix
+        if runtime_prefix.startswith("model.language_model."):
+            runtime_prefix = (
+                "language_model.model." + runtime_prefix[len("model.language_model.") :]
+            )
+        for shard_index, shard_size in enumerate(self.shard_sizes):
+            bases = (
+                f"{prefix}.shard_{shard_index}",
+                f"{prefix}.shards.{shard_index}",
+                f"{runtime_prefix}.shard_{shard_index}",
+                f"{runtime_prefix}.shards.{shard_index}",
+            )
+            base = next(
+                (
+                    candidate
+                    for candidate in bases
+                    if f"{candidate}.weight" in weight_map
+                ),
+                None,
+            )
+            if base is None:
+                raise KeyError(
+                    f"SSD-backed PLE shard {shard_index} is absent; "
+                    f"checked {', '.join(bases)}"
+                )
+
+            weight_key = f"{base}.weight"
+            scales_key = f"{base}.scales"
+            biases_key = f"{base}.biases"
+            weight_reader = register_reader(weight_key)
+            weight_shape = weight_reader.tensor_shape(weight_key)
+            weight_dtype = weight_reader.tensor_dtype(weight_key)
+            if len(weight_shape) != 2 or weight_shape[0] != shard_size:
+                raise ValueError(f"Unexpected shape for {weight_key}: {weight_shape}")
+
+            if scales_key not in weight_map and biases_key not in weight_map:
+                if weight_shape[1] != dims:
+                    raise ValueError(
+                        f"Unexpected dense PLE width for {weight_key}: "
+                        f"expected {dims}, got {weight_shape[1]}"
+                    )
+                if weight_dtype not in {"BF16", "F16", "F32", "F8_E4M3"}:
+                    raise TypeError(
+                        f"SSD-backed dense Qwen4 PLE does not support {weight_dtype}"
+                    )
+                self._shard_specs[shard_index] = (
+                    weight_key,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                continue
+
+            if scales_key not in weight_map or biases_key not in weight_map:
+                raise ValueError(
+                    f"Incomplete affine PLE tensors for {base}: both scales and "
+                    "biases are required"
+                )
+            if weight_dtype != "U32":
+                raise TypeError(
+                    f"Affine Qwen4 PLE weight must be U32, got {weight_dtype} "
+                    f"for {weight_key}"
+                )
+
+            scales_reader = register_reader(scales_key)
+            biases_reader = register_reader(biases_key)
+            scales_shape = scales_reader.tensor_shape(scales_key)
+            biases_shape = biases_reader.tensor_shape(biases_key)
+            if scales_shape != biases_shape or len(scales_shape) != 2:
+                raise ValueError(
+                    f"Invalid affine PLE parameter shapes for {base}: "
+                    f"scales={scales_shape}, biases={biases_shape}"
+                )
+            if scales_shape[0] != shard_size or scales_shape[1] <= 0:
+                raise ValueError(
+                    f"Unexpected affine PLE scale shape for {base}: {scales_shape}"
+                )
+            if dims % scales_shape[1] != 0:
+                raise ValueError(
+                    f"Cannot infer affine PLE group size for {base}: "
+                    f"dims={dims}, scales={scales_shape}"
+                )
+            group_size = dims // scales_shape[1]
+            packed_bits = weight_shape[1] * 32
+            if packed_bits % dims != 0:
+                raise ValueError(
+                    f"Cannot infer affine PLE bits for {base}: "
+                    f"dims={dims}, packed_shape={weight_shape}"
+                )
+            bits = packed_bits // dims
+            if bits not in {2, 3, 4, 5, 6, 8} or group_size not in {32, 64, 128}:
+                raise ValueError(
+                    f"Unsupported affine PLE layout for {base}: "
+                    f"bits={bits}, group_size={group_size}"
+                )
+            if dims % group_size or weight_shape[1] != dims * bits // 32:
+                raise ValueError(
+                    f"Inconsistent affine PLE layout for {base}: "
+                    f"weight={weight_shape}, scales={scales_shape}, dims={dims}"
+                )
+            self._shard_specs[shard_index] = (
+                weight_key,
+                scales_key,
+                biases_key,
+                bits,
+                group_size,
+            )
 
     def __call__(self, indices: mx.array) -> mx.array:
         shape = indices.shape
@@ -960,14 +1194,32 @@ class DiskBackedShardedEmbedding(nn.Module):
         result = mx.zeros((len(host_indices), self.dims), dtype=mx.bfloat16)
         for shard_index in touched:
             positions = [
-                i for i, current_shard in enumerate(shard_indices)
+                i
+                for i, current_shard in enumerate(shard_indices)
                 if current_shard == shard_index
             ]
             local = [
                 host_indices[i] - self.shard_offsets[shard_index] for i in positions
             ]
-            key = f"{self._prefix}.shard_{shard_index}.weight"
-            values = self._tensor_readers[key].rows(key, local)
+            weight_key, scales_key, biases_key, bits, group_size = self._shard_specs[
+                shard_index
+            ]
+            values = self._tensor_readers[weight_key].rows(weight_key, local)
+            if bits is not None:
+                assert scales_key is not None
+                assert biases_key is not None
+                assert group_size is not None
+                scales = self._tensor_readers[scales_key].rows(scales_key, local)
+                biases = self._tensor_readers[biases_key].rows(biases_key, local)
+                values = mx.dequantize(
+                    values,
+                    scales,
+                    biases,
+                    group_size=group_size,
+                    bits=bits,
+                    mode="affine",
+                )
+            values = values.astype(mx.bfloat16) * self.weight_scale
             self.rows_read += len(local)
             result = result.at[mx.array(positions, dtype=mx.int32)].add(values)
         return result.reshape(*shape, self.dims)
@@ -977,6 +1229,7 @@ class DiskBackedShardedEmbedding(nn.Module):
             reader.close()
         self._readers.clear()
         self._tensor_readers.clear()
+        self._shard_specs.clear()
 
     @property
     def _prefix(self):
@@ -999,6 +1252,9 @@ class ShardedEmbedding(nn.Module):
             base + (1 if index < remainder else 0) for index in range(num_shards)
         )
         self.shards = [nn.Embedding(size, dims) for size in self.shard_sizes]
+        # Official FP8 checkpoints keep one shared scale for every PLE shard.
+        # Decode only the selected rows so the 100 GB table stays compact.
+        self.weight_scale = mx.ones((1,), dtype=mx.bfloat16)
         offsets = [0]
         for size in self.shard_sizes:
             offsets.append(offsets[-1] + size)
@@ -1032,6 +1288,9 @@ class ShardedEmbedding(nn.Module):
             ]
             positions = mx.array(positions_list, dtype=mx.int32)
             values = self.shards[shard_index](mx.array(local_indices, dtype=mx.int32))
+            if values.dtype == mx.uint8:
+                values = mx.from_fp8(values, dtype=mx.bfloat16)
+            values = values * self.weight_scale
             if result is None:
                 result = mx.zeros((len(host_indices), self.dims), dtype=values.dtype)
             result = result.at[positions].add(values)
@@ -1217,12 +1476,13 @@ class Qwen4ExpPLELayer(nn.Module):
         input_ids: mx.array,
         cache: Optional[ArraysCache],
         mask: Optional[mx.array],
+        target_verify: bool = False,
     ):
         embeddings = self.ple_embedding(input_ids, cache)
-        keys = self.norm_key(self.key_proj(embeddings)).reshape(
-            *hidden_states.shape[:-1], self.hc_count, self.hidden_size
-        )
-        values = self.value_proj(embeddings)
+        keys = self.norm_key(
+            _target_verify_linear(self.key_proj, embeddings, target_verify)
+        ).reshape(*hidden_states.shape[:-1], self.hc_count, self.hidden_size)
+        values = _target_verify_linear(self.value_proj, embeddings, target_verify)
         queries = self.norm_query(hidden_states).reshape(
             *hidden_states.shape[:-1], self.hc_count, self.hidden_size
         )
@@ -1265,26 +1525,46 @@ class Qwen4ExpDecoderLayer(nn.Module):
         mask: Optional[mx.array],
         cache: Optional[Any],
         position_ids: Optional[mx.array],
+        gdn_sink=None,
+        target_verify: bool = False,
     ):
         if "ple" in self:
             hidden_states = hidden_states + self.ple(
-                hidden_states, input_ids, cache, mask
+                hidden_states,
+                input_ids,
+                cache,
+                mask,
+                target_verify=target_verify,
             )
 
         mixed, hyper_input, injection_weights = self.attn_hyper_connection(
-            hidden_states
+            hidden_states,
+            target_verify=target_verify,
         )
         if self.is_linear:
-            branch = self.linear_attn(mixed, mask=mask, cache=cache)
+            branch = self.linear_attn(
+                mixed,
+                mask=mask,
+                cache=cache,
+                gdn_sink=gdn_sink,
+                target_verify=target_verify,
+            )
         else:
             branch = self.self_attn(
-                mixed, mask=mask, cache=cache, position_ids=position_ids
+                mixed,
+                mask=mask,
+                cache=cache,
+                position_ids=position_ids,
+                target_verify=target_verify,
             )
         injection = branch[..., None, :] * injection_weights[..., None]
         hidden_states = hyper_input + injection.reshape(*hyper_input.shape)
 
-        mixed, hyper_input, injection_weights = self.mlp_hyper_connection(hidden_states)
-        branch = self.mlp(mixed)
+        mixed, hyper_input, injection_weights = self.mlp_hyper_connection(
+            hidden_states,
+            target_verify=target_verify,
+        )
+        branch = self.mlp(mixed, target_verify=target_verify)
         injection = branch[..., None, :] * injection_weights[..., None]
         return hyper_input + injection.reshape(*hyper_input.shape)
 
@@ -1315,6 +1595,7 @@ class Qwen4ExpModel(nn.Module):
         position_ids: Optional[mx.array] = None,
         capture_layer_ids=None,
         hidden_sink=None,
+        gdn_sink=None,
         **kwargs,
     ):
         del kwargs
@@ -1339,11 +1620,138 @@ class Qwen4ExpModel(nn.Module):
                 mask=layer_mask,
                 cache=layer_cache,
                 position_ids=position_ids,
+                gdn_sink=gdn_sink,
+                target_verify=gdn_sink is not None,
             )
             if hidden_sink is not None and index in capture:
-                hidden_sink.append(self.hyper_connection_mixer(hidden_states))
+                hidden_sink.append(
+                    self.hyper_connection_mixer(
+                        hidden_states,
+                        target_verify=gdn_sink is not None,
+                    )
+                )
 
-        return self.hyper_connection_mixer(hidden_states)
+        if inputs_embeds is None and gdn_sink is None:
+            host_ref = getattr(self, "_omlx_mtp_prime_host", None)
+            host = host_ref() if host_ref is not None else None
+            if host is not None:
+                from omlx.patches.mlx_lm_mtp import prompt_priming
+
+                if prompt_priming.capture_eligible(host, cache):
+                    prompt_priming.maybe_capture(
+                        host,
+                        inputs,
+                        hidden_states,
+                        cache,
+                    )
+
+        if hidden_sink is not None and capture_layer_ids == []:
+            # Lightning MTP consumes all residual streams before the final
+            # mixer. Ordinary layer captures retain their mixed representation.
+            hidden_sink.append(hidden_states)
+
+        return self.hyper_connection_mixer(
+            hidden_states,
+            target_verify=gdn_sink is not None,
+        )
+
+
+class Qwen4ExpMTPModule(nn.Module):
+    """Embedded one-layer draft head for Qwen4 Lightning MTP."""
+
+    def __init__(self, args: TextConfig):
+        super().__init__()
+        self.hidden_size = args.hidden_size
+        self.hc_count = args.hc_count
+        hc_hidden_size = self.hc_count * self.hidden_size
+        self.pre_fc_norm_embedding = Qwen4ExpRMSNorm(
+            self.hidden_size,
+            eps=args.rms_norm_eps,
+        )
+        self.pre_fc_norm_hidden = Qwen4ExpRMSNorm(
+            hc_hidden_size,
+            eps=args.rms_norm_eps,
+        )
+        self.fc_embedding = nn.Linear(
+            self.hidden_size,
+            self.hidden_size,
+            bias=False,
+        )
+        self.fc_hidden = nn.Linear(
+            self.hidden_size,
+            self.hidden_size,
+            bias=False,
+        )
+
+        layer_config = replace(
+            args,
+            num_hidden_layers=1,
+            layer_types=["qwen_sparse_attention"],
+            full_attention_interval=1,
+            ple_layer_ids=[],
+        )
+        self.layers = [Qwen4ExpDecoderLayer(layer_config, layer_idx=0)]
+        self.hyper_connection_mixer = Qwen4ExpGatedResidual(
+            layer_config,
+            use_combine=False,
+        )
+
+    def fuse_inputs(
+        self,
+        token_embeddings: mx.array,
+        hidden_states: mx.array,
+    ) -> mx.array:
+        expected_width = self.hc_count * self.hidden_size
+        if hidden_states.ndim == 4:
+            hidden_states = hidden_states.reshape(
+                *hidden_states.shape[:-2],
+                expected_width,
+            )
+        if hidden_states.ndim != 3 or hidden_states.shape[-1] != expected_width:
+            raise ValueError(
+                "Qwen4 Lightning MTP expects hidden shape "
+                "[batch, tokens, hc_count * hidden_size]."
+            )
+
+        projected_embedding = self.fc_embedding(
+            self.pre_fc_norm_embedding(token_embeddings)
+        )
+        hidden_streams = self.pre_fc_norm_hidden(hidden_states).reshape(
+            *hidden_states.shape[:-1],
+            self.hc_count,
+            self.hidden_size,
+        )
+        projected_hidden = self.fc_hidden(hidden_streams)
+        return (projected_embedding[..., None, :] + projected_hidden).reshape(
+            hidden_states.shape
+        )
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        next_token_ids: mx.array,
+        embed_tokens,
+        cache=None,
+    ) -> tuple[mx.array, mx.array]:
+        hidden_states = self.fuse_inputs(
+            embed_tokens(next_token_ids),
+            hidden_states,
+        )
+        if cache is None:
+            cache = [None] * len(self.layers)
+        mask = _create_qwen3_5_attention_mask(
+            hidden_states,
+            cache[0] if cache else None,
+        )
+        for layer, layer_cache in zip(self.layers, cache):
+            hidden_states = layer(
+                hidden_states,
+                next_token_ids,
+                mask=mask,
+                cache=layer_cache,
+                position_ids=None,
+            )
+        return self.hyper_connection_mixer(hidden_states), hidden_states
 
 
 class LanguageModel(Qwen3_5LanguageModel):
@@ -1353,10 +1761,76 @@ class LanguageModel(Qwen3_5LanguageModel):
         self.config = config
         self.model_type = args.model_type
         self.model = Qwen4ExpModel(args)
+        self.model._omlx_mtp_prime_host = weakref.ref(self)
         self._position_ids = None
         self._rope_deltas = None
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def bind_mtp_owner(self, owner) -> None:
+        """Reference a root-level Lightning MTP head without double registration."""
+        self._omlx_qwen4_mtp_owner = weakref.ref(owner)
+        self._enable_mtp_decode_markers()
+
+    def _enable_mtp_decode_markers(self) -> None:
+        from omlx.patches.mlx_lm_mtp import get_mtp_depth
+
+        self._omlx_mtp_decode_enabled = True
+        self._omlx_mtp_chain = True
+        self._omlx_mtp_depth = get_mtp_depth()
+        self._omlx_mtp_head_prenorm = True
+
+    def get_mtp_module(self):
+        module = getattr(self, "mtp", None)
+        if module is not None:
+            return module
+        owner_ref = getattr(self, "_omlx_qwen4_mtp_owner", None)
+        owner = owner_ref() if owner_ref is not None else None
+        return getattr(owner, "mtp", None) if owner is not None else None
+
+    def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
+        return_hidden = bool(kwargs.get("return_hidden", False))
+        mtp_capture = return_hidden and kwargs.get("capture_layer_ids") is None
+        if mtp_capture:
+            kwargs["capture_layer_ids"] = []
+        output = super().__call__(inputs, inputs_embeds, mask, cache, **kwargs)
+        if mtp_capture and output.hidden_states:
+            output.hidden_states = [output.hidden_states[0]]
+        return output
+
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache,
+        return_hidden: bool = False,
+        logits_keep: int = 0,
+    ):
+        mtp = self.get_mtp_module()
+        if mtp is None:
+            raise RuntimeError(
+                "Qwen4 Lightning MTP forward called without an attached head."
+            )
+        mtp_output, hc_hidden = mtp(
+            hidden_states,
+            next_token_ids,
+            self.model.embed_tokens,
+            mtp_cache,
+        )
+        logits_source = mtp_output
+        if logits_keep and logits_source.shape[1] > logits_keep:
+            logits_source = logits_source[:, -logits_keep:, :]
+        if self.args.tie_word_embeddings:
+            logits = self.model.embed_tokens.as_linear(logits_source)
+        else:
+            logits = self.lm_head(logits_source)
+        if return_hidden:
+            return logits, hc_hidden
+        return logits
+
+    def make_mtp_cache(self):
+        mtp = self.get_mtp_module()
+        return [QSAKVCache() for _ in mtp.layers] if mtp is not None else []
 
     def make_cache(self):
         caches = []

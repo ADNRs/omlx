@@ -8,6 +8,7 @@ import json
 import re
 from typing import Any, List
 
+from ..exceptions import InvalidRequestError
 from .openai_models import Message
 
 # Model families whose chat templates consume message.reasoning_content directly.
@@ -173,7 +174,7 @@ def _extract_text_from_content_list(content: list) -> str:
 def _extract_multimodal_content_list(content: list) -> list:
     """Extract text, image, and audio parts from a content array.
 
-    Keeps text, image_url, video_url, and input_audio items for VLM processing.
+    Keeps text, image_url, and input_audio items for VLM processing.
     Other content types (tool_use, thinking, refusal, etc.) are dropped.
     """
     parts = []
@@ -240,13 +241,10 @@ def _extract_multimodal_content_list(content: list) -> list:
                         }
                     )
             elif item_type in ("video_url", "input_video"):
-                video_value = item.get("video_url", item.get("input_video"))
-                if isinstance(video_value, str):
-                    video_value = {"url": video_value}
-                if isinstance(video_value, dict) and video_value.get("url"):
-                    parts.append(
-                        {"type": "video_url", "video_url": video_value}
-                    )
+                raise InvalidRequestError(
+                    "Video input is not supported by oMLX.",
+                    field="messages",
+                )
     return parts
 
 
@@ -1269,7 +1267,7 @@ def extract_multimodal_content(
         elif isinstance(content, list):
             # Preserve image_url and input_audio parts for VLM processing
             multimodal_parts = _extract_multimodal_content_list(content)
-            multimodal_types = {"image_url", "video_url", "input_audio"}
+            multimodal_types = {"image_url", "input_audio"}
             has_multimodal = any(
                 p.get("type") in multimodal_types for p in multimodal_parts
             )
