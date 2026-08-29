@@ -951,6 +951,34 @@ class TestStaticCeiling:
             result = enforcer._get_static_ceiling()
         assert result == 10 * 1024**3
 
+    def test_capability_ceiling_uses_static_ram_and_metal_cap(self):
+        gib = 1024**3
+        with (
+            patch("omlx.settings.get_system_memory", return_value=128 * gib),
+            patch(
+                "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+                return_value=int(107.5 * gib),
+            ),
+        ):
+            result = pme.get_memory_capability_ceiling_bytes("balanced")
+
+        assert result == int(107.5 * gib)
+
+    def test_capability_ceiling_respects_explicit_custom_limit(self):
+        gib = 1024**3
+        with (
+            patch("omlx.settings.get_system_memory", return_value=128 * gib),
+            patch(
+                "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+                return_value=int(107.5 * gib),
+            ),
+        ):
+            result = pme.get_memory_capability_ceiling_bytes(
+                "custom", 70 * gib
+            )
+
+        assert result == 70 * gib
+
 
 class TestDynamicCeilingActiveRatio:
     """Dynamic ceiling sums free + inactive + active * tier ratio
