@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Monkey-patch for ml-explore/mlx-lm PR #990 — Qwen3.5/3.6 native MTP.
+"""Monkey-patch for ml-explore/mlx-lm PR #990 — Qwen3.5/3.6 Lightning MTP.
 
 Adds an MTP head to ``mlx_lm.models.qwen3_5.TextModel`` (the language-model
 half) and a pass-through on ``mlx_lm.models.qwen3_5.Model`` (the VLM-outer
@@ -51,6 +51,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+from ..dflash_lifecycle import get_dflash_guard_base, set_dflash_guard_base
 from . import prompt_priming
 
 logger = logging.getLogger(__name__)
@@ -60,7 +61,7 @@ def _is_our_method(cls: Any, attr: str, marker: str) -> bool:
 
     Used as a self-healing idempotency check: when another patch (e.g.
     dflash's speculative hook) overwrites ``__call__`` between two
-    Native-MTP loads in the same process, the marker disappears and the
+    Lightning MTP loads in the same process, the marker disappears and the
     caller knows to re-apply. Reading from ``cls.__dict__`` instead of
     ``getattr`` avoids resolving inherited attributes — only what is
     actually defined on this class counts.
@@ -243,17 +244,9 @@ def _patch_gated_delta_net(q35: Any) -> None:
     # DFlash engine's speculative hook and its generations degenerate into
     # repetition loops. Instead install our body as the guard's fallback
     # base: dflash traffic keeps its hook, MTP/batched traffic gets ours.
-    try:
-        from ..dflash_lifecycle import (
-            dflash_owns_call,
-            get_backup_base,
-            swap_backup_base,
-        )
-    except ImportError:
-        dflash_owns_call = None  # type: ignore[assignment]
-    if dflash_owns_call is not None and dflash_owns_call(cls):
-        if getattr(get_backup_base(cls), "_omlx_mtp_call_marker", False):
-            return  # our body already sits under the dflash guard
+    dflash_base = get_dflash_guard_base(cls)
+    if getattr(dflash_base, "_omlx_mtp_call_marker", False):
+        return  # our body already sits under the dflash guard
 
     import mlx.core as mx
     import mlx.nn as nn
@@ -373,11 +366,10 @@ def _patch_gated_delta_net(q35: Any) -> None:
 
     cls._process_chunk = _process_chunk
     __call__._omlx_mtp_call_marker = True
-    if dflash_owns_call is not None and dflash_owns_call(cls):
+    if dflash_base is not None:
         # Compose with the armed dflash guard instead of replacing it
         # (issue #2972): our body becomes the guard's fallback base.
-        if not swap_backup_base(cls, __call__):
-            cls.__call__ = __call__
+        set_dflash_guard_base(cls, __call__)
     else:
         cls.__call__ = __call__
 
