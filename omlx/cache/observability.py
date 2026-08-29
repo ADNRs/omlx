@@ -127,6 +127,15 @@ class BoundarySnapshotDiagnostics:
         }.get(event)
 
         with self._lock:
+            cause = None
+            if (
+                event == "store_skip"
+                and self._last_event is not None
+                and self._last_event.get("event") == "override_miss"
+                and self._last_event.get("request_id") == request_id
+            ):
+                cause = self._last_event.get("reason")
+
             if counter is not None:
                 self._counters[counter] += 1
             if event == "capture_success" and storage in {"ssd", "memory"}:
@@ -143,6 +152,7 @@ class BoundarySnapshotDiagnostics:
                 ("source", source),
                 ("storage", storage),
                 ("available_boundaries", available_boundaries),
+                ("cause", cause),
             ):
                 if value is not None:
                     last_event[key] = value
@@ -157,6 +167,13 @@ class BoundarySnapshotDiagnostics:
                     dict(self._last_event) if self._last_event is not None else None
                 ),
             }
+
+    def clear(self) -> None:
+        with self._lock:
+            for name in self._counters:
+                self._counters[name] = 0
+            self._reasons.clear()
+            self._last_event = None
 
 
 def _window_label(seconds: int) -> str:

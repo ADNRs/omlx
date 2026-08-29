@@ -1734,6 +1734,13 @@ class TestSchedulerReset:
     def test_reset_clears_state(self, mock_model, mock_tokenizer):
         """Test reset() clears all scheduler state."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._boundary_snapshot_diagnostics.record(
+            "capture_attempt",
+            request_id="before-reset",
+            token_count=4,
+            block_size=4,
+        )
+        scheduler._last_prefix_cache_lookup = {"request_id": "before-reset"}
 
         # Add some requests
         for i in range(3):
@@ -1751,11 +1758,35 @@ class TestSchedulerReset:
         assert len(scheduler.running) == 0
         assert len(scheduler.requests) == 0
         assert scheduler.batch_generator is None
+        diagnostics = scheduler._boundary_snapshot_diagnostics.snapshot()
+        assert diagnostics["capture_attempts"] == 0
+        assert diagnostics["last_event"] is None
+        assert scheduler._last_prefix_cache_lookup is None
         # reset() only drops Python references (bytes move INTO the pooled
         # cache), so an enforcer reclaim request must survive it: the
         # enforcer never re-issues below hard pressure, and dropping the
         # request anywhere re-opens the 2179 wedge.
         assert scheduler._pending_reclaim_request is True
+
+    def test_cache_recovery_clears_cache_observability(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler._boundary_snapshot_diagnostics.record(
+            "capture_attempt",
+            request_id="before-recovery",
+            token_count=4,
+            block_size=4,
+        )
+        scheduler._last_prefix_cache_lookup = {"request_id": "before-recovery"}
+
+        scheduler._recover_from_cache_error()
+
+        diagnostics = scheduler._boundary_snapshot_diagnostics.snapshot()
+        assert diagnostics["capture_attempts"] == 0
+        assert diagnostics["last_event"] is None
+        assert scheduler._last_prefix_cache_lookup is None
 
     def test_reset_clears_async_store_cache_bookkeeping(
         self, mock_model, mock_tokenizer
@@ -2597,6 +2628,7 @@ class TestSchedulerBoundarySnapshots:
             "boundary_snapshot_unavailable": 1,
             "no_snapshots": 1,
         }
+        assert diagnostics["last_event"]["cause"] == "no_snapshots"
         assert "reason=boundary_snapshot_unavailable" in caplog.text
 
     def test_prefix_lookup_observation_explains_reprefill_boundary(

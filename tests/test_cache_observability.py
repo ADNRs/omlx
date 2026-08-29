@@ -278,3 +278,43 @@ def test_boundary_snapshot_diagnostics_are_structured_and_thread_safe():
         "source": "prefill",
         "storage": "memory",
     }
+
+
+def test_boundary_snapshot_diagnostics_preserve_store_skip_cause():
+    diagnostics = BoundarySnapshotDiagnostics()
+    diagnostics.record(
+        "override_miss",
+        reason="ssd_load_failed",
+        request_id="req-a",
+        token_count=4096,
+        block_size=2048,
+        available_boundaries=2,
+    )
+
+    diagnostics.record(
+        "store_skip",
+        reason="boundary_snapshot_unavailable",
+        request_id="req-a",
+        token_count=4096,
+        block_size=2048,
+        available_boundaries=2,
+    )
+
+    assert diagnostics.snapshot()["last_event"]["cause"] == "ssd_load_failed"
+
+
+def test_boundary_snapshot_diagnostics_clear_resets_state():
+    diagnostics = BoundarySnapshotDiagnostics()
+    diagnostics.record(
+        "capture_attempt",
+        request_id="req-a",
+        token_count=4096,
+        block_size=2048,
+    )
+
+    diagnostics.clear()
+
+    snapshot = diagnostics.snapshot()
+    assert snapshot["capture_attempts"] == 0
+    assert snapshot["reasons"] == {}
+    assert snapshot["last_event"] is None
