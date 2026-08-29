@@ -1231,6 +1231,10 @@ _KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
         "BatchTurboQuantKVCache",
         "ChunkedKVCache",
         "MiniMaxM3KVCache",
+        # Both QSA handlers support block slicing, so their growing KV and
+        # index state must not be copied into every boundary snapshot.
+        "QSAKVCache",
+        "QSAQuantizedKVCache",
     }
 )
 
