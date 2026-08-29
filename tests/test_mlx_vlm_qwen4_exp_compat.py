@@ -612,48 +612,9 @@ def test_qwen4_ple_ordinary_forward_disarms_stale_snapshot():
     assert getattr(ple_cache, "_qwen4_exp_ple_speculative_state", None) is None
 
 
-def test_qwen4_ple_rollback_fails_closed_on_incomplete_snapshot():
-    """An aborted verify forward can leave a half-written snapshot. Rollback must
-    reject it before mutating any cache, not apply a mixed-epoch state."""
+def test_qwen4_ple_rollback_validates_accepted_count_before_qsa_mutation():
     config = _tiny_config()
-    from mlx_vlm.models.qwen4_exp.language import (
-        LanguageModel,
-        _PLESpeculativeRollbackError,
-    )
-
-    model = LanguageModel(config.text_config, config)
-    cache = model.make_cache()
-    model(mx.array([[2, 3, 4]], dtype=mx.int32), cache=cache)
-    verified = model(
-        mx.array([[5, 6]], dtype=mx.int32), cache=cache, return_hidden=True
-    )
-
-    ple_cache, qsa_cache = cache[0], cache[1]
-    before_hist = mx.array(ple_cache[3])
-    before_conv = mx.array(ple_cache[2])
-    before_offset = int(qsa_cache.offset)
-
-    ple_cache._qwen4_exp_ple_speculative_state.complete = False
-    with pytest.raises(_PLESpeculativeRollbackError):
-        model.rollback_speculative_cache(
-            cache, verified.gdn_states, accepted=0, block_size=2
-        )
-
-    mx.eval(ple_cache[3], ple_cache[2])
-    assert mx.array_equal(ple_cache[3], before_hist).item()
-    assert mx.array_equal(ple_cache[2], before_conv).item()
-    assert int(qsa_cache.offset) == before_offset
-    assert getattr(ple_cache, "_qwen4_exp_ple_speculative_state", None) is None
-
-
-def test_qwen4_ple_rollback_validates_snapshot_before_qsa_mutation():
-    """A malformed accepted-count aborts the whole rollback with QSA/GDN
-    untouched (validation runs before the inherited rollback)."""
-    config = _tiny_config()
-    from mlx_vlm.models.qwen4_exp.language import (
-        LanguageModel,
-        _PLESpeculativeRollbackError,
-    )
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel
 
     model = LanguageModel(config.text_config, config)
     cache = model.make_cache()
@@ -663,10 +624,9 @@ def test_qwen4_ple_rollback_validates_snapshot_before_qsa_mutation():
     )
     before_offset = int(cache[1].offset)
 
-    # batch is 1, so a 2-element accepted list cannot match
-    with pytest.raises(_PLESpeculativeRollbackError):
+    with pytest.raises(ValueError, match="outside the verify window"):
         model.rollback_speculative_cache(
-            cache, verified.gdn_states, accepted=[0, 0], block_size=2
+            cache, verified.gdn_states, accepted=2, block_size=2
         )
     assert int(cache[1].offset) == before_offset
     assert getattr(cache[0], "_qwen4_exp_ple_speculative_state", None) is None
