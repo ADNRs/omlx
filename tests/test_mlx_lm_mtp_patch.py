@@ -2821,3 +2821,33 @@ class TestLoopTaxHygiene:
         assert tracker.recently_active(3.0)  # just-finished counts
         tracker.clear()
         assert not tracker.recently_active(3.0)
+
+
+class TestChainNextDraftsLateJoin:
+    """Regression for the multi-row fold guard (issue #3245, PR #3246)."""
+
+    def test_multi_row_trunk_hidden_skips_singleton_fold(self):
+        """A row joining mid-MTP-cycle hands the singleton fold a batch-shaped
+        trunk hidden; the fold must bail out with empty drafts instead of
+        crashing in the model's mtp_forward/fuse_inputs."""
+        import mlx.core as mx
+
+        from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+        calls = []
+
+        def boom(*args, **kwargs):
+            calls.append(args)
+            raise AssertionError("mtp_forward must not run for a multi-row fold")
+
+        gen_batch = SimpleNamespace(model=SimpleNamespace(mtp_forward=boom))
+        state = bg._MtpState(uid=1, chain=True, depth=2, mtp_cache=[])
+        hidden_rows = mx.zeros((2, 3, 8), dtype=mx.float32)
+        committed = mx.array([1, 2, 3], dtype=mx.uint32)
+
+        bg._chain_next_drafts(gen_batch, state, hidden_rows, committed, None)
+
+        assert not calls
+        assert state.drafts is not None and state.drafts.size == 0
+        assert state.draft_lps == []
+        assert state.draft_accept_lps == []

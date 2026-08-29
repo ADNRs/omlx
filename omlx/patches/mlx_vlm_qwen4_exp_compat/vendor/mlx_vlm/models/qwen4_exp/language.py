@@ -475,6 +475,15 @@ class BatchQSAKVCache:
     def trim(self, n):
         trimmed = self.kv_cache.trim(n)
         self.index_offset = max(0, self.index_offset - trimmed)
+        # Slice the physical arrays like the singleton trim does:
+        # update_indexer concatenates onto them and re-derives index_offset
+        # from shape[1], so stale draft columns would otherwise fossilize
+        # and desync the indexer from the KV by the trimmed amount.
+        if trimmed and self.index_keys is not None:
+            self.index_keys = self.index_keys[:, : self.index_offset]
+            self.index_position_ids = self.index_position_ids[
+                ..., : self.index_offset
+            ]
         return trimmed
 
     @property
@@ -711,6 +720,11 @@ class Qwen4ExpQSAIndexer(nn.Module):
             full_position_ids = position_ids
 
         key_len = raw_keys.shape[1]
+        if isinstance(past_len, mx.array):
+            # Batched rows carry per-row KV offsets, but the indexer cache is
+            # left-padded to one width; the masks below need aligned-column
+            # scalars or the (batch,) offsets broadcast into the seq axis.
+            past_len = key_len - seq_len
         max_complete_blocks = key_len // self.compress_ratio
         if max_complete_blocks <= self.block_topk:
             return None

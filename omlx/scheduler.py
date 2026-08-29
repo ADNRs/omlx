@@ -992,6 +992,13 @@ def _to_batched_cache_layer(cache_obj: Any) -> Any:
         and type(cache_obj) is _TQ_SINGLETON_CACHE_TYPE
     ):
         return cache_obj.merge([cache_obj])
+    # Model-owned singletons (e.g. qwen4_exp QSAKVCache) declare their batch
+    # conversion via to_batch, which _patched_make_cache honors at creation;
+    # honor it on the continuous-batching join path too, or extend() hits a
+    # singleton without the method. A warm singleton is one unpadded row.
+    to_batch = getattr(cache_obj, "to_batch", None)
+    if callable(to_batch):
+        return to_batch([0])
     return cache_obj
 
 

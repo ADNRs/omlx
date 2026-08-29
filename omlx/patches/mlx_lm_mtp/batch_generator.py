@@ -2309,6 +2309,15 @@ def _chain_next_drafts(
     """
     import mlx.core as mx
 
+    if getattr(hidden_rows, "ndim", 0) == 3 and hidden_rows.shape[0] != 1:
+        # A row joined mid-cycle (continuous batching): the singleton head
+        # cache cannot fold a multi-row trunk hidden. Skip this fold — the
+        # late-join handoff/park path rebuilds MTP state afterwards.
+        state.drafts = mx.zeros((0,), dtype=mx.uint32)
+        state.draft_lps = []
+        state.draft_accept_lps = []
+        return
+
     model = gen_batch.model
     if _dspark_host(model) is not None:
         return _dspark_next_drafts(

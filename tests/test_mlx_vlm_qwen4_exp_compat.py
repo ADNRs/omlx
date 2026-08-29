@@ -748,6 +748,126 @@ def test_external_ple_path_is_bounded_and_ssd_alias_resolves(tmp_path):
         configure_ple_runtime(compute, mode="resident")
 
 
+# ---------------------------------------------------------------------------
+# Continuous-batching join regressions (issue #3245, PR #3246)
+# ---------------------------------------------------------------------------
+
+
+def _warm_qsa_row(length: int, start: int, index_dim: int = 4):
+    """Build a warm singleton QSAKVCache holding ``length`` cached tokens.
+
+    Adapted from the fixture in PR #3215 (DiscoStew6082).
+    """
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+
+    cache = QSAKVCache()
+    values = mx.arange(start, start + 2 * length * 4, dtype=mx.float32).reshape(
+        1, 2, length, 4
+    )
+    cache.state = (
+        values,
+        values + 100,
+        mx.arange(start, start + length * index_dim, dtype=mx.float32).reshape(
+            1, length, index_dim
+        ),
+        mx.arange(start, start + length, dtype=mx.int32)[None],
+    )
+    return cache
+
+
+def test_qwen4_cache_extension_promotes_singletons_to_model_owned_batch():
+    """A warm QSA singleton joining a running batch must be promoted via the
+    model-owned ``to_batch`` before ``extend`` — previously the join path
+    raised AttributeError ('QSAKVCache' object has no attribute 'extend').
+
+    Adapted from PR #3215 (DiscoStew6082), which fixes the same seam.
+    """
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache
+
+    import omlx.scheduler  # noqa: F401  (installs BatchGenerator cache patches)
+
+    left = _warm_qsa_row(3, 10)
+    right = _warm_qsa_row(1, 30)
+    generate = importlib.import_module("mlx_lm.generate")
+
+    caches = generate._extend_cache([left], [right])
+
+    assert len(caches) == 1
+    assert isinstance(caches[0], BatchQSAKVCache)
+    mx.eval(caches[0].offset, caches[0].index_keys, caches[0].index_position_ids)
+    assert caches[0].offset.tolist() == [3, 1]
+    assert caches[0].index_offset == 3
+    assert caches[0].extract(0).offset == 3
+    assert caches[0].extract(1).offset == 1
+    assert mx.array_equal(
+        caches[0].extract(1).index_position_ids, right.index_position_ids
+    ).item()
+
+
+def test_qwen4_qsa_indexer_handles_ragged_batch_offsets():
+    """``from_projected`` on a batched cache whose ``offset`` is a per-row
+    array must keep the mask math on aligned-column scalars — previously the
+    (batch,) offsets broadcast into the seq axis and produced selected_tokens
+    of shape (batch, batch, key_len), crashing mx.concatenate."""
+    config = _tiny_config().text_config
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache, Qwen4ExpQSAIndexer
+
+    class _PassthroughRope:
+        @staticmethod
+        def apply_rotary(q, k, position_ids, unsqueeze_dim=1):
+            return q, k
+
+    indexer = Qwen4ExpQSAIndexer(config, _PassthroughRope())
+    index_dim = config.indexer_head_dim
+
+    batch = _warm_qsa_row(12, 0, index_dim=index_dim).to_batch([0])
+    batch.extend(_warm_qsa_row(4, 100, index_dim=index_dim).to_batch([0]))
+    assert isinstance(batch, BatchQSAKVCache)
+    assert isinstance(batch.offset, mx.array)  # ragged per-row KV offsets
+    assert batch.offset.tolist() == [12, 4]
+
+    total = (config.indexer_n_heads + config.indexer_kv_heads) * index_dim
+    qk = (mx.arange(2 * total, dtype=mx.float32) / total).reshape(2, 1, total)
+    positions = mx.array([[12], [4]], dtype=mx.int32)
+
+    selected = indexer.from_projected(qk, batch, positions)
+
+    assert selected is not None
+    mx.eval(selected)
+    key_len = batch.index_offset
+    assert key_len == 13
+    assert selected.shape == (2, 1, 1, key_len)
+    assert selected.dtype == mx.bool_
+
+
+def test_qwen4_batch_qsa_trim_slices_indexer_arrays():
+    """``BatchQSAKVCache.trim`` must slice the physical indexer arrays like the
+    singleton trim does — previously only ``index_offset`` was decremented, so
+    a later ``update_indexer`` resynced it to the stale physical width and the
+    rejected draft columns fossilized inside the index."""
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+
+    batch = _warm_qsa_row(6, 0).to_batch([0])
+    assert batch.index_offset == 6
+
+    trimmed = batch.trim(2)
+
+    assert trimmed == 2
+    assert batch.offset.tolist() == [4]
+    assert batch.index_offset == 4
+    assert batch.index_keys.shape[1] == 4
+    assert batch.index_position_ids.shape[-1] == 4
+
+    # The next indexer update must resync against the trimmed length, not the
+    # stale physical width.
+    batch.update_indexer(
+        mx.zeros((1, 1, 4), dtype=mx.float32),
+        mx.array([[4]], dtype=mx.int32),
+    )
+    assert batch.index_offset == 5
+    assert batch.index_keys.shape[1] == 5
+    assert batch.index_position_ids.shape[-1] == 5
 def _make_bound_qwen4_language_model(config):
     from mlx_vlm.models.qwen4_exp.language import LanguageModel, Qwen4ExpMTPModule
 
