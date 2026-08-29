@@ -35,7 +35,10 @@ from ..api.openai_models import _coerce_tool_call_arguments
 from ..api.utils import _try_parse_json
 from ..model_discovery import model_display_name as _model_display_name
 from ..model_profiles import EXCLUDED_FROM_PROFILES
-from ..model_settings import merge_chat_template_kwargs
+from ..model_settings import (
+    MAX_LIGHTNING_MTP_DRAFT_TOKENS,
+    merge_chat_template_kwargs,
+)
 from ..settings import BURST_DECODE_MODES, SubKeyEntry, burst_decode_env
 from ..utils.release_check import normalize_update_channel, select_latest_release
 from ..websearch import (
@@ -2368,10 +2371,13 @@ async def update_model_settings(
         )
     if "mtp_num_draft_tokens" in sent:
         value = request.mtp_num_draft_tokens
-        if value is not None and value < 1:
+        if value is not None and not 1 <= value <= MAX_LIGHTNING_MTP_DRAFT_TOKENS:
             raise HTTPException(
                 status_code=400,
-                detail="mtp_num_draft_tokens must be a positive integer (or null).",
+                detail=(
+                    "mtp_num_draft_tokens must be between 1 and "
+                    f"{MAX_LIGHTNING_MTP_DRAFT_TOKENS} (or null)."
+                ),
             )
         current_settings.mtp_num_draft_tokens = value
     if "preserve_thinking" in sent:

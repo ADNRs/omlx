@@ -377,16 +377,15 @@ async def test_preserve_thinking_and_turboquant_skip_last_are_persisted():
 
 
 @pytest.mark.asyncio
-async def test_mtp_draft_tokens_rejects_non_positive_values():
+@pytest.mark.parametrize("value", [0, 9])
+async def test_mtp_draft_tokens_rejects_out_of_range_values(value):
     pool, _ = _failed_pool()
 
-    with pytest.raises(
-        admin_routes.HTTPException, match="must be a positive integer"
-    ):
+    with pytest.raises(admin_routes.HTTPException, match="must be between 1 and 8"):
         await _update_settings(
             pool,
             ModelSettings(),
-            admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=0),
+            admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=value),
         )
 
 
