@@ -805,6 +805,54 @@ def test_qwen4_cache_extension_promotes_singletons_to_model_owned_batch():
     ).item()
 
 
+def test_qwen4_cache_extension_accepts_existing_model_owned_batch():
+    """A singleton QSA row can join an existing model-owned batch.
+
+    Adapted from PR #3214 (HaloFour).
+    """
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache
+
+    import omlx.scheduler  # noqa: F401  (installs BatchGenerator cache patches)
+
+    left = _warm_qsa_row(3, 10)
+    right_rows = [_warm_qsa_row(2, 30), _warm_qsa_row(1, 50)]
+    right = BatchQSAKVCache.merge(right_rows)
+    generate = importlib.import_module("mlx_lm.generate")
+
+    caches = generate._extend_cache([left], [right])
+
+    assert len(caches) == 1
+    assert isinstance(caches[0], BatchQSAKVCache)
+    mx.eval(caches[0].offset, caches[0].left_padding, caches[0].index_keys)
+    assert caches[0].offset.tolist() == [3, 2, 1]
+    assert caches[0].left_padding.tolist() == [0, 1, 2]
+    assert [caches[0].extract(i).offset for i in range(3)] == [3, 2, 1]
+
+
+def test_qwen4_cache_extension_keeps_existing_batch_in_place():
+    """Extending two batched QSA caches must retain the left batch object.
+
+    Adapted from PR #3214 (HaloFour).
+    """
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache
+
+    import omlx.scheduler  # noqa: F401  (installs BatchGenerator cache patches)
+
+    left = BatchQSAKVCache.merge([_warm_qsa_row(3, 10)])
+    right = BatchQSAKVCache.merge([_warm_qsa_row(2, 30)])
+    generate = importlib.import_module("mlx_lm.generate")
+
+    caches = generate._extend_cache([left], [right])
+
+    assert caches[0] is left
+    mx.eval(left.offset, left.left_padding, left.index_keys)
+    assert left.offset.tolist() == [3, 2]
+    assert left.left_padding.tolist() == [0, 1]
+    assert [left.extract(i).offset for i in range(2)] == [3, 2]
+
+
 def test_qwen4_qsa_indexer_handles_ragged_batch_offsets():
     """``from_projected`` on a batched cache whose ``offset`` is a per-row
     array must keep the mask math on aligned-column scalars — previously the
