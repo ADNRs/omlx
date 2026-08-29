@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Batch-one Qwen4 QSA decode gather regression tests."""
 
-# SPDX-License-Identifier: Apache-2.0
-
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -133,7 +131,6 @@ def test_qwen4_language_wrapper_routes_2d_text_positions_to_gather(monkeypatch):
     original_prefill_eligible = (
         language.Qwen4ExpAttention._gathered_text_prefill_eligible
     )
-    original_decode_eligible = language.Qwen4ExpAttention._gathered_text_decode_eligible
 
     def tracked_prefill(self, x, cache, position_ids=None):
         calls.append(("prefill", position_ids.ndim, position_ids.shape))
@@ -313,6 +310,7 @@ def test_qwen4_decode_gather_stays_budget_bounded_at_long_cache(
 def test_qwen4_decode_sdpa_fails_closed_when_native_shape_is_rejected(monkeypatch):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     import mlx_vlm.models.qwen4_exp.qsa_fast as qsa_fast
+
     from omlx.custom_kernels.decode_fast import fast
 
     q = mx.random.normal((1, 4, 1, 8))
@@ -339,6 +337,7 @@ def test_qwen4_decode_sdpa_fails_closed_when_native_shape_is_rejected(monkeypatc
 def test_qwen4_decode_sdpa_uses_native_only_after_capability_accepts(monkeypatch):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     import mlx_vlm.models.qwen4_exp.qsa_fast as qsa_fast
+
     from omlx.custom_kernels.decode_fast import fast
 
     q = mx.random.normal((1, 24, 1, 256)).astype(mx.bfloat16)

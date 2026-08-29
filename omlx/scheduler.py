@@ -2730,17 +2730,22 @@ class Scheduler:
                 model_type = str(
                     getattr(getattr(self.model, "config", None), "model_type", "") or ""
                 )
-            if model_type.startswith(("qwen3_5", "qwen4_exp")):
+            is_qwen35 = model_type.startswith("qwen3_5")
+            is_qwen4 = model_type.startswith("qwen4_exp")
+            if is_qwen4:
+                from .custom_kernels.glm_moe_dsa import fast
+
+                if not fast.is_native_available() or not fast.has_symbol(
+                    "qwen4_qsa_sparse_gqa_attention"
+                ):
+                    return 0
+            if is_qwen35 or is_qwen4:
                 from .custom_kernels.nax import is_nax_available
                 from .settings import get_system_memory
 
                 if get_system_memory() >= 64 * 1024**3 and not is_nax_available():
-                    # Measured on the 27B (M3 Ultra, 2026-08-17): chunk 4096
-                    # beats the 2048 default +3.2% at 4k prompts / +1.0% at
-                    # 16k; 8192 is flat versus 4096. Qwen4's direct-index QSA
-                    # likewise removes the selected-K/V memory reason for
-                    # 2048-row tiles. Keep 2048 on NAX/M5, where wider Qwen
-                    # prefill regresses throughput (#2880).
+                    # Qwen4 needs its sparse native path before wider chunks
+                    # are safe. NAX/M5 stays at 2048 for both model families.
                     return 4096
         except Exception:
             logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)

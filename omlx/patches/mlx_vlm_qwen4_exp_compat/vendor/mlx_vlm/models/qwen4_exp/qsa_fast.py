@@ -1,15 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Exact gathered QSA prefill for contiguous batch-one text prompts.
+"""Exact gathered QSA for contiguous batch-one text prompts.
 
-This is the exact path proven by Fusion's native Qwen4-Exp bring-up. It never
-constructs the full ``[query_tokens, key_tokens]`` main-attention matrix: QSA
-selects complete four-token micro-blocks, then the production native kernel
-reads those rows directly from K/V. Portable MLX gathers only the selected
-rows (plus the incomplete causal tail) when that narrow ABI is unavailable.
-
-The caller owns eligibility.  In particular, this module is only used for a
-single contiguous text prompt.  Batched, padded, multimodal and target-verify
-requests stay on mlx-vlm's general QSA implementation.
+The native path reads selected four-token blocks directly from K/V. The MLX
+fallback gathers the selected rows and causal tail. Batched, padded,
+multimodal, and target-verify requests use mlx-vlm's general implementation.
 """
 
 from __future__ import annotations
@@ -18,7 +12,6 @@ import math
 from collections.abc import Callable
 
 import mlx.core as mx
-
 
 IndexKeyNorm = Callable[[mx.array], mx.array]
 IndexRoPE = Callable[[mx.array, mx.array], mx.array]

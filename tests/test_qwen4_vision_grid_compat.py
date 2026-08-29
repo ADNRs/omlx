@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qwen4-Exp image/video grid compatibility with newer MLX releases."""
 
-# SPDX-License-Identifier: Apache-2.0
-
 from __future__ import annotations
 
 from types import SimpleNamespace

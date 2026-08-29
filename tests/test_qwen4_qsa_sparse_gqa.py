@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Narrow native Qwen4 QSA main-attention regression tests."""
 
-# SPDX-License-Identifier: Apache-2.0
-
 from __future__ import annotations
 
 import mlx.core as mx
@@ -10,7 +8,6 @@ import pytest
 
 from omlx.custom_kernels.glm_moe_dsa import fast
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
-
 
 compat.apply_mlx_vlm_qwen4_exp_compat_patch()
 from mlx_vlm.models.qwen4_exp import qsa_fast  # noqa: E402
