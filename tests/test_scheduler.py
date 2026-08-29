@@ -265,6 +265,31 @@ class TestSchedulerStepOutputs:
         assert output.finished_request_ids == {"running"}
         scheduler._cleanup_finished.assert_called_once_with({"running"})
 
+    def test_decode_materializes_cache_at_configured_interval(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        scheduler._schedule_waiting = MagicMock(return_value=([], []))
+        scheduler._process_batch_responses = MagicMock(return_value=([], set()))
+        scheduler._cleanup_finished = MagicMock()
+
+        scheduler.running = {"running": MagicMock()}
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.next_generated.return_value = iter([MagicMock()])
+        scheduler._decode_eval_kv_cache_interval = 256
+        scheduler._tokens_since_kv_cache_eval = 255
+
+        with patch.object(
+            scheduler_module,
+            "_eval_generation_batch_cache",
+            return_value=1,
+        ) as eval_cache:
+            scheduler.step()
+
+        eval_cache.assert_called_once_with(scheduler.batch_generator)
+        assert scheduler._tokens_since_kv_cache_eval == 0
+
 
 class TestSchedulerInitialization:
     """Tests for Scheduler initialization."""
