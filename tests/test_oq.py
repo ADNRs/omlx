@@ -3096,7 +3096,10 @@ class TestModelExceedsRamGuard:
         gib = 1024**3
         capacity = capacity_gib * gib
         monkeypatch.setattr(
-            oq_module, "_calibration_capability_capacity_bytes", lambda **_k: capacity
+            oq_module, "_system_available_memory_bytes", lambda: capacity
+        )
+        monkeypatch.setattr(
+            oq_module, "_metal_available_memory_bytes", lambda: capacity
         )
 
         budget = _calibration_memory_budget()
@@ -3105,14 +3108,15 @@ class TestModelExceedsRamGuard:
         assert budget["model_limit_bytes"] == int(capacity * 0.75)
         assert budget["reserve_bytes"] == capacity - int(capacity * 0.75)
 
-    def test_budget_uses_stable_capability_ceiling(self, monkeypatch):
+    def test_budget_uses_smaller_metal_working_set(self, monkeypatch):
         from omlx import oq as oq_module
 
         gib = 1024**3
         monkeypatch.setattr(
-            oq_module,
-            "_calibration_capability_capacity_bytes",
-            lambda **_k: 464 * gib,
+            oq_module, "_system_available_memory_bytes", lambda: 512 * gib
+        )
+        monkeypatch.setattr(
+            oq_module, "_metal_available_memory_bytes", lambda: 464 * gib
         )
 
         budget = _calibration_memory_budget(413 * gib)
@@ -3126,23 +3130,20 @@ class TestModelExceedsRamGuard:
 
         capacity = 4000
         monkeypatch.setattr(
-            oq_module, "_calibration_capability_capacity_bytes", lambda **_k: capacity
+            oq_module, "_system_available_memory_bytes", lambda: capacity
+        )
+        monkeypatch.setattr(
+            oq_module, "_metal_available_memory_bytes", lambda: capacity
         )
 
         at_limit = int(capacity * _MAX_MODEL_RAM_FRACTION)
         assert _calibration_memory_budget(at_limit)["requires_proxy"] is False
         assert _calibration_memory_budget(at_limit + 1)["requires_proxy"] is True
 
-    def test_capability_admission_ignores_live_memory_pressure(self, monkeypatch):
+    def test_budget_uses_live_memory_pressure(self, monkeypatch):
         from omlx import oq as oq_module
 
         gib = 1024**3
-        capability = int(107.5 * gib)
-        monkeypatch.setattr(
-            oq_module,
-            "_calibration_capability_capacity_bytes",
-            lambda **_k: capability,
-        )
         monkeypatch.setattr(
             oq_module, "_system_available_memory_bytes", lambda: int(72.9 * gib)
         )
@@ -3152,33 +3153,9 @@ class TestModelExceedsRamGuard:
 
         budget = _calibration_memory_budget(int(67.0 * gib))
 
-        assert budget["live_capacity_bytes"] == int(72.9 * gib)
-        assert budget["capacity_bytes"] == capability
-        assert budget["model_limit_bytes"] == int(capability * 0.75)
-        assert budget["requires_proxy"] is False
-
-    def test_capability_admission_still_rejects_unsafe_resident_model(
-        self, monkeypatch
-    ):
-        from omlx import oq as oq_module
-
-        gib = 1024**3
-        capability = int(107.5 * gib)
-        monkeypatch.setattr(
-            oq_module,
-            "_calibration_capability_capacity_bytes",
-            lambda **_k: capability,
-        )
-        monkeypatch.setattr(
-            oq_module, "_system_available_memory_bytes", lambda: int(72.9 * gib)
-        )
-        monkeypatch.setattr(
-            oq_module, "_metal_available_memory_bytes", lambda: int(107.5 * gib)
-        )
-
-        budget = _calibration_memory_budget(int(81.0 * gib))
-
-        assert budget["model_limit_bytes"] == int(capability * 0.75)
+        capacity = int(72.9 * gib)
+        assert budget["capacity_bytes"] == capacity
+        assert budget["model_limit_bytes"] == int(capacity * 0.75)
         assert budget["requires_proxy"] is True
 
 
@@ -3644,9 +3621,6 @@ class TestSensitivityRequiredEnforcement:
         from omlx import settings as _settings
 
         monkeypatch.setattr(_settings, "get_system_memory", lambda: 0)
-        monkeypatch.setattr(
-            _oq, "_calibration_capability_capacity_bytes", lambda **_k: 0
-        )
         monkeypatch.setattr(_oq, "_system_available_memory_bytes", lambda: 0)
         monkeypatch.setattr(_oq, "_metal_available_memory_bytes", lambda: 0)
 
@@ -3688,9 +3662,6 @@ class TestSensitivityRequiredEnforcement:
 
         from omlx import oq as _oq
 
-        monkeypatch.setattr(
-            _oq, "_calibration_capability_capacity_bytes", lambda **_k: 0
-        )
         monkeypatch.setattr(_oq, "_system_available_memory_bytes", lambda: 0)
         monkeypatch.setattr(_oq, "_metal_available_memory_bytes", lambda: 0)
 
@@ -3739,9 +3710,6 @@ class TestSensitivityRequiredEnforcement:
         monkeypatch.setattr(_settings, "get_system_memory", lambda: 0)
         from omlx import oq as _oq
 
-        monkeypatch.setattr(
-            _oq, "_calibration_capability_capacity_bytes", lambda **_k: 0
-        )
         monkeypatch.setattr(_oq, "_system_available_memory_bytes", lambda: 0)
         monkeypatch.setattr(_oq, "_metal_available_memory_bytes", lambda: 0)
 
@@ -3774,9 +3742,6 @@ class TestSensitivityRequiredEnforcement:
 
         from omlx import oq as oq_module
 
-        monkeypatch.setattr(
-            oq_module, "_calibration_capability_capacity_bytes", lambda **_k: 1000
-        )
         monkeypatch.setattr(oq_module, "_system_available_memory_bytes", lambda: 1000)
         monkeypatch.setattr(oq_module, "_metal_available_memory_bytes", lambda: 1000)
         proxy = tmp_path / "proxy"
@@ -3798,7 +3763,7 @@ class TestSensitivityRequiredEnforcement:
 
         assert not proxy.exists()
 
-    def test_oqe_uses_proxy_when_source_exceeds_capability_limit(
+    def test_proxy_reuses_prebuild_live_budget(
         self, tmp_path, monkeypatch
     ):
         if not HAS_MLX:
@@ -3815,10 +3780,10 @@ class TestSensitivityRequiredEnforcement:
 
         from omlx import oq as oq_module
 
+        system_available = MagicMock(side_effect=[1000, 1])
         monkeypatch.setattr(
-            oq_module, "_calibration_capability_capacity_bytes", lambda **_k: 1000
+            oq_module, "_system_available_memory_bytes", system_available
         )
-        monkeypatch.setattr(oq_module, "_system_available_memory_bytes", lambda: 1000)
         monkeypatch.setattr(oq_module, "_metal_available_memory_bytes", lambda: 1000)
         proxy = tmp_path / "proxy"
         build_proxy = MagicMock()
@@ -3846,6 +3811,7 @@ class TestSensitivityRequiredEnforcement:
             )
 
         build_proxy.assert_called_once()
+        system_available.assert_called_once()
         assert not proxy.exists()
 
 
@@ -6664,9 +6630,6 @@ class TestCalibrationFootprint:
         import omlx.oq as oq
 
         # Fixed capacity 400 -> model_limit = int(0.75 * 400) = 300.
-        monkeypatch.setattr(
-            oq, "_calibration_capability_capacity_bytes", lambda **_k: 400
-        )
         monkeypatch.setattr(oq, "_system_available_memory_bytes", lambda: 400)
         monkeypatch.setattr(oq, "_metal_available_memory_bytes", lambda: 400)
 

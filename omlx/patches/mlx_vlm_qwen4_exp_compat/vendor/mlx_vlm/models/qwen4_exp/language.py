@@ -110,32 +110,16 @@ def resolve_ple_runtime_mode(
 
 
 def configure_ple_runtime(model_path: str | Path, mode: str | None = None) -> str:
-    """Bind the external PLE artifact before Qwen4 model construction."""
+    """Bind same-directory PLE storage before Qwen4 model construction."""
     global _PLE_RUNTIME_MODEL_PATH, _PLE_RUNTIME_MODE
 
     compute_path = Path(model_path).expanduser().resolve()
-    ple_path = compute_path
-    artifact = {}
-    config_path = compute_path / "config.json"
-    if config_path.is_file():
-        artifact = json.loads(config_path.read_text()).get("qwen4_exp_artifact") or {}
-        relative_ple = artifact.get("ple_artifact")
-        if relative_ple is not None:
-            relative_ple = Path(relative_ple)
-            if relative_ple.is_absolute():
-                raise ValueError("Qwen4-Exp PLE artifact path must be relative")
-            ple_path = (compute_path / relative_ple).resolve()
-            artifact_root = compute_path.parent.resolve()
-            if ple_path != artifact_root and artifact_root not in ple_path.parents:
-                raise ValueError("Qwen4-Exp PLE artifact escapes its artifact root")
-
     requested = mode or os.environ.get("OMLX_QWEN4_PLE_MODE")
     if requested is None:
-        requested = artifact.get("ple_residency", "auto")
+        requested = "auto"
     checkpoint_bytes = sum(
         path.stat().st_size
-        for root in {compute_path, ple_path}
-        for path in root.glob("*.safetensors")
+        for path in compute_path.glob("*.safetensors")
     )
     physical_memory = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
     _PLE_RUNTIME_MODE = resolve_ple_runtime_mode(
@@ -143,7 +127,7 @@ def configure_ple_runtime(model_path: str | Path, mode: str | None = None) -> st
         checkpoint_bytes=checkpoint_bytes,
         physical_memory=physical_memory,
     )
-    _PLE_RUNTIME_MODEL_PATH = ple_path
+    _PLE_RUNTIME_MODEL_PATH = compute_path
     return _PLE_RUNTIME_MODE
 
 

@@ -3518,40 +3518,6 @@ def _metal_available_memory_bytes() -> int:
     return max(0, max_working_set - active)
 
 
-def _calibration_capability_capacity_bytes(
-    fallback_system_bytes: int = 0,
-) -> int:
-    """Return stable hardware/configuration capacity for calibration."""
-    tier = "balanced"
-    custom_ceiling_bytes = 0
-    try:
-        from omlx.settings import get_settings
-
-        memory = get_settings().memory
-        tier = str(memory.memory_guard_tier)
-        custom_ceiling_bytes = int(
-            float(memory.memory_guard_custom_ceiling_gb) * 1024**3
-        )
-    except Exception:
-        # Direct library callers may not have initialized GlobalSettings.
-        pass
-
-    try:
-        from omlx.process_memory_enforcer import (
-            get_memory_capability_ceiling_bytes,
-        )
-
-        capacity = get_memory_capability_ceiling_bytes(
-            tier,
-            custom_ceiling_bytes,
-        )
-        if capacity > 0:
-            return int(capacity)
-    except Exception as exc:
-        logger.debug("Calibration capability ceiling unavailable: %s", exc)
-    return max(0, int(fallback_system_bytes))
-
-
 def _checkpoint_storage_bytes(weight_files) -> int:
     """Return the complete on-disk size of checkpoint weight shards.
 
@@ -3569,24 +3535,6 @@ def _checkpoint_storage_bytes(weight_files) -> int:
     return total
 
 
-def _qwen4_exp_checkpoint_roots(model_path: str | Path, config: dict) -> set[Path]:
-    """Return the compute and optional bounded external PLE artifact roots."""
-    compute_path = Path(model_path).expanduser().resolve()
-    roots = {compute_path}
-    artifact = config.get("qwen4_exp_artifact") or {}
-    relative_ple = artifact.get("ple_artifact")
-    if relative_ple is None:
-        return roots
-    relative_ple = Path(relative_ple)
-    if relative_ple.is_absolute():
-        return roots
-    candidate = (compute_path / relative_ple).resolve()
-    artifact_root = compute_path.parent.resolve()
-    if candidate == artifact_root or artifact_root in candidate.parents:
-        roots.add(candidate)
-    return roots
-
-
 def _calibration_resident_checkpoint_bytes(
     model_path: str | Path,
     config: dict,
@@ -3598,14 +3546,7 @@ def _calibration_resident_checkpoint_bytes(
     layer walk invokes neither the vision tower nor the ordinary ``lm_head``.
     Safetensors headers and every other tensor remain charged to the model.
     """
-    roots = (
-        _qwen4_exp_checkpoint_roots(model_path, config)
-        if _is_qwen4_exp_config(config)
-        else {Path(model_path)}
-    )
-    weight_files = sorted(
-        {path.resolve() for root in roots for path in root.glob("*.safetensors")}
-    )
+    weight_files = sorted(Path(model_path).glob("*.safetensors"))
     checkpoint_bytes = _checkpoint_storage_bytes(weight_files)
     if not _is_qwen4_exp_config(config):
         return checkpoint_bytes
@@ -3644,34 +3585,23 @@ def _calibration_memory_budget(
     *,
     fallback_system_bytes: int = 0,
 ) -> dict[str, int | bool]:
-    """Return the stable capability budget for calibration forwards.
+    """Return the live memory budget for full-model calibration forwards.
 
-    Hard admission uses total RAM minus the configured tier's OS reserve,
-    capped by Metal (and by a configured custom ceiling). Live availability is
-    retained as diagnostics and for downstream micro-batch sizing, but other
-    applications and transient file cache do not redefine machine capability.
-    A proportional 25% reserve remains between the resident checkpoint and
-    the stable capability ceiling.
+    Apple Silicon uses unified memory, but Metal exposes a recommended working
+    set that can be smaller than physical RAM. The safe capacity is therefore
+    the smaller positive value of live system memory and remaining Metal
+    working-set memory. A proportional 25% reserve scales down to 16/32 GiB
+    machines without imposing a fixed reserve that would reject every model.
     """
     system_available = _system_available_memory_bytes()
     metal_available = _metal_available_memory_bytes()
-    live_candidates = [
-        value for value in (system_available, metal_available) if value > 0
-    ]
-    live_capacity = min(live_candidates) if live_candidates else 0
-    capability_capacity = _calibration_capability_capacity_bytes(
-        fallback_system_bytes=fallback_system_bytes,
-    )
-    capacity = capability_capacity or live_capacity or max(
-        0, int(fallback_system_bytes)
-    )
+    candidates = [value for value in (system_available, metal_available) if value > 0]
+    capacity = min(candidates) if candidates else max(0, int(fallback_system_bytes))
     model_limit = int(capacity * _MAX_MODEL_RAM_FRACTION)
     checkpoint_bytes = max(0, int(checkpoint_bytes))
     return {
         "system_available_bytes": int(system_available),
         "metal_available_bytes": int(metal_available),
-        "live_capacity_bytes": int(live_capacity),
-        "capability_capacity_bytes": int(capability_capacity),
         "capacity_bytes": int(capacity),
         "model_limit_bytes": int(model_limit),
         "reserve_bytes": max(0, int(capacity) - int(model_limit)),
@@ -5927,13 +5857,13 @@ def quantize_oq_streaming(
     if _model_requires_proxy and static_sensitivity_map is None:
         logger.info(
             f"oQ{oq_level:g}: calibration footprint ({_format_size(_calibration_bytes)}) "
-            f"exceeds {int(_MAX_MODEL_RAM_FRACTION * 100)}% of stable calibration "
-            "capability "
+            f"exceeds {int(_MAX_MODEL_RAM_FRACTION * 100)}% of calibration "
+            "capacity "
             f"({_format_size(int(_calibration_budget['capacity_bytes']))}; "
             f"limit={_format_size(int(_calibration_budget['model_limit_bytes']))}, "
-            "live system available="
+            "system available="
             f"{_format_size(int(_calibration_budget['system_available_bytes']))}, "
-            "live Metal available="
+            "Metal available="
             f"{_format_size(int(_calibration_budget['metal_available_bytes']))}). "
             "Full-model calibration will use a proxy."
         )
@@ -5974,30 +5904,23 @@ def quantize_oq_streaming(
                 candidate,
                 config,
             )
-            proxy_budget = _calibration_memory_budget(
-                proxy_resident_bytes,
-                fallback_system_bytes=_system_ram,
-            )
-            if int(proxy_budget["capacity_bytes"]) > 0 and bool(
-                proxy_budget["requires_proxy"]
-            ):
+            prebuild_capacity = int(_calibration_budget["capacity_bytes"])
+            prebuild_limit = int(_calibration_budget["model_limit_bytes"])
+            if prebuild_capacity > 0 and proxy_resident_bytes > prebuild_limit:
                 shutil.rmtree(candidate, ignore_errors=True)
                 raise RuntimeError(
-                    "calibration proxy is still too large for the stable capability "
-                    f"budget (proxy={_format_size(proxy_bytes)}, "
+                    "calibration proxy is still too large for the pre-build live "
+                    f"memory budget (proxy={_format_size(proxy_bytes)}, "
                     f"resident={_format_size(proxy_resident_bytes)}, "
-                    f"limit={_format_size(int(proxy_budget['model_limit_bytes']))}, "
-                    f"capability={_format_size(int(proxy_budget['capacity_bytes']))}, "
-                    f"live={_format_size(int(proxy_budget['live_capacity_bytes']))})"
+                    f"limit={_format_size(prebuild_limit)}, "
+                    f"capacity={_format_size(prebuild_capacity)})"
                 )
             _ram_safe_proxy_dir = candidate
             logger.info(
                 f"oQ{oq_level:g}: calibration proxy size "
                 f"{_format_size(proxy_bytes)} on disk, resident calibration "
                 f"footprint {_format_size(proxy_resident_bytes)} within "
-                f"{_format_size(int(proxy_budget['model_limit_bytes']))} stable "
-                "capability limit (live capacity "
-                f"{_format_size(int(proxy_budget['live_capacity_bytes']))})"
+                f"{_format_size(prebuild_limit)} pre-build live memory limit"
             )
         return _ram_safe_proxy_dir
 

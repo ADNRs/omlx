@@ -75,22 +75,6 @@ _ACTIVE_RECLAIM_RATIO: dict[str, float] = {
     "aggressive": 0.8,
 }
 
-
-def _static_memory_ceiling_bytes(system_bytes: int, tier: str) -> int:
-    """Return total RAM minus the tier-scaled OS reserve."""
-    system_bytes = max(0, int(system_bytes))
-    tier = (tier or "").strip().lower()
-    if tier not in _STATIC_RESERVE_LARGE:
-        tier = "balanced"
-    if tier == "custom":
-        reserve = _STATIC_RESERVE_LARGE["custom"]
-    elif system_bytes < _SMALL_SYSTEM_THRESHOLD:
-        reserve = _SMALL_SYSTEM_RESERVE
-    else:
-        reserve = _STATIC_RESERVE_LARGE[tier]
-    return max(0, system_bytes - reserve)
-
-
 # Default soft watermark per tier. A saved 0.85 from older configs is treated
 # as the legacy default so balanced / aggressive can move to their tier defaults.
 _LEGACY_SOFT_THRESHOLD = 0.85
@@ -198,38 +182,6 @@ def get_effective_metal_cap_bytes() -> int:
     if sysctl_cap > 0:
         return sysctl_cap
     return _get_max_metal_working_set_bytes()
-
-
-def get_memory_capability_ceiling_bytes(
-    memory_guard_tier: str = "balanced",
-    memory_guard_custom_ceiling_bytes: int = 0,
-) -> int:
-    """Return the stable machine/configuration memory ceiling.
-
-    Unlike the enforcer's dynamic ceiling, this deliberately excludes live
-    free/active/inactive page counts.  It answers whether the machine is
-    fundamentally capable of a workload: total RAM minus the tier's static OS
-    reserve, capped by Metal and by an explicit custom ceiling when configured.
-    """
-    tier = (memory_guard_tier or "").strip().lower()
-    if tier not in _STATIC_RESERVE_LARGE:
-        tier = "balanced"
-    try:
-        total = max(0, int(_settings.get_system_memory()))
-    except Exception:  # noqa: BLE001
-        total = 0
-
-    static_ceiling = _static_memory_ceiling_bytes(total, tier)
-
-    candidates = [static_ceiling] if static_ceiling > 0 else []
-    metal_cap = get_effective_metal_cap_bytes()
-    if metal_cap > 0:
-        candidates.append(int(metal_cap))
-    custom_ceiling = max(0, int(memory_guard_custom_ceiling_bytes))
-    if tier == "custom" and custom_ceiling > 0:
-        candidates.append(custom_ceiling)
-    return min(candidates) if candidates else 0
-
 
 def _wired_limit_suggestion_bytes(desired_bytes: int) -> int:
     """Clamp and align a wired-limit recommendation to leave 5% of RAM.
@@ -610,12 +562,16 @@ class ProcessMemoryEnforcer:
 
     def _get_static_ceiling(self) -> int:
         """Total RAM minus tier-scaled static reserve."""
-        tier = self._memory_guard_tier
-        try:
-            system_bytes = max(0, int(_settings.get_system_memory()))
-        except Exception:  # noqa: BLE001
-            system_bytes = 0
-        return _static_memory_ceiling_bytes(system_bytes, tier)
+        from .settings import get_system_memory
+
+        system_bytes = get_system_memory()
+        if self._memory_guard_tier == "custom":
+            return max(0, system_bytes - _STATIC_RESERVE_LARGE["custom"])
+        if system_bytes < _SMALL_SYSTEM_THRESHOLD:
+            reserve = _SMALL_SYSTEM_RESERVE
+        else:
+            reserve = _STATIC_RESERVE_LARGE[self._memory_guard_tier]
+        return max(0, system_bytes - reserve)
 
     def _get_dynamic_ceiling(self) -> int:
         """Tier-aware reclaimable-memory ceiling.

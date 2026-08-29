@@ -882,31 +882,6 @@ def test_disk_backed_affine_ple_supports_all_oq_bits(tmp_path, bits):
     assert embedding._shard_specs[0][3:] == (bits, 32)
     embedding.close()
 
-
-def test_external_ple_path_is_bounded_and_ssd_alias_resolves(tmp_path):
-    compute = tmp_path / "compute"
-    ple = tmp_path / "ple"
-    compute.mkdir()
-    ple.mkdir()
-    (compute / "config.json").write_text(
-        json.dumps(
-            {
-                "qwen4_exp_artifact": {
-                    "ple_artifact": "../ple",
-                    "ple_residency": "ssd_mmap",
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-    try:
-        assert compat.configure_qwen4_exp_runtime(compute) == "mmap"
-    finally:
-        from mlx_vlm.models.qwen4_exp.language import configure_ple_runtime
-
-        configure_ple_runtime(compute, mode="resident")
-
-
 # ---------------------------------------------------------------------------
 # Continuous-batching join regressions (issue #3245, PR #3246)
 # ---------------------------------------------------------------------------
