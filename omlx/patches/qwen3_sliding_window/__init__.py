@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qwen3 sliding-window attention monkey-patch for the pinned mlx-lm dependency.
 
-Unlike the laguna/mimo_v2 patches, which register a vendored module under a
-model_type that mlx-lm doesn't ship at all yet (see omlx/patches/laguna/__init__.py),
+Unlike vendored-family patches, which register a whole module under a
+model_type mlx-lm doesn't ship,
 this patches two attributes, ModelArgs and Qwen3Model, directly on the real,
 already-existing mlx_lm.models.qwen3 module. That's safe here because
 the patched classes are a strict backward-compatible superset of the originals.
@@ -18,7 +18,7 @@ and TransformerBlock.
 
 There's no known upstream proposal for Qwen3 sliding-window support
 at the time of writing, so there's no PR reference to carry here
-the way laguna/mimo_v2 do.
+the way vendored-family patches do.
 """
 
 from __future__ import annotations

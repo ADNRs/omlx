@@ -262,11 +262,7 @@ class DistributedBatchedEngine(BatchedEngine):
         incompatible = [
             name
             for name in (
-                "dflash_enabled",
-                "specprefill_enabled",
                 "mtp_enabled",
-                "vlm_mtp_enabled",
-                "turboquant_kv_enabled",
             )
             if bool(getattr(settings, name, False))
         ]
@@ -380,8 +376,6 @@ class DistributedBatchedEngine(BatchedEngine):
             )
         if kwargs.get("logit_bias"):
             raise ValueError("logit_bias is not yet supported by distributed inference")
-        if kwargs.get("specprefill") is True:
-            raise ValueError("SpecPrefill is not supported by distributed inference")
 
     def _completion_payload(
         self,

@@ -159,10 +159,8 @@ from .api.tool_calling import (
     ToolCallStreamFilter,
     build_json_system_prompt,
     convert_tools_for_template,
-    enrich_tool_params_for_gemma4,
     extract_tool_calls_with_thinking,
     parse_json_output,
-    restore_gemma4_param_names,
     sanitize_tool_call_markup,
 )
 from .api.utils import (
@@ -1117,7 +1115,7 @@ async def get_engine(
         )
 
     # Resolve alias/profile request to the physical model. Exposed profiles
-    # may carry engine-construction settings (MTP/DFlash/etc.); pass those
+    # may carry engine-construction settings (MTP etc.); pass those
     # transient settings to the pool so the loaded variant can switch without
     # mutating the base model's persisted settings.
     requested_model_id = model_id
@@ -2594,47 +2592,7 @@ async def server_status(_: bool = Depends(verify_api_key)):
             format_size(model_memory_max) if model_memory_max else "unlimited"
         ),
         "custom_kernels": native_kernel_status(),
-        "ane_prefill": _ane_prefill_status(pool),
     }
-
-
-def _ane_prefill_status(pool) -> dict:
-    """Aggregate the Qwen ANE prefill state across loaded models.
-
-    Best-effort and defensive: any model that never attempted ANE prefill is
-    omitted, so an empty ``models`` list means no loaded model uses it. Lets a
-    statusline distinguish "ANE active on N layers" from a silent no-op.
-    """
-    result = {"patch_available": False, "configured_models": 0, "models": []}
-    if pool is None:
-        return result
-    try:
-        from .patches.qwen35_ane_prefill import qwen35_ane_prefill_status
-    except Exception:  # noqa: BLE001 - patch optional at runtime
-        return result
-    # "patch importable", not "ANE hardware present": eligibility is decided
-    # per model at enable time and reported through the per-model entries.
-    result["patch_available"] = True
-    try:
-        for model_id, entry in pool._entries.items():
-            engine = getattr(entry, "engine", None)
-            mdl = (
-                getattr(engine, "_model", None) or getattr(engine, "_vlm_model", None)
-                if engine is not None
-                else None
-            )
-            if mdl is None:
-                continue
-            st = qwen35_ane_prefill_status(mdl)
-            if not st["attempted"]:
-                continue
-            st["model_id"] = model_id
-            result["models"].append(st)
-            if st["configured"]:
-                result["configured_models"] += 1
-    except Exception as exc:  # noqa: BLE001 - status must never fail the endpoint
-        logger.warning("ANE prefill status unavailable: %s", exc)
-    return result
 
 
 def _markitdown_virtual_model_status() -> dict:
@@ -2903,19 +2861,7 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
             _server_state.global_settings is not None
             and _server_state.global_settings.model.hide_helper_models
         )
-        # Set of draft-model references (paths / repo ids) pointed at by other
-        # models' speculative settings — used to flag "helper" drafters that
-        # only differ from a chat model by being referenced elsewhere.
         referenced_drafts: set[str] = set()
-        if hide_helpers and settings_manager:
-            for _ms in settings_manager.get_all_settings().values():
-                for ref in (
-                    _ms.specprefill_draft_model,
-                    _ms.dflash_draft_model,
-                    _ms.vlm_mtp_draft_model,
-                ):
-                    if ref:
-                        referenced_drafts.add(ref)
 
         excluded_model_ids: set[str] = set()
         for m in status["models"]:
@@ -3617,11 +3563,8 @@ async def create_chat_completion(
             ),
         )
         is_vlm = isinstance(engine, VLMBatchedEngine)
-        is_dflash_vlm = not is_vlm and getattr(
-            engine, "supports_multimodal_fallback", False
-        )
         extractor = getattr(engine, "message_extractor", None)
-        merge_system_fallback_roles = not (is_vlm or is_dflash_vlm)
+        merge_system_fallback_roles = not is_vlm
         if extractor is not None:
             extractor_kwargs = {}
             try:
@@ -3639,8 +3582,8 @@ async def create_chat_completion(
                 **extractor_kwargs,
             )
             merge_system_fallback_roles = True
-        elif is_vlm or is_dflash_vlm:
-            # VLM or DFlash with VLM fallback: preserve image_url content parts
+        elif is_vlm:
+            # VLM path: preserve image_url content parts
             messages = extract_multimodal_content(
                 request.messages,
                 max_tool_result_tokens,
@@ -3735,9 +3678,6 @@ async def create_chat_completion(
         tools_for_template = (
             convert_tools_for_template(effective_tools) if effective_tools else None
         )
-        # Gemma 4 drops required params that lack descriptions — enrich them
-        if tools_for_template and "gemma" in (resolved_model or "").lower():
-            tools_for_template = enrich_tool_params_for_gemma4(tools_for_template)
         await _ensure_tokenizer_for_system_probe(engine, messages)
         messages = prepare_system_messages_for_template(
             messages,
@@ -3826,7 +3766,7 @@ async def create_chat_completion(
 
         # Auto-set enable_thinking in chat template kwargs when a thinking
         # budget is active (from request or model settings).  Some chat
-        # templates (e.g. Gemma 4) explicitly suppress thinking unless this
+        # templates explicitly suppress thinking unless this
         # kwarg is True.
         if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
             merged_ct_kwargs["enable_thinking"] = True
@@ -3867,18 +3807,6 @@ async def create_chat_completion(
 
         # Forward partial-mode decision to the engine explicitly
         chat_kwargs["is_partial"] = is_partial
-
-        # SpecPrefill: per-request overrides (fall back to model_settings)
-        if request.specprefill is not None:
-            chat_kwargs["specprefill"] = request.specprefill
-        if request.specprefill_keep_pct is not None:
-            chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
-        elif _server_state.settings_manager and ms.specprefill_keep_pct is not None:
-            chat_kwargs["specprefill_keep_pct"] = ms.specprefill_keep_pct
-        if getattr(request, "specprefill_threshold", None) is not None:
-            chat_kwargs["specprefill_threshold"] = request.specprefill_threshold
-        elif _server_state.settings_manager and ms.specprefill_threshold is not None:
-            chat_kwargs["specprefill_threshold"] = ms.specprefill_threshold
 
         if request.stop:
             chat_kwargs["stop"] = request.stop
@@ -4007,16 +3935,6 @@ async def create_chat_completion(
                 if not is_valid:
                     logger.warning(f"JSON validation failed: {error}")
 
-            # Reverse Gemma 4 parameter renaming (param_description -> description)
-            if tool_calls and "gemma" in (resolved_model or "").lower():
-                for tc in tool_calls:
-                    if tc.function and tc.function.arguments:
-                        try:
-                            args = json.loads(tc.function.arguments)
-                            args = restore_gemma4_param_names(args)
-                            tc.function.arguments = json.dumps(args, ensure_ascii=False)
-                        except (json.JSONDecodeError, AttributeError):
-                            pass
 
             finish_reason = "tool_calls" if tool_calls else output.finish_reason
 
@@ -5011,16 +4929,6 @@ async def stream_chat_completion(
             )
             yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
-    # Reverse Gemma 4 parameter renaming for streaming path
-    if tool_calls and "gemma" in (resolved_model or request.model or "").lower():
-        for tc in tool_calls:
-            if tc.function and tc.function.arguments:
-                try:
-                    args = json.loads(tc.function.arguments)
-                    args = restore_gemma4_param_names(args)
-                    tc.function.arguments = json.dumps(args, ensure_ascii=False)
-                except (json.JSONDecodeError, AttributeError):
-                    pass
 
     # Emit tool call chunks if found
     if tool_calls:
@@ -5301,9 +5209,8 @@ async def stream_anthropic_messages(
                         # a text block, drop pure-whitespace deltas. Most
                         # models emit a leading newline around <tool_call>
                         # envelopes that tool_filter passes through (their
-                        # whitespace isn't part of the envelope markers;
-                        # DeepSeek V4's separator is, and the filter
-                        # consumes it itself). Without this guard, the `\n`
+                        # whitespace isn't part of the envelope markers).
+                        # Without this guard, the `\n`
                         # opens a text block that then holds only
                         # whitespace — surfacing as a phantom empty-ish
                         # text block before the tool_use blocks.
@@ -5482,16 +5389,6 @@ async def stream_anthropic_messages(
         yield create_content_block_start_event(index=block_index, block_type="text")
         yield create_content_block_stop_event(index=block_index)
 
-    # Reverse Gemma 4 parameter renaming
-    if tool_calls and "gemma" in (resolved_model or request.model or "").lower():
-        for tc in tool_calls:
-            if tc.function and tc.function.arguments:
-                try:
-                    args = json.loads(tc.function.arguments)
-                    args = restore_gemma4_param_names(args)
-                    tc.function.arguments = json.dumps(args, ensure_ascii=False)
-                except (json.JSONDecodeError, AttributeError):
-                    pass
 
     # Emit tool_use blocks if present
     # When neither text nor thinking was streamed AND the empty-text-block
@@ -5639,9 +5536,6 @@ async def create_anthropic_message(
         # Convert Anthropic format to internal format
         # Harmony models need special handling to preserve tool format
         is_vlm = isinstance(engine, VLMBatchedEngine)
-        is_dflash_vlm = not is_vlm and getattr(
-            engine, "supports_multimodal_fallback", False
-        )
         native_reasoning = uses_native_reasoning_content(
             resolved_model,
             config_model_type=(
@@ -5668,15 +5562,14 @@ async def create_anthropic_message(
                 request,
                 max_tool_result_tokens,
                 engine.tokenizer,
-                preserve_images=is_vlm or is_dflash_vlm,
+                preserve_images=is_vlm,
                 native_reasoning_content=native_reasoning,
                 consolidate_system_messages=False,
             )
 
-        # Apply model-specific message extraction (e.g. Gemma 4 converts
-        # role=tool messages into tool_responses on assistant turns).
+        # Apply model-specific message extraction.
         extractor = getattr(engine, "message_extractor", None)
-        merge_system_fallback_roles = not (is_vlm or is_dflash_vlm)
+        merge_system_fallback_roles = not is_vlm
         if extractor is not None:
             extractor_kwargs = {}
             try:
@@ -5789,9 +5682,6 @@ async def create_anthropic_message(
                 internal_tools = None
         else:
             internal_tools = user_internal
-        # Gemma 4 drops required params that lack descriptions — enrich them
-        if internal_tools and "gemma" in (resolved_model or "").lower():
-            internal_tools = enrich_tool_params_for_gemma4(internal_tools)
         if internal_tools:
             chat_kwargs["tools"] = internal_tools
 
@@ -5920,16 +5810,6 @@ async def create_anthropic_message(
                 tool_calls = extraction.tool_calls
                 cleaned_thinking = extraction.cleaned_thinking
 
-            # Reverse Gemma 4 parameter renaming
-            if tool_calls and "gemma" in (resolved_model or "").lower():
-                for tc in tool_calls:
-                    if tc.function and tc.function.arguments:
-                        try:
-                            args = json.loads(tc.function.arguments)
-                            args = restore_gemma4_param_names(args)
-                            tc.function.arguments = json.dumps(args, ensure_ascii=False)
-                        except (json.JSONDecodeError, AttributeError):
-                            pass
 
             response = convert_internal_to_anthropic_response(
                 text=cleaned_text.strip() if cleaned_text else "",
@@ -6108,9 +5988,7 @@ async def create_response(
         # Images in function_call_output lists survive only for engines that
         # can extract them; text engines get a placeholder instead so base64
         # payloads never reach the prompt (#2989).
-        preserve_tool_images = isinstance(engine, VLMBatchedEngine) or getattr(
-            engine, "supports_multimodal_fallback", False
-        )
+        preserve_tool_images = isinstance(engine, VLMBatchedEngine)
 
         current_input_messages = convert_responses_input_to_messages(
             request.input,
@@ -6235,9 +6113,6 @@ async def create_response(
         tools_for_template = (
             convert_tools_for_template(effective_tools) if effective_tools else None
         )
-        # Gemma 4 drops required params that lack descriptions — enrich them
-        if tools_for_template and "gemma" in (resolved_model or "").lower():
-            tools_for_template = enrich_tool_params_for_gemma4(tools_for_template)
         await _ensure_tokenizer_for_system_probe(engine, messages)
         messages = prepare_system_messages_for_template(
             messages,
@@ -6439,17 +6314,6 @@ async def create_response(
                 tool_calls = extraction.tool_calls
                 cleaned_thinking = extraction.cleaned_thinking
 
-            # Reverse Gemma 4 parameter renaming
-            if tool_calls and "gemma" in (resolved_model or "").lower():
-                for tc in tool_calls:
-                    fn = getattr(tc, "function", None)
-                    if fn and fn.arguments:
-                        try:
-                            args = json.loads(fn.arguments)
-                            args = restore_gemma4_param_names(args)
-                            fn.arguments = json.dumps(args, ensure_ascii=False)
-                        except (json.JSONDecodeError, AttributeError):
-                            pass
 
             # Process response_format if specified
             if response_format and not tool_calls:
@@ -7003,17 +6867,6 @@ async def stream_responses_api(
                 },
             )
 
-    # Reverse Gemma 4 parameter renaming
-    if tool_calls and "gemma" in (resolved_model or request.model or "").lower():
-        for tc in tool_calls:
-            fn = getattr(tc, "function", None)
-            if fn and fn.arguments:
-                try:
-                    args = json.loads(fn.arguments)
-                    args = restore_gemma4_param_names(args)
-                    fn.arguments = json.dumps(args, ensure_ascii=False)
-                except (json.JSONDecodeError, AttributeError):
-                    pass
 
     final_text = cleaned_text.strip() if cleaned_text else ""
 
@@ -7396,12 +7249,15 @@ model and sampling defaults are managed via the admin page.
     # Match the cli.py launcher: keep freed GPU buffers in the pool so
     # allocator::free() never releases a buffer the GPU may still be
     # using (kernel panics on M4 otherwise; see cli.py and issue #300).
-    # EnginePool eviction also assumes this cache limit is in place.
-    import mlx.core as mx
+    # EnginePool eviction also assumes this cache limit is in place. The
+    # optional cap (mx_cache_limit_gb setting / env override) lives in
+    # utils/mx_pool.py — it stops the pool-refill thrash loop that
+    # collapses long-context prefill to floor-size chunks.
+    from .utils.mx_pool import apply_mx_cache_limit
 
-    total_mem = mx.device_info().get("memory_size", 0)
-    if total_mem > 0:
-        mx.set_cache_limit(total_mem)
+    apply_mx_cache_limit(
+        getattr(getattr(settings, "cache", None), "mx_cache_limit_gb", 0) or 0
+    )
 
     # Initialize server
     init_server(

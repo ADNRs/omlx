@@ -274,7 +274,7 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
         from ..mlx_lm_mtp import is_mtp_active
 
         if type(self) is not cls:
-            # Subclasses (e.g. the qwen4_exp vendor LanguageModel, which
+            # Subclasses of the vendored language model classes, which
             # inherits from this class) own their MTP wiring; running the
             # Qwen3.5 attach here would bolt a q35 MTPModule onto a
             # foreign architecture (issue #2972, reverse leg).
@@ -321,7 +321,7 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
         ``rollback_speculative_cache`` instead of a confirmed/draft split.
         """
         if type(self) is not cls:
-            # Subclasses (qwen4_exp vendor) reach here via super().__call__
+            # Vendored subclasses reach here via super().__call__
             # and implement their own return_hidden / capture contract.
             # Reshaping their kwargs here collapses the raw hyper-stream
             # hidden that Qwen4 Lightning MTP requires (issue #2972).

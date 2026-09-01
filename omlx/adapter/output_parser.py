@@ -18,7 +18,6 @@ from typing import Any, Protocol
 
 from ..utils.tokenizer import (
     create_streaming_detokenizer,
-    is_gemma4_model,
     is_harmony_model,
 )
 from .harmony import HarmonyStreamingParser, parse_tool_calls_from_tokens
@@ -363,11 +362,6 @@ def install_minimax_m3_tokenizer_protocol(
     if not _is_minimax_m3_model(model_name, model_config):
         return False
 
-    from ..patches.mlx_vlm_minimax_m3_compat import (
-        apply_mlx_vlm_minimax_m3_compat_patch,
-    )
-
-    apply_mlx_vlm_minimax_m3_compat_patch()
     from mlx_vlm.tool_parsers.minimax_m3 import (
         parse_tool_call as parse_native_tool_call,
     )
@@ -723,12 +717,6 @@ class MiniMaxM3OutputParserSession:
         tool_calls: list[dict[str, str]] = []
         if _MINIMAX_TOOL_CALL_START in self._raw_text:
             try:
-                from ..patches.mlx_vlm_minimax_m3_compat import (
-                    apply_mlx_vlm_minimax_m3_compat_patch,
-                )
-
-                apply_mlx_vlm_minimax_m3_compat_patch()
-
                 from mlx_vlm.tool_parsers.minimax_m3 import parse_tool_call
 
                 parsed = parse_tool_call(self._raw_text)
@@ -782,16 +770,6 @@ def _is_inkling_model(
         return True
     return "inkling" in model_name.lower()
 
-
-def _is_muse_glimmer_model(
-    model_name: str,
-    model_config: dict[str, Any] | None = None,
-) -> bool:
-    model_type = model_config.get("model_type") if model_config else None
-    if model_type == "muse_glimmer":
-        return True
-    lowered = model_name.lower()
-    return "muse" in lowered and "glimmer" in lowered
 
 
 def _append_missing_json_object_closers(payload: str) -> str | None:
@@ -1286,35 +1264,6 @@ def detect_output_parser(
             thinking_end_trailing_text="<|start|>assistant<|channel|>final<|message|>",
         )
 
-    if is_gemma4_model(model_name, model_config):
-        from .gemma4 import (
-            _CLOSE_MARKER,
-            _OPEN_MARKER_BARE,
-            _TOOL_RESPONSE_CLOSE,
-            _TOOL_RESPONSE_OPEN,
-            _TURN_END_MARKER,
-            Gemma4OutputParserSession,
-        )
-
-        return OutputParserFactory(
-            kind="gemma4",
-            create_session=lambda session_tokenizer: Gemma4OutputParserSession(
-                session_tokenizer,
-                model_path=session_model_path,
-            ),
-            stop_token_ids=set(),
-            thinking_start_text="<|channel>thought",
-            thinking_start_output_text="<think>\n",
-            thinking_end_text="<channel|>",
-            protocol_marker_texts=(
-                _OPEN_MARKER_BARE,
-                _CLOSE_MARKER,
-                _TURN_END_MARKER,
-                _TOOL_RESPONSE_OPEN,
-                _TOOL_RESPONSE_CLOSE,
-            ),
-        )
-
     if _is_deepseek_v4_model(model_name, tokenizer, model_config):
         return OutputParserFactory(
             kind="deepseek_v4",
@@ -1370,47 +1319,6 @@ def detect_output_parser(
             protocol_marker_texts=_INKLING_MARKERS,
         )
 
-    if _is_muse_glimmer_model(model_name, model_config):
-        from .muse_glimmer import (
-            _MUSE_END_OF_TEXT,
-            _MUSE_EOM,
-            _MUSE_EOT,
-            _MUSE_MARKERS,
-            _MUSE_MESSAGE,
-            _MUSE_START,
-            MuseGlimmerOutputParserSession,
-        )
-
-        muse_stop_ids = set()
-        for stop_marker in (_MUSE_EOT, _MUSE_END_OF_TEXT):
-            stop_id = _token_id_for_text(tokenizer, stop_marker)
-            if stop_id is not None:
-                muse_stop_ids.add(stop_id)
-
-        return OutputParserFactory(
-            kind="muse_glimmer",
-            create_session=lambda session_tokenizer: MuseGlimmerOutputParserSession(
-                session_tokenizer,
-                model_path=session_model_path,
-            ),
-            create_session_with_tools=lambda session_tokenizer, tools: (
-                MuseGlimmerOutputParserSession(
-                    session_tokenizer,
-                    model_path=session_model_path,
-                    tools=tools,
-                )
-            ),
-            stop_token_ids=muse_stop_ids,
-            thinking_start_output_text="<think>\n",
-            # A forced thinking close ends the reasoning message and opens
-            # the visible-answer message.
-            thinking_end_text=_MUSE_EOM,
-            thinking_end_trailing_text=(
-                _MUSE_START + "assistant to=user" + _MUSE_MESSAGE
-            ),
-            protocol_marker_texts=_MUSE_MARKERS,
-        )
-
     if _is_minimax_m3_model(model_name, model_config):
         minimax_stop_ids = set()
         eos_id = _token_id_for_text(tokenizer, _MINIMAX_EOS_TOKEN)
@@ -1456,11 +1364,6 @@ def detect_message_extractor(
         from ..api.utils import extract_harmony_messages
 
         return extract_harmony_messages
-
-    if is_gemma4_model(model_name, model_config):
-        from .gemma4 import extract_gemma4_messages
-
-        return extract_gemma4_messages
 
     # Default: caller decides between extract_text_content and
     # extract_multimodal_content based on engine type (VLM vs text).

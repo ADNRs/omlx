@@ -11,8 +11,6 @@ from omlx.cluster.prompt_snapshot_cache import (
     agreed_boundary,
     candidate_boundaries,
 )
-from omlx.patches.deepseek_v4.cache_extras import PoolingCache
-
 MODEL = ("model-path", None, None)
 STEP = 2048
 
@@ -53,35 +51,6 @@ def _rotating_and_gdn():
     gdn = ArraysCache(size=1)
     _advance([rot, gdn], 20)
     return [rot, gdn]
-
-
-def _pooling(ratio=4, tokens=10, dim=8, with_prev=True):
-    """A pooling cache driven through its own accumulate/pool surface."""
-
-    cache = PoolingCache(ratio)
-    kv = mx.random.normal((1, tokens, dim))
-    gate = mx.random.normal((1, tokens, dim))
-    ready_kv, ready_gate, _ = cache.accumulate_windows(kv, gate, 0)
-    windows = ready_kv.shape[1] // ratio
-    if windows > 0:
-        cache.update_and_fetch(mx.random.normal((1, windows, dim)))
-        if with_prev:
-            cache.store_prev(
-                ready_kv.reshape(1, windows, ratio, dim),
-                ready_gate.reshape(1, windows, ratio, dim),
-                0,
-            )
-    return cache
-
-
-def _assert_pooling_equal(restored, original):
-    assert type(restored).__name__ == "PoolingCache"
-    assert restored.ratio == original.ratio
-    assert restored.remainder == original.remainder
-    for got, want in zip(restored.state, original.state):
-        assert (got is None) == (want is None)
-        if want is not None:
-            assert mx.array_equal(got, want)
 
 
 def test_candidate_boundaries_are_aligned_and_longest_first():
@@ -210,51 +179,6 @@ def test_non_sliceable_members_ride_the_deepest_file(tmp_path):
     assert mx.array_equal(restored[1].state[0], rot.state[0])
 
 
-def test_a_pooling_cache_round_trips_every_slot(tmp_path):
-    """DeepSeek's pool cache: remainder rows, pooled rows and the overlap
-    carry must all survive, or a partial hit diverges from the live cache."""
-
-    store = SSDPromptSnapshotStore(tmp_path, step=STEP)
-    tokens = list(range(STEP))
-    original = _pooling(ratio=4, tokens=10)
-    assert original.remainder == 2 and original.prev_win_kv is not None
-
-    assert store.put(MODEL, tokens, [original])
-    restored = store.load(MODEL, tokens, STEP)
-
-    assert restored is not None
-    _assert_pooling_equal(restored[0], original)
-
-
-def test_the_deepseek_layer_shape_round_trips(tmp_path):
-    """The real DSA layout: CacheList(rotating, pool, pool) plus a plain
-    rotating layer, with a boundary-typical empty remainder on one pool."""
-
-    store = SSDPromptSnapshotStore(tmp_path, step=STEP)
-    tokens = list(range(STEP))
-    rot_member = RotatingKVCache(max_size=8)
-    plain = RotatingKVCache(max_size=8)
-    _advance([rot_member, plain], 20)
-    pool_small = _pooling(ratio=4, tokens=10)
-    pool_large = _pooling(ratio=128, tokens=256, with_prev=False)
-    assert pool_large.remainder == 0  # buf and prev slots are all None
-    caches = [CacheList(rot_member, pool_small, pool_large), plain]
-
-    assert store.put(MODEL, tokens, caches)
-    restored = store.load(MODEL, tokens, STEP)
-
-    assert restored is not None
-    assert [type(c).__name__ for c in restored] == ["CacheList", "RotatingKVCache"]
-    members = restored[0].caches
-    assert type(members[0]).__name__ == "RotatingKVCache"
-    assert mx.array_equal(members[0].state[0], rot_member.state[0])
-    _assert_pooling_equal(members[1], pool_small)
-    _assert_pooling_equal(members[2], pool_large)
-    assert mx.array_equal(restored[1].state[0], plain.state[0])
-    # The live cache was wrapped, not rewritten.
-    assert pool_small.prev_win_kv is not None
-
-
 def test_an_arrays_cache_with_an_unwritten_slot_round_trips(tmp_path):
     """A recurrent cache may leave slots None until a layer first writes them;
     the stand-in must carry the mixed written/unwritten layout exactly."""
@@ -270,46 +194,6 @@ def test_an_arrays_cache_with_an_unwritten_slot_round_trips(tmp_path):
     assert type(restored[0]).__name__ == "ArraysCache"
     assert mx.array_equal(restored[0][0], gdn[0])
     assert restored[0][1] is None
-
-
-def test_an_empty_pooling_cache_still_round_trips(tmp_path):
-    """A member with no state yet must not shift later caches in the file."""
-
-    store = SSDPromptSnapshotStore(tmp_path, step=STEP)
-    trailing = _kv()[0]
-    assert store.put(MODEL, list(range(STEP)), [PoolingCache(4), trailing])
-    restored = store.load(MODEL, list(range(STEP)), STEP)
-
-    assert restored is not None
-    assert type(restored[0]).__name__ == "PoolingCache"
-    assert restored[0].empty() and restored[0].ratio == 4
-    assert mx.array_equal(restored[1].state[0], trailing.state[0])
-
-
-def test_an_untouched_rotating_member_round_trips(tmp_path):
-    """DeepSeek short context: a sparse branch below its engagement length
-    keeps a rotating member whose state slices are zero-size, which
-    safetensors rejects. The stand-in must carry it and every later cache."""
-
-    store = SSDPromptSnapshotStore(tmp_path, step=STEP)
-    idle = RotatingKVCache(max_size=8)
-    idle.keys = mx.zeros((1, 2, 0, 4), dtype=mx.float16)
-    idle.values = mx.zeros((1, 2, 0, 4), dtype=mx.float16)
-    pool = _pooling(ratio=4, tokens=10)
-    trailing = RotatingKVCache(max_size=8)
-    _advance([trailing], 20)
-
-    assert store.put(MODEL, list(range(STEP)), [CacheList(idle, pool), trailing])
-    restored = store.load(MODEL, list(range(STEP)), STEP)
-
-    assert restored is not None
-    members = restored[0].caches
-    assert type(members[0]).__name__ == "RotatingKVCache"
-    assert members[0].offset == 0
-    assert members[0].keys.shape == (1, 2, 0, 4)
-    assert members[0].keys.dtype == mx.float16
-    _assert_pooling_equal(members[1], pool)
-    assert mx.array_equal(restored[1].state[0], trailing.state[0])
 
 
 def test_a_new_store_reclaims_what_a_dead_process_left(tmp_path):

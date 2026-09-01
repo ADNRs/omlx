@@ -227,7 +227,7 @@ class TestApplyProfile:
             top_p=0.5,
             top_k=40,
             max_tokens=512,
-            dflash_enabled=True,
+            mtp_enabled=True,
             ttl_seconds=300,
             is_pinned=True,
         )
@@ -242,7 +242,7 @@ class TestApplyProfile:
         assert s.max_tokens is None
         # Model-specific fields keep additive overlay (preset/template chips
         # materialize universal-only profiles and must not disturb them)
-        assert s.dflash_enabled is True
+        assert s.mtp_enabled is True
         # Excluded fields are never touched by profiles
         assert s.ttl_seconds == 300
         assert s.is_pinned is True
@@ -290,39 +290,11 @@ class TestApplyProfile:
         assert s.forced_ct_kwargs is None
 
     def test_apply_overlays_model_specific_fields_when_present(self, mgr):
-        mgr.set_settings("m", ModelSettings(turboquant_kv_enabled=False))
-        mgr.save_profile("m", "p", "P", None, {"turboquant_kv_enabled": True})
+        mgr.set_settings("m", ModelSettings(mtp_enabled=False))
+        mgr.save_profile("m", "p", "P", None, {"mtp_enabled": True})
         mgr.apply_profile("m", "p")
-        assert mgr.get_settings("m").turboquant_kv_enabled is True
+        assert mgr.get_settings("m").mtp_enabled is True
 
-    def test_apply_resolves_vlm_mtp_processor_conflict(self, tmp_path):
-        manager = ModelSettingsManager(tmp_path)
-        manager.set_settings(
-            "m",
-            ModelSettings(
-                vlm_mtp_enabled=True,
-                vlm_mtp_draft_model="qwen-mtp-drafter",
-            ),
-        )
-        manager.save_profile(
-            "m",
-            "penalty",
-            "Penalty",
-            None,
-            {"presence_penalty": 1.5},
-        )
-
-        applied = manager.apply_profile("m", "penalty")
-
-        assert applied is not None
-        assert applied.presence_penalty == 1.5
-        assert applied.vlm_mtp_enabled is False
-        assert applied.active_profile_name == "penalty"
-
-        persisted = ModelSettingsManager(tmp_path).get_settings("m")
-        assert persisted.presence_penalty == 1.5
-        assert persisted.vlm_mtp_enabled is False
-        assert persisted.active_profile_name == "penalty"
 
     def test_apply_tolerates_legacy_empty_string_values(self, tmp_path):
         profiles_file = tmp_path / "model_profiles.json"
@@ -394,33 +366,19 @@ class TestProfileFieldFiltering:
         )
         assert mgr.get_profile("m", "p")["settings"] == {"top_p": 0.9}
 
-    def test_qwen_ane_prefill_fields_round_trip_as_model_specific(self, mgr):
+    def test_model_specific_fields_round_trip_as_model_specific(self, mgr):
         settings = {
-            "qwen35_ane_prefill_enabled": True,
-            "qwen35_ane_prefill_sequence_length": 2048,
-            "qwen35_ane_prefill_tail_padding_min_tokens": 1357,
-            "qwen35_ane_prefill_fraction": 0.53,
-            "qwen35_ane_prefill_max_layers": 64,
-            "qwen35_ane_prefill_dual_ane": True,
-            "qwen35_ane_prefill_gdn": True,
-            "qwen35_ane_prefill_gdn_fraction": 0.50,
-            "qwen35_ane_prefill_gdn_max_layers": 48,
+            "mtp_enabled": True,
+            "mtp_num_draft_tokens": 3,
         }
 
-        mgr.save_profile("m", "ane", "ANE", None, settings)
-        assert mgr.get_profile("m", "ane")["settings"] == settings
+        mgr.save_profile("m", "mtp", "MTP", None, settings)
+        assert mgr.get_profile("m", "mtp")["settings"] == settings
 
-        mgr.apply_profile("m", "ane")
+        mgr.apply_profile("m", "mtp")
         applied = mgr.get_settings("m")
-        assert applied.qwen35_ane_prefill_enabled is True
-        assert applied.qwen35_ane_prefill_sequence_length == 2048
-        assert applied.qwen35_ane_prefill_tail_padding_min_tokens == 1357
-        assert applied.qwen35_ane_prefill_fraction == 0.53
-        assert applied.qwen35_ane_prefill_max_layers == 64
-        assert applied.qwen35_ane_prefill_dual_ane is True
-        assert applied.qwen35_ane_prefill_gdn is True
-        assert applied.qwen35_ane_prefill_gdn_fraction == 0.50
-        assert applied.qwen35_ane_prefill_gdn_max_layers == 48
+        assert applied.mtp_enabled is True
+        assert applied.mtp_num_draft_tokens == 3
 
     def test_save_template_drops_none_and_empty_string_values(self, mgr):
         mgr.save_template(
@@ -446,7 +404,7 @@ class TestTemplatesCRUD:
             description="d",
             settings={
                 "temperature": 0.0,
-                "turboquant_kv_enabled": True,
+                "mtp_enabled": True,
                 "is_pinned": True,
             },
         )
@@ -468,7 +426,7 @@ class TestTemplatesCRUD:
         mgr.update_template(
             "coding",
             display_name="Coding v2",
-            settings={"temperature": 0.2, "turboquant_kv_enabled": True},
+            settings={"temperature": 0.2, "mtp_enabled": True},
         )
         t = mgr.get_template("coding")
         assert t["display_name"] == "Coding v2"
@@ -571,7 +529,7 @@ class TestExposedProfilePersistence:
         _save_exposed_profile(
             mgr,
             name="accelerated",
-            settings={"temperature": 0.6, "dflash_enabled": True},
+            settings={"temperature": 0.6, "mtp_enabled": True},
         )
 
         flags = {
@@ -705,7 +663,7 @@ class TestExposedProfileRequestSettings:
         mgr.set_settings("qwen-base", ModelSettings(temperature=0.2))
         _save_exposed_profile(
             mgr,
-            settings={"temperature": 0.9, "dflash_enabled": True},
+            settings={"temperature": 0.9, "mtp_enabled": True},
         )
 
         settings = mgr.get_settings_for_request(
@@ -714,7 +672,7 @@ class TestExposedProfileRequestSettings:
         )
 
         assert settings.temperature == 0.9
-        assert settings.dflash_enabled is False
+        assert settings.mtp_enabled is False
 
     def test_runtime_settings_include_engine_fields_without_mutating_base(self, mgr):
         mgr.set_settings(

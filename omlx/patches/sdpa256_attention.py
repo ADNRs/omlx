@@ -24,9 +24,9 @@ route keeps the memory-safe default: always tiled past the kv_len threshold.
 (pre-#2204 behavior); ``OMLX_SDPA256_TILED=0`` never engages it (restores the
 O(L^2) memory wall — benchmarking only).
 
-Install mechanics mirror turboquant_attention.py (patch the module attr + rebind
-already-imported model modules). The route is strictly gated (see _should_route);
-everything else passes through to the original SDPA unchanged.
+Install mechanics: patch the module attr + rebind already-imported model
+modules. The route is strictly gated (see _should_route); everything else
+passes through to the original SDPA unchanged.
 """
 
 import logging
@@ -46,18 +46,165 @@ HEAD_DIM = 256
 # fallback's O(L^2) score matrix becomes a memory problem. Below this, the
 # fused-GEMM fallback is faster and fits comfortably. Tunable.
 _SDPA256_MIN_KV_LEN = 8192
-# Decode-shaped multi-row calls (MTP verify: q_len = 1 + draft depth <= 9)
-# must not take this route: the per-KV-tile eval sync only amortizes over
-# prefill-sized q tiles, and at tiny q_len it costs O(kv_len/tile) sequential
-# dispatches per call — 8-22x slower than stock SDPA, collapsing long-context
-# MTP throughput (issue #2127). Below this floor the stock path's score
-# matrix is at most n_q * 15 * kv_len, which is never a memory problem.
+# Multi-row decode-shaped calls (MTP verify: q_len = 1 + draft depth <= 9)
+# stay on the stock path: at q_len 2-8 the Q-tiled kernel's batched GEMM
+# shapes underperform the stock unfused fallback (measured 22.8 vs 9.4
+# ms/layer at kv=200k — the broadcast-GQA GEMM materializes poorly at
+# tiny M), and no fused multi-row hd-256 kernel exists. Decode (q_len 1)
+# keeps the fused vector kernel.
 _SDPA256_MIN_Q_LEN = 16
-# Tile sizes for the online-softmax kernel (tuned on M2 Max).
-_Q_TILE = 512
-_KV_TILE = 1024
-
+# Q-tile cap for the kernel (auto-sized down by live headroom; see
+# _pick_q_tile). Env-overridable: OMLX_SDPA256_Q_TILE. Measured on M5 Pro
+# at q_len 2048 (2026-08-27 sweep): tile 128-256 is the sweet spot —
+# 200k kv: 64 -> 1440ms, 128 -> 893ms, 256 -> 870ms (1.66x), 512+ ->
+# slower or flat while transient keeps growing; 100k kv: flat 128-512.
+# Capping at 256 keeps the transient bounded with the best throughput.
+_Q_TILE = 256
+# Per-score-element transient bytes budgeted when sizing a Q tile.
+# MEASURED with mx.get_peak_memory at kv=200k (2026-08-27): marginal cost
+# 5.1 bytes/elem for tiles >= 128 (score bf16 write 2 + softmax passes +
+# PV read; fixed q/k/v/out buffers amortize away at larger tiles). The
+# previous 10 B/elem constant was 2x conservative and capped the tile at
+# 64 rows at 200k — M=64 GEMMs run at ~1/3 of tensor-core peak.
+_Q_TILE_BYTES_PER_ELEM = 5.5
+# Transient ceiling for one Q tile when no guard headroom is available
+# (no scheduler / unit tests): keeps the kernel memory-safe standalone.
+_Q_TILE_DEFAULT_BUDGET = 4 * 1024**3
+# When live headroom IS available, one Q tile may claim at most this
+# fraction of it (and at most this absolute cap). The first flash chunk's
+# tile-pool fill is recorded by the scheduler's transient tracker as a
+# positive phys delta; keeping the budget a minority share of headroom
+# leaves room for that one-off charge plus KV growth, so the pre-chunk
+# guard never rejects the SECOND chunk over the first's pool allocation
+# (the pool is reused afterwards and the measured delta collapses back to
+# KV growth, healing the prediction within one chunk).
+_Q_TILE_HEADROOM_FRACTION = 0.35
+_Q_TILE_BUDGET_CAP = 3 * 1024**3
+# Second budget anchored to the PHYSICAL admission-limit headroom rather
+# than the sizing target: the sizing target reserves headroom for PERSISTENT
+# growth (KV), and at 200k context it leaves only ~2.75GB — never enough
+# for a productive tile (192 rows needs ~5GB). A tile transient is
+# short-lived and pool-recycled; it competes with the enforcer's hard
+# watermark, not the sizing target. The fraction is deliberately a MINORITY
+# share: the tile peak also carries the chunk's other activations, KV
+# growth, and boundary-snapshot slop on top, and the pool itself is capped
+# (8GB default) — larger fractions measurably cycle the pool against the
+# enforcer at 170K+ and spiral into requeue rejections (2026-08-28
+# regression: 0.80 of the raw-limit headroom capped 262K runs at ~15xK).
+_Q_TILE_PHYS_FRACTION = 0.50
+_Q_TILE_PHYS_BUDGET_CAP = 4 * 1024**3
 _NEG_INF = -1e30  # fp32 sentinel for masked logits (exp -> 0)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = int(os.environ.get(name, "").strip())
+        return v if v > 0 else default
+    except Exception:
+        return default
+
+
+def _pick_q_tile(n_q: int, kv_len: int) -> int:
+    """Size one Q tile so its score transient fits the live headroom.
+
+    The kernel materializes [n_q, q_tile, kv_len] scores per Q tile (bf16
+    GEMM out, bf16 softmax pass, bf16 weights — ~10 bytes/elem). Sizing the
+    tile from the guard's live headroom keeps the peak under the same
+    ceiling the scheduler enforces, lets short contexts run the whole chunk
+    in one tile, and shrinks the tile automatically as context grows. The
+    budget is a minority share of headroom (see _Q_TILE_HEADROOM_FRACTION)
+    so the first chunk's pool allocation cannot crowd out KV growth in the
+    guard's own accounting."""
+    # The physical-headroom budget is currently DISABLED for production
+    # sizing (2026-08-28 postmortem): any tile large enough to move the
+    # needle (192-256 rows = 3.5-5GB transient) cycles the capped MLX pool
+    # against the enforcer at long context, and the per-window refill
+    # deltas poison the transient estimator into chunk collapse and
+    # requeue rejections (262K runs died at 51K-177K across three tuning
+    # attempts). The speed answer is the fused NAX kernel (O(1)
+    # transient), not bigger composed-GEMM tiles. Provider kept for the
+    # fused-kernel work; fraction deliberately zero.
+    budget = _Q_TILE_DEFAULT_BUDGET
+    live = unfused_headroom_bytes()
+    if live is not None:
+        budget = max(
+            512 << 20,
+            min(int(live * _Q_TILE_HEADROOM_FRACTION), _Q_TILE_BUDGET_CAP),
+        )
+    tile = int(budget // (max(n_q, 1) * max(kv_len, 1) * _Q_TILE_BYTES_PER_ELEM))
+    tile = min(_Q_TILE, tile)
+    tile = max(64, tile)
+    return tile - (tile % 64)
+
+
+def _flash_sdpa256(queries, keys, values, scale, mask):
+    """Flash-style attention for head_dim=256 prefill, tiled over Q only.
+
+    queries: [batch, n_q, q_len, head_dim]
+    keys/values: [batch, n_kv, k_len, head_dim]   (n_q % n_kv == 0)
+    mask: "causal" or None. Returns [batch, n_q, q_len, head_dim] in
+    queries.dtype.
+
+    Per Q tile (headroom-sized, see ``_pick_q_tile``): one bf16 QK^T GEMM
+    over the FULL key span (NAX tensor cores), one fused fp32 softmax, one
+    bf16 PV GEMM. The [q_tile x kv_len] score tile is transient and bounded
+    by the tile sizing — peak stays O(headroom), never O(q_len x kv_len)
+    for the whole chunk. Profiling on M5 Pro (29 TFLOPS bf16 GEMM) showed
+    the earlier KV-tiled online-softmax kernel spends most of its time in
+    per-tile eval syncs and fp32 elementwise passes (~470GB of softmax
+    traffic per layer at 100k kv_len — bandwidth-bound at 6.6x off GEMM
+    peak); this layout keeps the GEMMs big and the softmax fused, running
+    near the GEMM roofline instead.
+
+    MLX is lazy: each Q tile's output is eval'd to bound the live graph.
+    """
+    batch, n_q, q_len, head_dim = queries.shape
+    _, n_kv, k_len, _ = keys.shape
+    group_size = n_q // n_kv
+    causal = mask == "causal"
+    dtype = queries.dtype
+
+    qr = queries.reshape(batch, n_kv, group_size, q_len, head_dim)
+    kr = keys.reshape(batch, n_kv, 1, k_len, head_dim)
+    vr = values.reshape(batch, n_kv, 1, k_len, head_dim)
+
+    # MLX 'causal' aligns queries to the END of the key axis: with a cached
+    # prefix (k_len > q_len, chunked prefill) local query i is global position
+    # i + offset and attends keys 0..(i + offset). offset == 0 for square.
+    offset = k_len - q_len
+
+    k_pos = mx.arange(k_len).reshape(1, 1, 1, 1, k_len) if causal else None
+    q_tile = _pick_q_tile(n_q, k_len)
+
+    out_q_tiles = []
+    for qi0 in range(0, q_len, q_tile):
+        qi1 = min(qi0 + q_tile, q_len)
+        # scale is applied to the queries up front: for head_dim 256 it is
+        # 2^-4 — exactly representable in bf16, so this costs nothing in
+        # precision and saves a full pass over the score tile.
+        qb = qr[:, :, :, qi0:qi1, :] * scale
+        qt = qi1 - qi0
+
+        # Full-KV score GEMM in the input dtype (NAX tensor cores; measured
+        # 27-31 TFLOPS at these shapes). Softmax stays in the input dtype
+        # too: an fp32 upcast more than doubles tile traffic and mx.softmax
+        # measured only ~119GB/s on the fp32 volume — the dominant cost of
+        # the first cut of this kernel. bf16 softmax matches the numerics
+        # class of stock MLX SDPA (whose weights matmul is input-dtype).
+        s = qb @ mx.swapaxes(kr, -1, -2)
+        if causal:
+            q_pos = mx.arange(qi0 + offset, qi1 + offset).reshape(
+                1, 1, 1, qt, 1
+            )
+            s = mx.where(k_pos > q_pos, float("-inf"), s)
+        w = mx.softmax(s, axis=-1)
+        out_tile = w @ vr
+
+        mx.eval(out_tile)  # bound the live graph -> headroom-sized peak
+        out_q_tiles.append(out_tile)
+
+    out = mx.concatenate(out_q_tiles, axis=3)
+    return out.reshape(batch, n_q, q_len, head_dim)
 
 # Live guard-headroom provider for memory-aware routing (issue #2204).
 # Registered by Scheduler.__init__ as a bound method returning the bytes left
@@ -97,6 +244,37 @@ def set_unfused_headroom_provider(method) -> None:
     _HEADROOM_PROVIDER = weakref.WeakMethod(method)
 
 
+# Second provider: live headroom under the PHYSICAL hard ceiling (the
+# enforcer's hard limit minus current usage). Registered by the Scheduler
+# alongside _HEADROOM_PROVIDER; the Q-tile sizer uses it to let the
+# short-lived tile transient use memory the sizing target reserves for
+# persistent KV growth. WeakMethod for the same teardown reasons.
+_PHYS_HEADROOM_PROVIDER: "weakref.WeakMethod | None" = None
+
+
+def set_physical_headroom_provider(method) -> None:
+    """Register a bound method returning bytes left under the physical hard
+    ceiling (negative/None when no ceiling is active)."""
+    global _PHYS_HEADROOM_PROVIDER
+    _PHYS_HEADROOM_PROVIDER = weakref.WeakMethod(method)
+
+
+def physical_headroom_bytes():
+    """Live hard-ceiling headroom in bytes, or ``None`` when inactive."""
+    provider = (
+        _PHYS_HEADROOM_PROVIDER() if _PHYS_HEADROOM_PROVIDER is not None else None
+    )
+    if provider is None:
+        return None
+    try:
+        headroom = provider()
+    except Exception:
+        return None
+    if headroom is None or headroom < 0:
+        return None
+    return int(headroom)
+
+
 def _parse_force_tiled_env() -> bool | None:
     value = os.environ.get("OMLX_SDPA256_TILED", "").strip()
     if value == "1":
@@ -106,48 +284,104 @@ def _parse_force_tiled_env() -> bool | None:
     return None
 
 
+def _sticky_tiled_enabled() -> bool:
+    return os.environ.get("OMLX_SDPA256_STICKY", "1").strip() != "0"
+
+
+def unfused_headroom_bytes():
+    """Live guard headroom in bytes, or ``None`` when no ceiling is active.
+
+    Shared by this module's route gate and other long-context prefill routes
+    so every O(L^2)-shaped decision prices against the same scheduler
+    target."""
+    provider = _HEADROOM_PROVIDER() if _HEADROOM_PROVIDER is not None else None
+    if provider is None:
+        return None
+    try:
+        headroom = provider()
+    except Exception:
+        return None
+    if headroom is None or headroom < 0:
+        return None
+    return int(headroom)
+
+
+# The shared estimator prices ONE unfused SDPA call: the bf16 score matrix
+# plus the fp32 output. The real unfused path also materializes softmax
+# temporaries of the same [n_q, q_len, kv_len] shape, and MLX's async eval
+# can keep more than one layer's graph live, so the measured Metal peak runs
+# ~1.7-2x the raw estimate (262k-context Qwen3.8-27B repro, 2026-08-25
+# server log: ~11.6GB estimate at kv_len 124928 vs ~20GB observed spike).
+# Pricing only the raw matrix let the route re-engage the unfused path right
+# after an eviction/reclaim re-opened headroom, overshoot the target again,
+# and loop (prefill-LRU-eviction thrash, issue #2204 follow-up).
+_UNFUSED_TRANSIENT_SAFETY = 3.0
+
+# High-water kv_len at which the unfused path last proved not to fit. The
+# unfused transient grows with kv_len and within one prefill current usage
+# only grows, so once it did not fit at kv_len K it cannot fit again at
+# kv_len >= K on the same envelope — regardless of the transient headroom a
+# just-finished reclaim opened (that headroom is the buffer pool the very
+# next chunk re-allocates). Without this ratchet the route flips between
+# unfused and tiled every reclaim cycle. Cleared only by process restart;
+# a shorter request starts below the mark and keeps the fast path.
+# OMLX_SDPA256_STICKY=0 disables it (benchmarking).
+_STICKY_TILED_KV_LEN: int | None = None
+_ROUTE_PROBE_LOGGED = False
+
+
 def _tiled_route_required(queries, keys) -> bool:
     """Decide tiled vs stock for a shape-matched prefill call (True = tiled).
 
     The stock unfused fallback is faster wherever its score matrix fits
     (issues #2155 / #2204), so take the tiled pass only when the unfused
     transient would not fit under the guard ceiling — or when no headroom
-    info is available, keeping the memory-safe #2025 behavior."""
+    info is available, keeping the memory-safe #2025 behavior. The transient
+    is priced with a safety multiplier (see ``_UNFUSED_TRANSIENT_SAFETY``)
+    and engagement is sticky (see ``_STICKY_TILED_KV_LEN``)."""
+    global _STICKY_TILED_KV_LEN
     if _FORCE_TILED is not None:
         if _FORCE_TILED:
             _note_tiled_route("forced", "forced by OMLX_SDPA256_TILED=1")
         return _FORCE_TILED
+    kv_len = int(keys.shape[-2])
+    if (
+        _sticky_tiled_enabled()
+        and _STICKY_TILED_KV_LEN is not None
+        and kv_len >= _STICKY_TILED_KV_LEN
+    ):
+        _note_tiled_route(
+            "sticky",
+            f"kv_len={kv_len} at/above the high-water mark {_STICKY_TILED_KV_LEN} "
+            "where the unfused path last proved not to fit",
+        )
+        return True
+    headroom = unfused_headroom_bytes()
+    if headroom is None:
+        _note_tiled_route(
+            "no-ceiling",
+            "memory ceiling not available (no guard headroom provider "
+            "registered, or enforcer state not yet propagated)",
+        )
+        return True
     try:
-        provider = _HEADROOM_PROVIDER() if _HEADROOM_PROVIDER is not None else None
-        if provider is None:
-            _note_tiled_route(
-                "no-provider",
-                "no guard headroom provider registered "
-                "(engine without a scheduler, or scheduler gone)",
-            )
-            return True
-        headroom = provider()
-        if headroom is None or headroom < 0:
-            _note_tiled_route(
-                "no-ceiling",
-                "memory ceiling not available (enforcer state not yet "
-                "propagated)",
-            )
-            return True
         batch, n_q, q_len, _ = queries.shape
         transient = estimate_unfused_sdpa_call_bytes(
             batch * n_q,
             q_len,
-            keys.shape[-2],
+            kv_len,
             HEAD_DIM,
             score_dtype_size=queries.dtype.size,
-        )
+        ) * _UNFUSED_TRANSIENT_SAFETY
         if transient > headroom:
             _note_tiled_route(
                 "insufficient-headroom",
                 f"unfused transient ~{transient / 2**20:.0f}MiB exceeds live "
                 f"guard headroom ~{headroom / 2**20:.0f}MiB at "
-                f"kv_len={keys.shape[-2]}",
+                f"kv_len={kv_len}",
+            )
+            _STICKY_TILED_KV_LEN = max(
+                _STICKY_TILED_KV_LEN or 0, kv_len
             )
             return True
         return False
@@ -157,100 +391,6 @@ def _tiled_route_required(queries, keys) -> bool:
         return True  # headroom info unavailable -> memory-safe default
 
 
-def _broadcast_mask_5d(mask, batch, n_kv, group_size, q_len, k_len):
-    """Reshape a boolean mask for the tiled GQA attention layout."""
-    if mask.ndim == 4:
-        if mask.shape[1] == 1:
-            return mask[:, :, None]
-        return mask.reshape(batch, n_kv, group_size, q_len, k_len)
-    if mask.ndim == 3:
-        return mask[:, None, None]
-    if mask.ndim == 2:
-        return mask[None, None, None]
-    raise ValueError(f"unsupported attention mask ndim: {mask.ndim}")
-
-
-def _flash_sdpa256(queries, keys, values, scale, mask):
-    """Flash-style online-softmax attention for head_dim=256 prefill.
-
-    queries: [batch, n_q, q_len, head_dim]
-    keys/values: [batch, n_kv, k_len, head_dim]   (n_q % n_kv == 0)
-    mask: "causal", None, or a boolean array. Returns
-    [batch, n_q, q_len, head_dim] in queries.dtype.
-
-    Tiles over Q and KV, keeping a running (max m, sum denom, accumulator acc) per
-    query row so the [q x full_kv] score matrix is never materialized. fp32
-    accumulators; output cast back to the input dtype. GQA via reshape+broadcast.
-
-    MLX is lazy: without forcing materialization the whole tiled graph would stay
-    live until eval (peak dominated by graph buildup, not the O(L) working set),
-    so the running carry is eval'd per KV step / per finished Q tile to bound the
-    live graph to ~one tile -> true O(L) peak.
-    """
-    batch, n_q, q_len, head_dim = queries.shape
-    _, n_kv, k_len, _ = keys.shape
-    group_size = n_q // n_kv
-    causal = isinstance(mask, str) and mask == "causal"
-    bool_mask = None
-    if isinstance(mask, mx.array):
-        if mask.dtype != mx.bool_:
-            raise ValueError("_flash_sdpa256 only supports boolean array masks")
-        bool_mask = _broadcast_mask_5d(
-            mask, batch, n_kv, group_size, q_len, k_len
-        )
-
-    qr = queries.reshape(batch, n_kv, group_size, q_len, head_dim)
-    kr = keys.reshape(batch, n_kv, 1, k_len, head_dim)
-    vr = values.reshape(batch, n_kv, 1, k_len, head_dim)
-
-    # MLX 'causal' aligns queries to the END of the key axis: with a cached
-    # prefix (k_len > q_len, chunked prefill) local query i is global position
-    # i + offset and attends keys 0..(i + offset). offset == 0 for square.
-    offset = k_len - q_len
-
-    out_q_tiles = []
-    for qi0 in range(0, q_len, _Q_TILE):
-        qi1 = min(qi0 + _Q_TILE, q_len)
-        qb = qr[:, :, :, qi0:qi1, :].astype(mx.float32)
-        qt = qi1 - qi0
-        q_pos = mx.arange(qi0 + offset, qi1 + offset).reshape(1, 1, 1, qt, 1)
-
-        m = mx.full((batch, n_kv, group_size, qt, 1), _NEG_INF, dtype=mx.float32)
-        denom = mx.zeros((batch, n_kv, group_size, qt, 1), dtype=mx.float32)
-        acc = mx.zeros((batch, n_kv, group_size, qt, head_dim), dtype=mx.float32)
-
-        kv_end = min(qi1 + offset, k_len) if causal else k_len
-        for kj0 in range(0, kv_end, _KV_TILE):
-            kj1 = min(kj0 + _KV_TILE, kv_end)
-            kb = kr[:, :, :, kj0:kj1, :].astype(mx.float32)
-            vb = vr[:, :, :, kj0:kj1, :].astype(mx.float32)
-            kt = kj1 - kj0
-
-            s = (qb @ mx.swapaxes(kb, -1, -2)) * scale
-            if causal:
-                k_pos = mx.arange(kj0, kj1).reshape(1, 1, 1, 1, kt)
-                s = mx.where(k_pos > q_pos, _NEG_INF, s)
-            elif bool_mask is not None:
-                tile_mask = bool_mask[..., qi0:qi1, kj0:kj1]
-                s = mx.where(tile_mask, s, _NEG_INF)
-
-            m_tile = mx.max(s, axis=-1, keepdims=True)
-            m_new = mx.maximum(m, m_tile)
-            p = mx.exp(s - m_new)
-            corr = mx.exp(m - m_new)
-            denom = denom * corr + mx.sum(p, axis=-1, keepdims=True)
-            acc = acc * corr + (p @ vb)
-            m = m_new
-            mx.eval(m, denom, acc)  # bound the live graph -> O(L) peak
-
-        out_tile = (acc / denom).astype(queries.dtype)
-        mx.eval(out_tile)
-        out_q_tiles.append(out_tile)
-
-    out = mx.concatenate(out_q_tiles, axis=3)
-    return out.reshape(batch, n_q, q_len, head_dim)
-
-
 def _should_route(queries, keys, cache, mask, sinks) -> bool:
     # Never raise: any unexpected input must fall through to the original SDPA,
     # never break a request. Worst case we decline to engage.
@@ -258,6 +398,19 @@ def _should_route(queries, keys, cache, mask, sinks) -> bool:
     # on every SDPA call of every decode step, so the common (decode / MTP
     # verify) case must exit on the q_len check alone (issue #2132).
     try:
+        if queries.shape[-2] >= 16 and queries.shape[-1] == HEAD_DIM:
+            global _ROUTE_PROBE_LOGGED
+            if not _ROUTE_PROBE_LOGGED:
+                _ROUTE_PROBE_LOGGED = True
+                logger.info(
+                    "sdpa256 route probe: cache=%s bits=%s mask=%s "
+                    "kv_len=%s q_len=%s route_pending",
+                    type(cache).__name__,
+                    hasattr(cache, "bits"),
+                    type(mask).__name__,
+                    keys.shape[-2] if hasattr(keys, "shape") else "?",
+                    queries.shape[-2],
+                )
         if queries.shape[-2] < _SDPA256_MIN_Q_LEN:  # decode / MTP verify
             return False
         if queries.shape[-1] != HEAD_DIM:
@@ -266,7 +419,7 @@ def _should_route(queries, keys, cache, mask, sinks) -> bool:
             return False
         if sinks is not None:
             return False
-        # Quantized KV cache (TurboQuant etc.): keys/values are packed state,
+        # Quantized KV cache: keys/values are packed state,
         # not plain [.., kv, hd] arrays. MLX's own dispatcher detects this via
         # hasattr(cache, "bits"); let the quant-aware path handle it.
         if cache is not None and hasattr(cache, "bits"):
@@ -290,11 +443,12 @@ def _should_route(queries, keys, cache, mask, sinks) -> bool:
 def apply_sdpa256_attention_patch(min_kv_len: int = _SDPA256_MIN_KV_LEN) -> bool:
     """Monkey-patch mlx-lm's scaled_dot_product_attention for head_dim=256
     long-context prefill, and register the O(L) cost with the memory monitor."""
-    global _PATCHED, _SDPA256_MIN_KV_LEN, _FORCE_TILED
+    global _PATCHED, _SDPA256_MIN_KV_LEN, _FORCE_TILED, _Q_TILE
     if _PATCHED:
         return False
     _SDPA256_MIN_KV_LEN = min_kv_len
     _FORCE_TILED = _parse_force_tiled_env()
+    _Q_TILE = _env_int("OMLX_SDPA256_Q_TILE", _Q_TILE)
 
     try:
         from mlx_lm.models import base as mlx_base
@@ -337,8 +491,8 @@ def apply_sdpa256_attention_patch(min_kv_len: int = _SDPA256_MIN_KV_LEN) -> bool
         if getattr(mod, "scaled_dot_product_attention", None) is original_sdpa:
             mod.scaled_dot_product_attention = patched_sdpa
 
-    # mlx-vlm carries its own base SDPA (a distinct function, TurboQuant-aware
-    # cache handling included), and model modules like qwen3_5.language copy
+    # mlx-vlm carries its own base SDPA (a distinct function, with its own
+    # cache handling), and model modules like qwen3_5.language copy
     # the reference at import time. It needs its own capture + wrapper +
     # submodule rebind, mirroring qwen35_fa256_attention: checking mlx-vlm
     # modules against the mlx-lm original can never match, which left the VLM
@@ -387,12 +541,15 @@ def apply_sdpa256_attention_patch(min_kv_len: int = _SDPA256_MIN_KV_LEN) -> bool
                     mod.scaled_dot_product_attention = patched_vlm_sdpa
 
     # Keep the prefill memory guard in lockstep: tell the monitor head_dim 256
-    # prefill is now O(L), so it stops charging the O(L^2) score matrix.
+    # prefill no longer materializes the O(L^2) score matrix. The Q-tiled
+    # kernel's true transient is bounded by the live headroom at tile-sizing
+    # time (_pick_q_tile), so the estimator's one-tile charge is a floor the
+    # measured EWMA terms of the guard build on top of.
     try:
         from .. import memory_monitor
 
         memory_monitor.register_tiled_prefill_head_dim(
-            HEAD_DIM, min_kv_len=min_kv_len, kv_tile=_KV_TILE
+            HEAD_DIM, min_kv_len=min_kv_len, kv_tile=1024
         )
     except Exception:
         logger.debug("could not register sdpa256 with memory_monitor", exc_info=True)

@@ -56,19 +56,10 @@ class TestDetectThinkingDefault:
         """Directory without any template file returns None."""
         assert detect_thinking_default(tmp_path) is None
 
-    def test_laguna_template_uses_recommended_serving_default(self, tmp_path):
-        """Laguna's effective default follows Poolside's serving recommendation."""
-        (tmp_path / "config.json").write_text(json.dumps({"model_type": "laguna"}))
-        (tmp_path / "chat_template.jinja").write_text(
-            "{%- set enable_thinking = enable_thinking | default(false) -%}\n"
-            "{%- if not enable_thinking -%}</think>{%- else -%}<think>{%- endif -%}"
-        )
 
-        assert detect_thinking_default(tmp_path) is True
-
-    def test_laguna_without_thinking_template_returns_none(self, tmp_path):
-        """A Laguna config alone is not evidence that its template accepts the flag."""
-        (tmp_path / "config.json").write_text(json.dumps({"model_type": "laguna"}))
+    def test_config_without_thinking_template_returns_none(self, tmp_path):
+        """A config alone is not evidence that its template accepts the flag."""
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": "llama"}))
 
         assert detect_thinking_default(tmp_path) is None
 

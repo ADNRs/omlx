@@ -8,7 +8,6 @@ import pytest
 
 from omlx.cluster.collective import (
     CollectiveSmokeError,
-    _run_local_minimax_decode_smoke,
     run_local_collective_smoke,
     run_local_pipeline_smoke,
 )
@@ -140,39 +139,3 @@ def test_local_pipeline_smoke_rejects_divergent_outputs():
         run_local_pipeline_smoke(runner=runner, starting_port=43000)
 
 
-def test_local_minimax_decode_smoke_validates_real_rank_roles():
-    def runner(argv, *, timeout):
-        assert "omlx.cluster.minimax_decode_smoke_worker" in argv
-        assert timeout == 9.0
-        records = [
-            {
-                "type": "minimax_decode_result",
-                "model_type": "minimax_m3_vl",
-                "rank": rank,
-                "size": 2,
-                "steps": 3,
-                "skip_logits": rank != 0,
-                "local_layer_count": 2,
-                "local_cache_count": 2,
-                "logprobs_width": 128,
-                "next_token": 17,
-            }
-            for rank in (0, 1)
-        ]
-        return subprocess.CompletedProcess(
-            argv,
-            0,
-            stdout="\n".join(json.dumps(record) for record in records),
-            stderr="",
-        )
-
-    result = _run_local_minimax_decode_smoke(
-        timeout=9.0,
-        runner=runner,
-        starting_port=43000,
-    )
-
-    assert result["ok"] is True
-    assert result["steps"] == 3
-    assert result["ranks"][0]["skip_logits"] is False
-    assert result["ranks"][1]["skip_logits"] is True

@@ -14,8 +14,6 @@ count, else fall back to the top-level config.
 
 from unittest.mock import MagicMock
 
-import mlx.core as mx
-
 from omlx.memory_monitor import (
     _SDPA_FALLBACK_SCORE_DTYPE_SIZE,
     _SDPA_FULL_SUPPORTED_HEAD_DIMS,
@@ -24,7 +22,6 @@ from omlx.memory_monitor import (
     MemoryMonitor,
     collect_kv_layer_specs,
     estimate_mla_kv_bytes_per_token,
-    estimate_qwen4_exp_kv_bytes_per_token,
 )
 from omlx.scheduler import Scheduler, SchedulerConfig
 
@@ -97,17 +94,6 @@ class _GlmMlaConfig:
     index_head_dim = 128
 
 
-class _Qwen4Config:
-    model_type = "qwen4_exp"
-    num_key_value_heads = 2
-    head_dim = 128
-    indexer_head_dim = 128
-
-
-class QSAKVCache:
-    pass
-
-
 class _VLMConfigEmptySubConfigs:
     """Sub-configs are present but expose no layer count — skip and fall
     back to the top-level config. Defends against accidentally walking
@@ -118,20 +104,6 @@ class _VLMConfigEmptySubConfigs:
     num_attention_heads = 32
     head_dim = 128
     text_config = MagicMock(spec=["something_else"])  # no layer count
-
-
-def test_qwen4_qsa_memory_includes_indexer_and_mrope_state():
-    caches = [QSAKVCache() for _ in range(12)]
-
-    full_layers, rotating, arrays = collect_kv_layer_specs(caches)
-    estimate = estimate_qwen4_exp_kv_bytes_per_token(
-        _Qwen4Config(),
-        caches,
-        dtype_size=2,
-    )
-
-    assert (full_layers, rotating, arrays) == (12, [], 0)
-    assert estimate == 12 * (2 * 2 * 128 * 2 + 128 * 2 + 3 * 8)
 
 
 class TestSetModelInfoForMonitorVLMWalk:
@@ -280,23 +252,6 @@ class TestMlaKvMemoryEstimate:
         assert actual == tokens * bytes_per_token
         assert actual < standard / 20
 
-    def test_nope_mla_accepts_zero_rope_and_prices_pooling_ratio(self):
-        from omlx.patches.deepseek_v4 import apply_pooling_cache_support
-
-        apply_pooling_cache_support()
-        from mlx_lm.models.cache import CacheList, KVCache, PoolingCache
-
-        config = type(
-            "NopeMlaConfig",
-            (),
-            {"kv_lora_rank": 512, "qk_rope_head_dim": 0, "index_head_dim": 128},
-        )()
-        caches = [CacheList(KVCache(), PoolingCache(4)) for _ in range(11)]
-
-        assert estimate_mla_kv_bytes_per_token(config, caches, 2) == (
-            11 * (512 + 128 / 4) * 2
-        )
-
     def test_scheduler_passes_mla_kv_override_to_monitor(self):
         sched = _make_scheduler()
         sched.memory_monitor = MagicMock()
@@ -312,176 +267,6 @@ class TestMlaKvMemoryEstimate:
         assert kwargs["num_kv_heads"] == 64
         assert kwargs["num_kv_cache_layers"] == 99
         assert kwargs["kv_bytes_per_token"] == (78 * (512 + 64) + 21 * 128) * 2
-
-
-class TestSetModelInfoTurboQuantDtype:
-    def _make_sched_with_config(self, config) -> Scheduler:
-        from mlx_lm.models.cache import KVCache
-
-        sched = _make_scheduler()
-        sched.memory_monitor = MagicMock()
-        sched.model = MagicMock()
-        sched.model.config = config
-        sched.model.make_cache.return_value = [KVCache() for _ in range(40)]
-        del sched.model.args
-        return sched
-
-    def test_no_turboquant_uses_full_dtype(self):
-        sched = self._make_sched_with_config(_PlainLMConfig())
-        sched._turboquant_kv_bits = None
-
-        sched._set_model_info_for_monitor()
-
-        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
-        assert kwargs["dtype_size"] == 2
-
-    def test_turboquant_4bit_without_skip_last_uses_quantized_dtype(self):
-        sched = self._make_sched_with_config(_PlainLMConfig())
-        sched._turboquant_kv_bits = 4.0
-        sched._turboquant_skip_last = False
-
-        sched._set_model_info_for_monitor()
-
-        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
-        expected = 4.0 / 8.0 + 2.0 / 128
-        assert abs(kwargs["dtype_size"] - expected) < 1e-9
-
-    def test_turboquant_4bit_default_skip_last_keeps_one_full_dtype_layer(self):
-        sched = self._make_sched_with_config(_PlainLMConfig())
-        sched._turboquant_kv_bits = 4.0
-        sched._turboquant_skip_last = True
-
-        sched._set_model_info_for_monitor()
-
-        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
-        quantized = 4.0 / 8.0 + 2.0 / 128
-        expected = (39 * quantized + 2.0) / 40
-        assert abs(kwargs["dtype_size"] - expected) < 1e-9
-
-    def test_turboquant_8bit_without_skip_last_uses_quantized_dtype(self):
-        sched = self._make_sched_with_config(_PlainLMConfig())
-        sched._turboquant_kv_bits = 8.0
-        sched._turboquant_skip_last = False
-
-        sched._set_model_info_for_monitor()
-
-        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
-        expected = 8.0 / 8.0 + 2.0 / 128
-        assert abs(kwargs["dtype_size"] - expected) < 1e-9
-
-    def test_turboquant_dtype_with_vlm_nested_config(self):
-        sched = self._make_sched_with_config(_VLMConfigWithTextConfig())
-        sched._turboquant_kv_bits = 4.0
-        sched._turboquant_skip_last = False
-
-        sched._set_model_info_for_monitor()
-
-        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
-        assert kwargs["num_layers"] == 40
-        expected = 4.0 / 8.0 + 2.0 / 128
-        assert abs(kwargs["dtype_size"] - expected) < 1e-9
-
-    def test_turboquant_hybrid_arrays_cache_counts_only_kv_layers(self):
-        from mlx_lm.models.cache import ArraysCache, KVCache
-
-        sched = self._make_sched_with_config(_VLMConfigWithTextConfig())
-        sched.model.make_cache.return_value = [
-            KVCache() if (i + 1) % 4 == 0 else ArraysCache(size=2) for i in range(40)
-        ]
-        sched._turboquant_kv_bits = 4.0
-        sched._turboquant_skip_last = True
-
-        sched._set_model_info_for_monitor()
-
-        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
-        quantized = 4.0 / 8.0 + 2.0 / 128
-        expected = (9 * quantized + 2.0) / 10
-        assert kwargs["num_kv_cache_layers"] == 10
-        assert abs(kwargs["dtype_size"] - expected) < 1e-9
-
-    def test_turboquant_arrays_cache_only_uses_full_dtype(self):
-        from mlx_lm.models.cache import ArraysCache
-
-        sched = self._make_sched_with_config(_PlainLMConfig())
-        sched.model.make_cache.return_value = [ArraysCache(size=2) for _ in range(40)]
-        sched._turboquant_kv_bits = 4.0
-        sched._turboquant_skip_last = False
-
-        sched._set_model_info_for_monitor()
-
-        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
-        assert kwargs["dtype_size"] == 2
-
-    def test_turboquant_ineligible_cache_uses_full_dtype(self):
-        sched = self._make_sched_with_config(_PlainLMConfig())
-        sched.model.make_cache.return_value = [object()]
-        sched._turboquant_kv_bits = 4.0
-        sched._turboquant_skip_last = False
-
-        sched._set_model_info_for_monitor()
-
-        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
-        assert kwargs["dtype_size"] == 2
-
-    def test_turboquant_mla_model_uses_full_dtype(self):
-        class _MLAConfig(_PlainLMConfig):
-            kv_lora_rank = 512
-
-        sched = self._make_sched_with_config(_MLAConfig())
-        sched._turboquant_kv_bits = 4.0
-        sched._turboquant_skip_last = False
-
-        sched._set_model_info_for_monitor()
-
-        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
-        assert kwargs["dtype_size"] == 2
-
-    def test_turboquant_attention_sink_model_uses_full_dtype(self):
-        sched = self._make_sched_with_config(_PlainLMConfig())
-        sched.model.modules = lambda: [{"sinks": mx.zeros((8,))}]
-        sched._turboquant_kv_bits = 4.0
-        sched._turboquant_skip_last = True
-
-        sched._set_model_info_for_monitor()
-
-        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
-        assert kwargs["dtype_size"] == 2
-
-    def test_reported_scale_fits_after_turboquant_skip_last_accounting(self):
-        tokens = 327_872
-        ceiling = 44.0 * 1024**3
-        current = 27.17 * 1024**3
-        headroom = ceiling - current
-
-        monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
-        monitor.set_model_info(
-            num_layers=40,
-            num_kv_heads=8,
-            head_dim=128,
-            dtype_size=2,
-            num_attention_heads=32,
-            num_kv_cache_layers=40,
-        )
-        full_dtype_peak = monitor.estimate_prefill_peak_bytes(
-            tokens, 2048, cached_tokens=0
-        )
-
-        quantized = 4.0 / 8.0 + 2.0 / 128
-        skip_last_dtype = (39 * quantized + 2.0) / 40
-        monitor.set_model_info(
-            num_layers=40,
-            num_kv_heads=8,
-            head_dim=128,
-            dtype_size=skip_last_dtype,
-            num_attention_heads=32,
-            num_kv_cache_layers=40,
-        )
-        turboquant_peak = monitor.estimate_prefill_peak_bytes(
-            tokens, 2048, cached_tokens=0
-        )
-
-        assert full_dtype_peak > headroom
-        assert turboquant_peak < headroom
 
 
 class TestSdpaDispatchEstimate:

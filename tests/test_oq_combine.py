@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the MTP combine steps in omlx.oq (gemma4 assistant merge and
-the native Qwen3.5/3.6 donor head graft).
+"""Tests for the MTP combine steps in omlx.oq (the native Qwen3.5/3.6
+donor head graft).
 
 Uses tiny synthetic checkpoints on disk — no model loading, no GPU work
 beyond a few small mx arrays.
@@ -14,128 +14,14 @@ import mlx.core as mx
 import pytest
 
 from omlx.oq import (
-    GEMMA4_ASSISTANT_MTP_PREFIX,
-    GEMMA4_ASSISTANT_MTP_SHARD,
+    MTP_MERGED_SHARD,
     MTPLX_RUNTIME_FILE,
     MTPLX_SIDECAR_SHARD,
-    combine_gemma4_assistant_mtp,
     combine_mtp_donor,
     combine_mtp_into_output,
     import_mtplx_sidecar,
-    validate_gemma4_assistant_pair,
     validate_mtp_donor_pair,
 )
-
-BASE_CONFIG = {
-    "model_type": "gemma4",
-    "vision_config": {},
-    "text_config": {"model_type": "gemma4_text", "hidden_size": 24},
-    "quantization": {"group_size": 64, "bits": 4},
-}
-
-ASSISTANT_CONFIG = {
-    "model_type": "gemma4_assistant",
-    "backbone_hidden_size": 24,
-    "tie_word_embeddings": True,
-    "text_config": {"model_type": "gemma4_text", "hidden_size": 8, "num_hidden_layers": 2},
-}
-
-
-def _write_base_output(tmp_path):
-    out = tmp_path / "base-oQ4"
-    out.mkdir()
-    (out / "config.json").write_text(json.dumps(BASE_CONFIG))
-    weights = {"language_model.model.embed_tokens.weight": mx.zeros((4, 24))}
-    mx.save_safetensors(str(out / "model-00001-of-00001.safetensors"), weights)
-    index = {
-        "metadata": {"total_size": 100},
-        "weight_map": {
-            k: "model-00001-of-00001.safetensors" for k in weights
-        },
-    }
-    (out / "model.safetensors.index.json").write_text(json.dumps(index))
-    return out
-
-
-def _write_assistant(tmp_path, config=None):
-    asst = tmp_path / "assistant"
-    asst.mkdir()
-    (asst / "config.json").write_text(json.dumps(config or ASSISTANT_CONFIG))
-    weights = {
-        "model.embed_tokens.weight": mx.ones((4, 8)),
-        "pre_projection.weight": mx.ones((8, 48)),
-        "post_projection.weight": mx.ones((24, 8)),
-    }
-    mx.save_safetensors(str(asst / "model.safetensors"), weights)
-    return asst
-
-
-def test_combine_writes_shard_index_and_config(tmp_path):
-    out = _write_base_output(tmp_path)
-    asst = _write_assistant(tmp_path)
-
-    combine_gemma4_assistant_mtp(out, asst)
-
-    shard = out / GEMMA4_ASSISTANT_MTP_SHARD
-    assert shard.exists()
-    merged = mx.load(str(shard))
-    assert set(merged) == {
-        GEMMA4_ASSISTANT_MTP_PREFIX + "model.embed_tokens.weight",
-        GEMMA4_ASSISTANT_MTP_PREFIX + "pre_projection.weight",
-        GEMMA4_ASSISTANT_MTP_PREFIX + "post_projection.weight",
-    }
-
-    index = json.loads((out / "model.safetensors.index.json").read_text())
-    for key in merged:
-        assert index["weight_map"][key] == GEMMA4_ASSISTANT_MTP_SHARD
-    # Base entries survive and total_size grows by the mtp shard bytes.
-    assert (
-        index["weight_map"]["language_model.model.embed_tokens.weight"]
-        == "model-00001-of-00001.safetensors"
-    )
-    mtp_bytes = sum(v.nbytes for v in merged.values())
-    assert index["metadata"]["total_size"] == 100 + mtp_bytes
-
-    config = json.loads((out / "config.json").read_text())
-    tc = config["text_config"]
-    assert tc["mtp_num_hidden_layers"] == 2
-    assert tc["mtp_assistant_config"] == ASSISTANT_CONFIG
-    # Base fields untouched.
-    assert config["quantization"] == BASE_CONFIG["quantization"]
-    assert tc["hidden_size"] == 24
-
-
-def test_combine_rejects_non_assistant_model(tmp_path):
-    out = _write_base_output(tmp_path)
-    wrong = dict(ASSISTANT_CONFIG)
-    wrong["model_type"] = "gemma4"
-    asst = _write_assistant(tmp_path, config=wrong)
-    with pytest.raises(ValueError, match="gemma4_assistant"):
-        combine_gemma4_assistant_mtp(out, asst)
-
-
-def test_validate_rejects_hidden_size_mismatch():
-    mismatched = dict(ASSISTANT_CONFIG)
-    mismatched["backbone_hidden_size"] = 32
-    with pytest.raises(ValueError, match="backbone_hidden_size"):
-        validate_gemma4_assistant_pair(BASE_CONFIG, mismatched)
-
-
-def test_validate_rejects_non_gemma4_base():
-    base = dict(BASE_CONFIG)
-    base["model_type"] = "qwen3_5"
-    with pytest.raises(ValueError, match="gemma4 base"):
-        validate_gemma4_assistant_pair(base, ASSISTANT_CONFIG)
-
-
-def test_validate_rejects_headless_assistant():
-    headless = dict(ASSISTANT_CONFIG)
-    headless["text_config"] = {"model_type": "gemma4_text"}
-    with pytest.raises(ValueError, match="num_hidden_layers"):
-        validate_gemma4_assistant_pair(BASE_CONFIG, headless)
-
-
-# ── Native Qwen3.5/3.6 donor head graft ─────────────────────────────────
 
 QWEN_GEOMETRY = {
     "vocab_size": 16,
@@ -147,6 +33,7 @@ QWEN_GEOMETRY = {
     "rms_norm_eps": 1e-06,
     "rope_theta": 10000,
 }
+
 
 TOKENIZER_BYTES = b'{"version": "qwen-test-tokenizer"}'
 
@@ -278,7 +165,7 @@ def test_graft_bf16_donor_writes_shard_index_config(tmp_path):
 
     combine_mtp_donor(out, donor)
 
-    shard = out / GEMMA4_ASSISTANT_MTP_SHARD
+    shard = out / MTP_MERGED_SHARD
     assert shard.exists()
     merged = mx.load(str(shard))
     assert merged, "no mtp tensors grafted"
@@ -291,7 +178,7 @@ def test_graft_bf16_donor_writes_shard_index_config(tmp_path):
 
     index = json.loads((out / "model.safetensors.index.json").read_text())
     for key in merged:
-        assert index["weight_map"][key] == GEMMA4_ASSISTANT_MTP_SHARD
+        assert index["weight_map"][key] == MTP_MERGED_SHARD
     mtp_bytes = sum(v.nbytes for v in merged.values())
     assert index["metadata"]["total_size"] == 100 + mtp_bytes
 
@@ -328,7 +215,7 @@ def test_graft_quantized_donor_synthesizes_per_layer_entries(tmp_path):
         # fc ships bf16 without scales — no entry, stays float on load.
         assert "mtp.fc" not in quant
 
-    merged = mx.load(str(out / GEMMA4_ASSISTANT_MTP_SHARD))
+    merged = mx.load(str(out / MTP_MERGED_SHARD))
     donor_weights = mx.load(str(donor / "model.safetensors"))
     key = "mtp.layers.0.self_attn.q_proj.weight"
     assert mx.array_equal(merged[key], donor_weights[key])
@@ -345,7 +232,7 @@ def test_graft_remaps_vlm_donor_prefix_into_text_recipient(tmp_path):
 
     combine_mtp_donor(out, donor)
 
-    merged = mx.load(str(out / GEMMA4_ASSISTANT_MTP_SHARD))
+    merged = mx.load(str(out / MTP_MERGED_SHARD))
     assert all(k.startswith("mtp.") for k in merged)
     config = json.loads((out / "config.json").read_text())
     assert config["mtp_num_hidden_layers"] == 1
@@ -360,7 +247,7 @@ def test_graft_remaps_text_donor_prefix_into_vlm_recipient(tmp_path):
 
     combine_mtp_donor(out, donor)
 
-    merged = mx.load(str(out / GEMMA4_ASSISTANT_MTP_SHARD))
+    merged = mx.load(str(out / MTP_MERGED_SHARD))
     assert all(k.startswith("language_model.mtp.") for k in merged)
     config = json.loads((out / "config.json").read_text())
     assert config["text_config"]["mtp_num_hidden_layers"] == 1
@@ -404,7 +291,8 @@ def test_validate_rejects_family_mismatch(tmp_path):
 
 
 def test_validate_rejects_non_qwen_recipient(tmp_path):
-    out = _write_base_output(tmp_path)
+    out = _write_qwen_output(tmp_path)
+    (out / "config.json").write_text(json.dumps({"model_type": "llada"}))
     donor = _write_qwen_donor(tmp_path)
     with pytest.raises(ValueError, match="Qwen3.5/Qwen3.6 recipients"):
         validate_mtp_donor_pair(out, donor)
@@ -423,13 +311,6 @@ def test_validate_rejects_undeclared_donor(tmp_path):
     with pytest.raises(ValueError, match="no MTP head"):
         validate_mtp_donor_pair(out, donor)
 
-
-def test_combine_dispatch_routes_gemma4_assistant(tmp_path):
-    out = _write_base_output(tmp_path)
-    asst = _write_assistant(tmp_path)
-    combine_mtp_into_output(out, asst)
-    config = json.loads((out / "config.json").read_text())
-    assert config["text_config"]["mtp_assistant_config"] == ASSISTANT_CONFIG
 
 
 def test_combine_dispatch_routes_qwen_donor(tmp_path):
@@ -500,7 +381,7 @@ def test_import_mtplx_sidecar_remaps_vlm_prefix(tmp_path):
     result = import_mtplx_sidecar(out)
 
     assert result["merge_mode"] == "remap"
-    shard = out / GEMMA4_ASSISTANT_MTP_SHARD
+    shard = out / MTP_MERGED_SHARD
     assert shard.exists()
     merged = mx.load(str(shard))
     assert all(k.startswith("language_model.mtp.") for k in merged)
@@ -508,7 +389,7 @@ def test_import_mtplx_sidecar_remaps_vlm_prefix(tmp_path):
     index = json.loads((out / "model.safetensors.index.json").read_text())
     assert (
         index["weight_map"]["language_model.mtp.fc.weight"]
-        == GEMMA4_ASSISTANT_MTP_SHARD
+        == MTP_MERGED_SHARD
     )
 
     config = json.loads((out / "config.json").read_text())
@@ -528,11 +409,11 @@ def test_import_mtplx_sidecar_renames_when_keys_align(tmp_path):
     # Bare keys already match: the side-car is renamed onto the shard name
     # mlx_lm's model*.safetensors glob actually opens. No duplicate bytes.
     assert result["merge_mode"] == "rename"
-    assert (out / GEMMA4_ASSISTANT_MTP_SHARD).exists()
+    assert (out / MTP_MERGED_SHARD).exists()
     assert not (out / MTPLX_SIDECAR_SHARD).exists()
 
     index = json.loads((out / "model.safetensors.index.json").read_text())
-    assert index["weight_map"]["mtp.fc.weight"] == GEMMA4_ASSISTANT_MTP_SHARD
+    assert index["weight_map"]["mtp.fc.weight"] == MTP_MERGED_SHARD
 
 
 def test_import_mtplx_sidecar_resolves_mtp_file_override(tmp_path):
@@ -549,7 +430,7 @@ def test_import_mtplx_sidecar_resolves_mtp_file_override(tmp_path):
     result = import_mtplx_sidecar(out)
 
     assert result["merge_mode"] == "remap"
-    assert (out / GEMMA4_ASSISTANT_MTP_SHARD).exists()
+    assert (out / MTP_MERGED_SHARD).exists()
     # Sub-directory side-cars are invisible to the loader globs and stay put.
     assert (out / "mtp" / "weights.safetensors").exists()
 

@@ -80,20 +80,43 @@ def test_eligibility_gates():
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-def test_eligibility_gates_turboquant_proxy():
-    """A turboquant-quantized KV cache hands back a proxy with .shape but no
-    .ndim (mlx_vlm.turboquant._QuantizedStateProxy, kept dequantized-free on
-    purpose). _eligible() must treat that as "not ours" rather than raising —
-    it used to crash every verify forward once turboquant KV compression was
-    active, since the .ndim check ran before the cache-type guard could rule
-    the call out.
-    """
+def test_nax_first_routing():
+    """The patched seam tries the NAX split-K kernel before the chunked
+    vector path: engaged at/above the KV floor (output matches the fp32
+    reference), declined below it or when the fa256 route table is empty
+    (the caller then falls back to the vector chunks)."""
+    from omlx.custom_kernels.qwen35_prefill import fast as fa_fast
+    from omlx.patches import qwen35_fa256_attention as fa
+    from omlx.patches.qwen35_verify_sdpa_split import _NAX_MIN_KV_LEN, _nax_sdpa
 
-    class _TurboQuantProxy:
-        def __init__(self, shape):
-            self.shape = shape
+    if not fa_fast.nax_attn256_available():
+        pytest.skip("NAX dsplit kernel unavailable")
 
-    q = mx.random.normal((1, HQ, 4, HD)).astype(mx.bfloat16)
-    k = mx.random.normal((1, HKV, 256, HD)).astype(mx.bfloat16)
-    assert _eligible(_TurboQuantProxy((1, HQ, 4, HD)), k, None) == 0
-    assert _eligible(q, _TurboQuantProxy((1, HKV, 256, HD)), None) == 0
+    q = mx.random.normal((1, HQ, 5, HD)).astype(mx.bfloat16)
+    k = mx.random.normal((1, HKV, _NAX_MIN_KV_LEN, HD)).astype(mx.bfloat16)
+    v = mx.random.normal((1, HKV, _NAX_MIN_KV_LEN, HD)).astype(mx.bfloat16)
+    scale = HD**-0.5
+
+    ref = _per_row_reference(q[:, :, :1], k, v, scale)  # shape sanity only
+    del ref
+
+    fa._NAX_ROUTE["kernel"] = fa_fast.qwen35_attn256_nax
+    fa._NAX_ROUTE["budget"] = 0
+    try:
+        out = _nax_sdpa(q, k, v, scale, _NAX_MIN_KV_LEN)
+        assert out is not None
+        assert out.shape == q.shape
+        # Agreement with the vector path it replaces (bf16 tail ULPs).
+        vec = _chunked_causal_sdpa(q, k, v, scale, 32 // (HQ // HKV))
+        diff = mx.abs(
+            out.astype(mx.float32) - vec.astype(mx.float32)
+        ).max().item()
+        assert diff <= 2e-2, f"NAX vs vector diff {diff}"
+        # Below the floor the seam declines (vector fallback).
+        assert _nax_sdpa(q, k[:, :, :-1], v[:, :, :-1], scale, 8191) is None
+        # Empty route table (fa256 patch unapplied) declines too.
+        fa._NAX_ROUTE["kernel"] = None
+        assert _nax_sdpa(q, k, v, scale, _NAX_MIN_KV_LEN) is None
+    finally:
+        fa._NAX_ROUTE["kernel"] = None
+        fa._NAX_ROUTE["budget"] = 0

@@ -163,37 +163,6 @@ def _pooling_layer(token_count: int, *, include_overlap_state: bool = False) -> 
     }
 
 
-def _delta_pooling_layer(token_count: int) -> list[dict]:
-    layers = [_pooling_layer(token_count, include_overlap_state=True)]
-    compact_pooling_cache_snapshot(layers, token_count, BLOCK_SIZE)
-    return layers
-
-
-def _make_v4_cache(tmp_path):
-    from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
-
-    apply_deepseek_v4_patch()
-    paged = PagedCacheManager(
-        block_size=BLOCK_SIZE,
-        max_blocks=100,
-        model_name="pooling-delta-test",
-        initial_blocks=100,
-    )
-    ssd = PagedSSDCacheManager(
-        cache_dir=tmp_path / "ssd",
-        max_size_bytes=100 * 1024**2,
-        hot_cache_max_bytes=10 * 1024**2,
-        hot_cache_only=True,
-        expected_model_name="pooling-delta-test",
-    )
-    cache = BlockAwarePrefixCache(
-        model=MockModel(num_layers=1),
-        paged_cache_manager=paged,
-        paged_ssd_cache_manager=ssd,
-    )
-    return cache, ssd
-
-
 def test_dedup_placeholder_rotating_block_backfilled(tmp_path):
     cache, ssd = _make_cache(tmp_path)
     tokens = list(range(3 * BLOCK_SIZE))
@@ -254,44 +223,6 @@ def test_partial_match_walks_back_to_backfilled_block(tmp_path):
     result = cache.reconstruct_cache(partial)
     assert result is not None
     assert partial.num_tokens == BLOCK_SIZE
-
-
-def test_dedup_placeholder_v4_delta_block_backfilled(tmp_path):
-    cache, ssd = _make_v4_cache(tmp_path)
-    tokens = list(range(3 * BLOCK_SIZE))
-
-    t1 = cache.store_cache("relic", tokens, [_pooling_layer(len(tokens))])
-    assert t1 is not None and len(t1.block_ids) == 3
-    b0, b1 = _block_hash(cache, t1, 0), _block_hash(cache, t1, 1)
-    data0, _ = ssd.load_block_with_metadata(b0)
-    assert cache._is_placeholder_state(data0[0])
-
-    assert cache.reconstruct_cache(_partial_table(cache, t1, 2, "pre")) is None
-
-    snapshots = {
-        tc: _delta_pooling_layer(tc)
-        for tc in range(BLOCK_SIZE, len(tokens) + 1, BLOCK_SIZE)
-    }
-    t2 = cache.store_cache(
-        "repair",
-        tokens,
-        [_pooling_layer(len(tokens))],
-        boundary_snapshots=snapshots,
-    )
-    assert t2 is not None
-
-    # Backfilled blocks carry the fresh delta form with per-block ranges.
-    for block_idx, block_hash in enumerate([b0, b1]):
-        block_data, _ = ssd.load_block_with_metadata(block_hash)
-        marker = block_data[0][0]
-        assert marker[0] == "__nstate__"
-        assert marker[1] == POOLING_CACHE_DELTA_CLASS
-        assert marker[2][5].tolist() == [block_idx, block_idx + 1]
-
-    partial = _partial_table(cache, t1, 2, "post")
-    restored = cache.reconstruct_cache(partial)
-    assert restored is not None
-    assert restored[0].caches[0].pooled.shape[1] == 2
 
 
 def test_no_snapshot_leaves_dedup_unchanged(tmp_path):

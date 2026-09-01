@@ -9,10 +9,10 @@ to run each in sequence and print a side-by-side comparison table.
 Usage
 -----
     # Single model
-    ~/.venv/bin/python scripts/bench.py ~/models/Bonsai-27B
+    ~/.venv/bin/python scripts/bench.py ~/models/Qwen3.8-27B-oQ4e-mtp
 
     # Compare two variants
-    ~/.venv/bin/python scripts/bench.py ~/models/bonsai-27b ~/.cache/huggingface/hub/models--prism-ml--Ternary-Bonsai-27B-mlx-2bit/snapshots/70f75f3ad081ab840a42f3304c02c27e7f89bfb7
+    ~/.venv/bin/python scripts/bench.py ~/models/Qwen3.8-27B-oQ4e-mtp ~/models/Qwen3.8-27B-AWQ-5.0bpw
 
     # With batch tests
     ~/.venv/bin/python scripts/bench.py model-a model-b --pp 1024 4096 --batch 2 4

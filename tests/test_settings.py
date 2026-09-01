@@ -419,7 +419,6 @@ class TestCacheSettings:
         assert settings.get_gdn_ssd_split_enabled() is True
         assert settings.gdn_ssd_pending_max_size == "512MB"
         assert settings.gdn_sidecar_state_dtype == "fp32"
-        assert settings.ane_compile_cache is False
         assert settings.initial_cache_blocks == 256
 
     def test_get_ssd_cache_dir_default(self):
@@ -465,8 +464,8 @@ class TestCacheSettings:
             "ssd_cache_max_size": "50GB",
             "hot_cache_max_size": "0",
             "hot_cache_write_through": False,
-            "ane_compile_cache": False,
             "initial_cache_blocks": 256,
+            "mx_cache_limit_gb": 8.0,
         }
 
     def test_from_dict(self):
@@ -964,7 +963,8 @@ class TestMemorySettings:
         """Memory guard defaults to balanced tier and guard on."""
         settings = MemorySettings()
         assert settings.prefill_memory_guard is True
-        assert settings.memory_guard_tier == "balanced"
+        assert settings.memory_guard_tier == "custom"
+        assert settings.memory_guard_custom_ceiling_gb == 48.0
 
     def test_to_dict(self):
         """Test serialization."""
@@ -993,13 +993,14 @@ class TestMemorySettings:
     def test_from_dict_defaults(self):
         """Test deserialization with empty dict uses defaults."""
         settings = MemorySettings.from_dict({})
-        assert settings.memory_guard_tier == "balanced"
+        assert settings.memory_guard_tier == "custom"
+        assert settings.memory_guard_custom_ceiling_gb == 48.0
         assert settings.prefill_memory_guard is True
 
-    def test_from_dict_invalid_tier_falls_back_to_balanced(self):
-        """Unknown tier values silently degrade to balanced."""
+    def test_from_dict_invalid_tier_falls_back_to_default(self):
+        """Unknown tier values silently degrade to the default tier."""
         settings = MemorySettings.from_dict({"memory_guard_tier": "wild"})
-        assert settings.memory_guard_tier == "balanced"
+        assert settings.memory_guard_tier == "custom"
 
     def test_from_dict_ignores_legacy_keys(self):
         """Legacy max_process_memory / is_explicit keys in old settings.json are ignored."""
@@ -1028,7 +1029,7 @@ class TestGlobalSettings:
             settings = GlobalSettings(base_path=Path(tmpdir))
             assert settings.server.host == "127.0.0.1"
             assert settings.server.port == 8000
-            assert settings.memory.memory_guard_tier == "balanced"
+            assert settings.memory.memory_guard_tier == "custom"
             assert settings.scheduler.max_concurrent_requests == 8
             assert settings.scheduler.embedding_batch_size == 32
             assert settings.cache.enabled is True
@@ -1078,7 +1079,7 @@ class TestGlobalSettings:
         settings = GlobalSettings.load(base_path=tmp_path, cli_args=args)
 
         assert settings.memory.memory_guard_tier == "safe"
-        assert settings.memory.memory_guard_custom_ceiling_gb == 0.0
+        assert settings.memory.memory_guard_custom_ceiling_gb == 48.0
 
     def test_cli_override_memory_guard_gb_sets_custom_tier(self, tmp_path):
         """CLI memory guard GB should select custom tier automatically."""
@@ -1094,7 +1095,7 @@ class TestGlobalSettings:
 
         assert settings.memory.prefill_memory_guard is False
         # The tier is left alone so turning the guard back on restores it.
-        assert settings.memory.memory_guard_tier == "balanced"
+        assert settings.memory.memory_guard_tier == "custom"
 
     def test_cli_tier_turns_a_disabled_guard_back_on(self, tmp_path):
         """A saved prefill_memory_guard=false used to make --memory-guard a

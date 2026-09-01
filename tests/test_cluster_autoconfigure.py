@@ -1521,26 +1521,6 @@ def _peer(found=(), missing=(), *, pip=None, uv=None, python="/peer/.venv/bin/py
     return runner
 
 
-def test_a_minimax_rank_needs_mlx_vlm_even_though_a_rank_is_an_mlx_lm_server(tmp_path):
-    """The exact shape of the failure: a text-path rank with a hidden mlx-vlm dep.
-
-    ``omlx.patches.minimax_m3_mlx_lm`` exists precisely because a rank is an
-    ``mlx_lm.server``, and it registers a model built on vendored mlx-vlm — so
-    "this is not a VLM load" is not a reason to skip asking for mlx-vlm.
-    """
-
-    from omlx.cluster.autoconfigure import required_imports
-
-    modules = {
-        requirement.module
-        for requirement in required_imports(
-            _model_dir(tmp_path, model_type="minimax_m3_vl")
-        )
-    }
-
-    assert "mlx_vlm" in modules
-
-
 def test_a_plain_llama_is_not_asked_to_bring_mlx_vlm(tmp_path):
     """Over-asking blocks a cluster that would have worked."""
 
@@ -1678,13 +1658,13 @@ def test_a_missing_import_names_the_module_and_what_asked_for_it(tmp_path):
 
     issues = peer_import_issues(
         {"studio": "studio"},
-        model_path=_model_dir(tmp_path, model_type="minimax_m3_vl"),
-        runner=_peer(missing=["mlx_vlm"], uv="/Users/omlx/.local/bin/uv"),
+        model_path=_model_dir(tmp_path, model_type="llama"),
+        runner=_peer(missing=["mlx_lm"], uv="/Users/omlx/.local/bin/uv"),
     )
 
     assert [issue.kind for issue in issues] == ["import_missing"]
-    assert "mlx_vlm" in issues[0].detail
-    assert "omlx.patches.minimax_m3_mlx_lm" in issues[0].detail
+    assert "mlx_lm" in issues[0].detail
+    assert "omlx.patches.mlx_lm_mtp" in issues[0].detail
 
 
 def test_a_missing_import_carries_a_command_that_installs_it(tmp_path):
@@ -1694,13 +1674,13 @@ def test_a_missing_import_carries_a_command_that_installs_it(tmp_path):
 
     issues = peer_import_issues(
         {"studio": "studio"},
-        model_path=_model_dir(tmp_path, model_type="minimax_m3_vl"),
-        runner=_peer(missing=["mlx_vlm"], uv="/Users/omlx/.local/bin/uv"),
+        model_path=_model_dir(tmp_path, model_type="llama"),
+        runner=_peer(missing=["mlx_lm"], uv="/Users/omlx/.local/bin/uv"),
     )
 
     command = issues[0].remediation
     assert command.startswith("ssh studio ")
-    assert "mlx-vlm" in command
+    assert "mlx-lm" in command
 
 
 def test_a_worker_venv_without_pip_is_told_to_use_the_installer_it_has(tmp_path):
@@ -1710,8 +1690,8 @@ def test_a_worker_venv_without_pip_is_told_to_use_the_installer_it_has(tmp_path)
 
     issues = peer_import_issues(
         {"studio": "studio"},
-        model_path=_model_dir(tmp_path, model_type="minimax_m3_vl"),
-        runner=_peer(missing=["mlx_vlm"], pip=None, uv="/Users/omlx/.local/bin/uv"),
+        model_path=_model_dir(tmp_path, model_type="llama"),
+        runner=_peer(missing=["mlx_lm"], pip=None, uv="/Users/omlx/.local/bin/uv"),
     )
 
     command = issues[0].remediation
@@ -1724,8 +1704,8 @@ def test_a_peer_with_pip_is_told_to_use_pip(tmp_path):
 
     issues = peer_import_issues(
         {"studio": "studio"},
-        model_path=_model_dir(tmp_path, model_type="minimax_m3_vl"),
-        runner=_peer(missing=["mlx_vlm"], pip="/peer/.venv/bin/pip"),
+        model_path=_model_dir(tmp_path, model_type="llama"),
+        runner=_peer(missing=["mlx_lm"], pip="/peer/.venv/bin/pip"),
     )
 
     assert "/peer/.venv/bin/python -m pip install" in issues[0].remediation
@@ -1736,26 +1716,26 @@ def test_a_peer_with_neither_installer_gets_a_command_that_still_works(tmp_path)
 
     issues = peer_import_issues(
         {"studio": "studio"},
-        model_path=_model_dir(tmp_path, model_type="minimax_m3_vl"),
-        runner=_peer(missing=["mlx_vlm"], pip=None, uv=None),
+        model_path=_model_dir(tmp_path, model_type="llama"),
+        runner=_peer(missing=["mlx_lm"], pip=None, uv=None),
     )
 
     assert "-m ensurepip" in issues[0].remediation
 
 
 def test_the_command_installs_the_version_omlx_pins(tmp_path):
-    """A peer on a different mlx-vlm fails differently, not less."""
+    """A peer on a different mlx-lm fails differently, not less."""
 
     from omlx.cluster.autoconfigure import _declared_requirements, peer_import_issues
 
-    pinned = _declared_requirements().get("mlx-vlm", "")
+    pinned = _declared_requirements().get("mlx-lm", "")
     if "git+" not in pinned:
         pytest.skip("oMLX metadata is unavailable in this environment")
 
     issues = peer_import_issues(
         {"studio": "studio"},
-        model_path=_model_dir(tmp_path, model_type="minimax_m3_vl"),
-        runner=_peer(missing=["mlx_vlm"], uv="/Users/omlx/.local/bin/uv"),
+        model_path=_model_dir(tmp_path, model_type="llama"),
+        runner=_peer(missing=["mlx_lm"], uv="/Users/omlx/.local/bin/uv"),
     )
 
     assert pinned in issues[0].remediation
@@ -1768,10 +1748,10 @@ def test_the_command_names_the_interpreter_the_peer_actually_ran(tmp_path):
 
     issues = peer_import_issues(
         {"studio": "studio"},
-        model_path=_model_dir(tmp_path, model_type="minimax_m3_vl"),
+        model_path=_model_dir(tmp_path, model_type="llama"),
         python_executable="/here/.venv/bin/python",
         runner=_peer(
-            missing=["mlx_vlm"],
+            missing=["mlx_lm"],
             uv="/Users/omlx/.local/bin/uv",
             python="/over/there/.venv/bin/python",
         ),
@@ -1787,8 +1767,8 @@ def test_a_peer_that_can_import_everything_raises_nothing(tmp_path):
     assert (
         peer_import_issues(
             {"studio": "studio"},
-            model_path=_model_dir(tmp_path, model_type="minimax_m3_vl"),
-            runner=_peer(found=["mlx", "mlx_lm", "mlx_vlm"]),
+            model_path=_model_dir(tmp_path, model_type="llama"),
+            runner=_peer(found=["mlx", "mlx_lm"]),
         )
         == ()
     )
@@ -1805,7 +1785,7 @@ def test_the_local_rank_is_not_asked_over_ssh(tmp_path):
     assert (
         peer_import_issues(
             {"here": "127.0.0.1", "also-here": "localhost"},
-            model_path=_model_dir(tmp_path, model_type="minimax_m3_vl"),
+            model_path=_model_dir(tmp_path, model_type="llama"),
             runner=runner,
         )
         == ()
@@ -1851,14 +1831,14 @@ def test_a_login_banner_ahead_of_the_report_does_not_hide_a_missing_import(tmp_p
     from omlx.cluster.autoconfigure import peer_import_issues
 
     def runner(argv, **kwargs):
-        report = {"python": "/peer/.venv/bin/python", "missing": ["mlx_vlm"]}
+        report = {"python": "/peer/.venv/bin/python", "missing": ["mlx_lm"]}
         return subprocess.CompletedProcess(
             argv, 0, "Welcome to the Studio\n" + json.dumps(report) + "\n", ""
         )
 
     issues = peer_import_issues(
         {"studio": "studio"},
-        model_path=_model_dir(tmp_path, model_type="minimax_m3_vl"),
+        model_path=_model_dir(tmp_path, model_type="llama"),
         runner=runner,
     )
 
@@ -1913,8 +1893,8 @@ def test_the_summary_shows_the_fix_and_not_only_the_failure(tmp_path):
 
     issues = peer_import_issues(
         {"studio": "studio"},
-        model_path=_model_dir(tmp_path, model_type="minimax_m3_vl"),
-        runner=_peer(missing=["mlx_vlm"], uv="/Users/omlx/.local/bin/uv"),
+        model_path=_model_dir(tmp_path, model_type="llama"),
+        runner=_peer(missing=["mlx_lm"], uv="/Users/omlx/.local/bin/uv"),
     )
 
     summary = describe_preflight(issues)

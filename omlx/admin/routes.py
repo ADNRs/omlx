@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import time
 from collections import deque
@@ -132,65 +133,16 @@ class ModelSettingsRequest(BaseModel):
     chat_template_kwargs: dict[str, Any] | None = None
     forced_ct_kwargs: list[str] | None = None
     ttl_seconds: int | None = None
-    index_cache_freq: int | None = None
     enable_thinking: bool | None = None
     # Keep  thinking blocks in historical turns (None = auto, True when the
     # template supports it). Mirrors ModelSettings.preserve_thinking.
     preserve_thinking: bool | None = None
-    qwen4_ple_ssd_offload: bool | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # MTP draft tokens per cycle for legacy MTP (None = adaptive default).
     mtp_num_draft_tokens: int | None = None
-    # TurboQuant KV cache (mlx-vlm backend)
-    turboquant_kv_enabled: bool | None = None
-    turboquant_kv_bits: float | None = None
-    turboquant_skip_last: bool | None = None
-    # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill
-    qwen35_ane_prefill_enabled: bool | None = None
-    qwen35_ane_prefill_sequence_length: int | None = None
-    qwen35_ane_prefill_tail_padding_min_tokens: int | None = None
-    qwen35_ane_prefill_fraction: float | None = None
-    qwen35_ane_prefill_fused_down: bool | None = None
-    qwen35_ane_prefill_max_layers: int | None = None
-    qwen35_ane_prefill_dual_ane: bool | None = None
-    qwen35_ane_prefill_gdn: bool | None = None
-    qwen35_ane_prefill_gdn_fraction: float | None = None
-    qwen35_ane_prefill_gdn_max_layers: int | None = None
-    qwen35_ane_prefill_cpu_enabled: bool | None = None
-    qwen35_ane_prefill_cpu_fraction: float | None = None
-    qwen35_ane_prefill_cpu_down_fraction: float | None = None
-    qwen35_ane_prefill_cpu_gdn_fraction: float | None = None
-    qwen35_ane_prefill_cpu_threads: int | None = None
-    qwen35_ane_prefill_cpu_shared_resource: bool | None = None
-    # SpecPrefill (experimental)
-    specprefill_enabled: bool | None = None
-    specprefill_draft_model: str | None = None
-    specprefill_keep_pct: float | None = None
-    specprefill_threshold: int | None = None
-    # DFlash (block diffusion speculative decoding)
-    dflash_enabled: bool | None = None
-    dflash_draft_model: str | None = None
-    dflash_draft_quant_enabled: bool | None = None
-    dflash_draft_quant_weight_bits: int | None = None
-    dflash_draft_quant_activation_bits: int | None = None
-    dflash_draft_quant_group_size: int | None = None
-    dflash_max_ctx: int | None = None
-    dflash_in_memory_cache: bool | None = None
-    dflash_in_memory_cache_max_entries: int | None = None
-    dflash_in_memory_cache_max_bytes: int | None = None
-    dflash_ssd_cache: bool | None = None
-    dflash_ssd_cache_max_bytes: int | None = None
-    dflash_draft_window_size: int | None = None
-    dflash_draft_sink_size: int | None = None
-    dflash_block_size: int | None = None
-    dflash_verify_mode: str | None = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     mtp_enabled: bool | None = None
-    # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
-    vlm_mtp_enabled: bool | None = None
-    vlm_mtp_draft_model: str | None = None
-    vlm_mtp_draft_block_size: int | None = None
     reasoning_parser: str | None = None
     guided_grammar_enabled: bool | None = None
     guided_grammar: str | None = None
@@ -289,7 +241,6 @@ class GlobalSettingsRequest(BaseModel):
     ssd_cache_max_size: str | None = None
     hot_cache_only: bool | None = None
     hot_cache_write_through: bool | None = None
-    ane_compile_cache: bool | None = None
     gdn_snapshot_storage: str | None = None
     gdn_ssd_split_enabled: bool | None = None
     gdn_ssd_pending_max_size: str | None = None
@@ -506,25 +457,6 @@ def _paroquant_compat_for_model(model_info: dict) -> tuple[bool, str]:
     return False, ""
 
 
-def _dflash_compat_for_model(model_info: dict) -> tuple[bool, str]:
-    """Resolve dflash compatibility for an engine_pool model dict.
-
-    Returns ``(False, "")`` when dflash-mlx is not installed so the UI hides
-    the compat hint instead of pointing the user at an unrelated reason.
-    """
-    is_paro, paro_reason = _paroquant_compat_for_model(model_info)
-    if is_paro:
-        return False, paro_reason
-    try:
-        from ..engine.dflash import is_dflash_compatible
-    except ImportError:
-        return False, ""
-    model_path = model_info.get("model_path") or ""
-    if not model_path:
-        return False, "model_path missing"
-    return is_dflash_compatible(model_path)
-
-
 def _entry_is_diffusion_model(entry) -> bool:
     model_type = (getattr(entry, "config_model_type", None) or "").lower()
     return model_type.replace("-", "_") == "diffusion_gemma"
@@ -548,22 +480,6 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
         "thinking_budget_tokens",
         "reasoning_parser",
         "guided_grammar",
-        "index_cache_freq",
-        "specprefill_draft_model",
-        "specprefill_keep_pct",
-        "specprefill_threshold",
-        "dflash_draft_model",
-        "dflash_draft_quant_enabled",
-        "dflash_draft_quant_weight_bits",
-        "dflash_draft_quant_activation_bits",
-        "dflash_draft_quant_group_size",
-        "dflash_max_ctx",
-        "dflash_draft_window_size",
-        "dflash_draft_sink_size",
-        "dflash_block_size",
-        "dflash_verify_mode",
-        "vlm_mtp_draft_model",
-        "vlm_mtp_draft_block_size",
     )
     for key in unsupported_none_fields:
         settings[key] = None
@@ -571,18 +487,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["force_sampling"] = False
     settings["thinking_budget_enabled"] = False
     settings["guided_grammar_enabled"] = False
-    settings["turboquant_kv_enabled"] = False
-    settings["turboquant_kv_bits"] = 4
-    settings["turboquant_skip_last"] = True
-    settings["specprefill_enabled"] = False
-    settings["dflash_enabled"] = False
-    settings["dflash_in_memory_cache"] = True
-    settings["dflash_in_memory_cache_max_entries"] = 4
-    settings["dflash_in_memory_cache_max_bytes"] = 8 * 1024 * 1024 * 1024
-    settings["dflash_ssd_cache"] = False
-    settings["dflash_ssd_cache_max_bytes"] = 20 * 1024 * 1024 * 1024
     settings["mtp_enabled"] = False
-    settings["vlm_mtp_enabled"] = False
 
     unsupported_ct_kwargs = {
         "enable_thinking",
@@ -645,38 +550,11 @@ def _sanitize_diffusion_model_settings(settings) -> None:
         ]
         settings.forced_ct_kwargs = filtered_forced or None
 
-    settings.index_cache_freq = None
-    settings.turboquant_kv_enabled = False
-    settings.turboquant_kv_bits = 4
-    settings.turboquant_skip_last = True
-    settings.specprefill_enabled = False
-    settings.specprefill_draft_model = None
-    settings.specprefill_keep_pct = None
-    settings.specprefill_threshold = None
-    settings.dflash_enabled = False
-    settings.dflash_draft_model = None
-    settings.dflash_draft_quant_enabled = None
-    settings.dflash_draft_quant_weight_bits = None
-    settings.dflash_draft_quant_activation_bits = None
-    settings.dflash_draft_quant_group_size = None
-    settings.dflash_max_ctx = None
-    settings.dflash_in_memory_cache = True
-    settings.dflash_in_memory_cache_max_entries = 4
-    settings.dflash_in_memory_cache_max_bytes = 8 * 1024 * 1024 * 1024
-    settings.dflash_ssd_cache = False
-    settings.dflash_ssd_cache_max_bytes = 20 * 1024 * 1024 * 1024
-    settings.dflash_draft_window_size = None
-    settings.dflash_draft_sink_size = None
-    settings.dflash_block_size = None
-    settings.dflash_verify_mode = None
     settings.mtp_enabled = False
-    settings.vlm_mtp_enabled = False
-    settings.vlm_mtp_draft_model = None
-    settings.vlm_mtp_draft_block_size = None
 
 
 def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
-    """Mirror of ``_dflash_compat_for_model`` for the native MTP toggle.
+    """Resolve native MTP compatibility for an engine_pool model dict.
 
     Returns ``(compatible, reason)``. Reason is empty on success and
     suitable for surfacing to users (admin UI shows it under the toggle).
@@ -686,9 +564,8 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
     converter actually preserved the MTP tensors, using the loader's
     ``_checkpoint_has_mtp_weights`` so native nextn layouts
     (``model.layers.<num_hidden_layers + i>.*``, e.g. GLM-5.2) count as
-    present (issue #2326). Qwen4-Exp uses its narrower runtime detector,
-    which accepts only embedded ``mtp.*`` tensors. Default mlx-lm converters
-    strip ``mtp.*``; PR 990 ships a separate path that keeps them.
+    present (issue #2326). Default mlx-lm converters strip ``mtp.*``; PR 990
+    ships a separate path that keeps them.
     """
     import json
     from pathlib import Path
@@ -716,18 +593,10 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
     model_type = cfg.get("model_type")
     if not _has_mtp_heads(cfg):
         return False, "model has no MTP heads in config"
-    # qwen4_exp (Qwen3.8 Flash Next) attaches its Lightning MTP head through
-    # the dedicated VLM path in omlx.utils.model_loading (vendored mlx-vlm
-    # qwen4_exp model + mlx_lm_mtp dispatch patch) and never goes through the
-    # mlx-lm ``_is_mtp_compatible`` whitelist, which gates the generic
-    # text-model patch. Mirroring the runtime, the admin gate accepts
-    # qwen4_exp and relies on the embedded ``mtp.*`` weight check below —
-    # the same condition the runtime path uses.
-    if model_type != "qwen4_exp" and not _is_mtp_compatible(cfg, model_type):
+    if not _is_mtp_compatible(cfg, model_type):
         return False, (
             f"model_type={model_type!r} is not on the MTP whitelist "
-            "(supported: qwen3_5*, qwen3_6*, deepseek_v4*, glm_moe_dsa, "
-            "gemma4, gemma4_unified)"
+            "(supported: qwen3_5* / qwen3_6*)"
         )
     if not _checkpoint_has_mtp_weights(model_path):
         from ..oq import _resolve_mtplx_sidecar
@@ -738,11 +607,6 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
             return False, (
                 "MTPLX side-car detected but not imported. Import it to "
                 "merge the MTP head into the checkpoint index."
-            )
-        if model_type == "qwen4_exp":
-            return False, (
-                "Qwen4-Exp Lightning MTP requires embedded mtp.* tensors; "
-                "native nextn layers are not supported by its dedicated runtime."
             )
         return False, (
             "Config declares MTP layers but the weight files contain neither "
@@ -1837,8 +1701,8 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
     except Exception as e:  # pragma: no cover — defensive
         logger.debug("torch stub install failed: %s", e)
 
-    # Prefer the 0.1.34+ registry so newer parsers (qwen3_6, gemma4,
-    # deepseek_v4, ...) are exposed.
+    # Prefer the 0.1.34+ registry so newer parsers (qwen3_6, ...) are
+    # exposed.
     try:
         from xgrammar.builtin_structural_tag import _structural_tag_registry
 
@@ -1904,39 +1768,11 @@ async def list_models(is_admin: bool = Depends(require_admin)):
     # Get engine pool status
     status = engine_pool.get_status()
     models_status = status.get("models", [])
-    residency_ceiling = int(status.get("final_ceiling", 0) or 0)
-    fallback_ceiling = getattr(engine_pool, "_fallback_admission_ceiling", None)
-    if callable(fallback_ceiling):
-        try:
-            candidate = fallback_ceiling()
-            if isinstance(candidate, (int, float)) and candidate > 0:
-                residency_ceiling = int(candidate)
-        except Exception:  # noqa: BLE001
-            pass
 
     # Get all model settings
     all_settings = settings_manager.get_all_settings() if settings_manager else {}
 
-    # Draft-model references pointed at by other models' speculative settings —
-    # used to badge "helper" drafters that only differ by being referenced.
     referenced_drafts: set[str] = set()
-    for _ms in all_settings.values():
-        for ref in (
-            _ms.specprefill_draft_model,
-            _ms.dflash_draft_model,
-            _ms.vlm_mtp_draft_model,
-        ):
-            if ref:
-                referenced_drafts.add(ref)
-
-    # SSD cache dir is set on the scheduler_config when the user enables paged
-    # SSD caching; admin UI consumes it to gate the dflash SSD toggle.
-    ssd_cache_dir = getattr(
-        getattr(engine_pool, "_scheduler_config", None),
-        "paged_ssd_cache_dir",
-        None,
-    )
-    dflash_ssd_cache_available = bool(ssd_cache_dir)
 
     # Combine model info with settings
     models = []
@@ -1945,36 +1781,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         settings = all_settings.get(model_id)
 
         is_paroquant, paroquant_reason = _paroquant_compat_for_model(model_info)
-        compat_ok, compat_reason = _dflash_compat_for_model(model_info)
         mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
-        qwen4_ple_ssd_offload_supported = False
-        qwen4_ple_ssd_offload_forced = False
-        qwen4_resident_bytes = 0
-        qwen4_mmap_bytes = 0
-        if (model_info.get("config_model_type") or "").replace(
-            "-", "_"
-        ).lower() == "qwen4_exp":
-            try:
-                from ..patches.mlx_vlm_qwen4_exp_compat.residency import (
-                    qwen4_exp_residency_estimate,
-                )
-
-                estimate = qwen4_exp_residency_estimate(
-                    model_info.get("model_path", "")
-                )
-                qwen4_ple_ssd_offload_supported = estimate.supported
-                qwen4_ple_ssd_offload_forced = estimate.force_ssd_offload(
-                    residency_ceiling
-                )
-                qwen4_resident_bytes = estimate.resident_bytes
-                qwen4_mmap_bytes = estimate.mmap_bytes
-            except (OSError, TypeError, ValueError):
-                logger.debug(
-                    "Could not inspect Qwen4-Exp PLE residency for %s",
-                    model_id,
-                    exc_info=True,
-                )
-
         model_data = {
             "id": model_id,
             "model_path": model_info.get("model_path", ""),
@@ -2019,15 +1826,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "source_type": model_info.get("source_type", "local"),
             "source_repo_id": model_info.get("source_repo_id"),
             "last_access": model_info.get("last_access"),
-            "dflash_compatible": compat_ok,
-            "dflash_compatibility_reason": compat_reason,
-            "dflash_ssd_cache_available": dflash_ssd_cache_available,
             "mtp_compatible": mtp_compat_ok,
             "mtp_compatibility_reason": mtp_compat_reason,
-            "qwen4_ple_ssd_offload_supported": qwen4_ple_ssd_offload_supported,
-            "qwen4_ple_ssd_offload_forced": qwen4_ple_ssd_offload_forced,
-            "qwen4_ple_resident_bytes": qwen4_resident_bytes,
-            "qwen4_ple_mmap_bytes": qwen4_mmap_bytes,
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
         }
@@ -2068,9 +1868,6 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "source_type": "builtin",
                 "source_repo_id": None,
                 "last_access": None,
-                "dflash_compatible": False,
-                "dflash_compatibility_reason": "",
-                "dflash_ssd_cache_available": False,
                 "mtp_compatible": False,
                 "mtp_compatibility_reason": "",
                 "is_paroquant": False,
@@ -2352,13 +2149,6 @@ async def update_model_settings(
         )
     if "enable_thinking" in sent:
         current_settings.enable_thinking = request.enable_thinking
-    if "qwen4_ple_ssd_offload" in sent:
-        is_qwen4_exp = (entry.config_model_type or "").replace(
-            "-", "_"
-        ).lower() == "qwen4_exp"
-        current_settings.qwen4_ple_ssd_offload = bool(
-            request.qwen4_ple_ssd_offload and is_qwen4_exp
-        )
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = (
             request.thinking_budget_enabled or False
@@ -2388,313 +2178,6 @@ async def update_model_settings(
         current_settings.forced_ct_kwargs = request.forced_ct_kwargs
     if "ttl_seconds" in sent:
         current_settings.ttl_seconds = request.ttl_seconds
-    if "index_cache_freq" in sent:
-        # 0 means disable (reset to None)
-        current_settings.index_cache_freq = (
-            request.index_cache_freq
-            if request.index_cache_freq and request.index_cache_freq >= 2
-            else None
-        )
-    # TurboQuant KV cache settings
-    if "turboquant_kv_enabled" in sent:
-        current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
-    if "turboquant_kv_bits" in sent:
-        current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
-    if "turboquant_skip_last" in sent:
-        # null = clear to the model default (True); bool(None) would flip it
-        # to False and silently disable the skip-last corruption guard.
-        current_settings.turboquant_skip_last = (
-            True if request.turboquant_skip_last is None
-            else bool(request.turboquant_skip_last)
-        )
-    # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill. These are all load-time
-    # controls; the runtime signature below causes a loaded model to be
-    # re-created when the user applies a changed profile.
-    if "qwen35_ane_prefill_enabled" in sent:
-        enabled = bool(request.qwen35_ane_prefill_enabled)
-        config_type = str(getattr(entry, "config_model_type", "") or "")
-        config_type = config_type.lower().replace("-", "_")
-        if enabled and not config_type.startswith(
-            ("qwen3_5", "qwen3_6", "qwen3_8")
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="ANE prefill is available only for Qwen3.5/3.6/3.8 models.",
-            )
-        current_settings.qwen35_ane_prefill_enabled = enabled
-    if "qwen35_ane_prefill_sequence_length" in sent:
-        value = request.qwen35_ane_prefill_sequence_length
-        if value is None or value < 1024 or value % 64:
-            raise HTTPException(
-                status_code=400,
-                detail="ANE prompt block must be a multiple of 64 and at least 1024.",
-            )
-        current_settings.qwen35_ane_prefill_sequence_length = int(value)
-        if (
-            current_settings.qwen35_ane_prefill_tail_padding_min_tokens
-            >= int(value)
-        ):
-            # A crossover is calibrated for one fixed program width. Changing
-            # that width invalidates it; disable padding until the next tune.
-            current_settings.qwen35_ane_prefill_tail_padding_min_tokens = 0
-    if "qwen35_ane_prefill_tail_padding_min_tokens" in sent:
-        value = request.qwen35_ane_prefill_tail_padding_min_tokens
-        sequence_length = int(current_settings.qwen35_ane_prefill_sequence_length)
-        if value is None or not 0 <= value < sequence_length:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "ANE tail padding threshold must be zero or less than the "
-                    "ANE prompt block."
-                ),
-            )
-        current_settings.qwen35_ane_prefill_tail_padding_min_tokens = int(value)
-    if "qwen35_ane_prefill_fraction" in sent:
-        value = request.qwen35_ane_prefill_fraction
-        if value is None or not 0.05 <= value <= 0.90:
-            raise HTTPException(
-                status_code=400,
-                detail="MLP ANE fraction must be between 0.05 and 0.90.",
-            )
-        current_settings.qwen35_ane_prefill_fraction = float(value)
-    if "qwen35_ane_prefill_max_layers" in sent:
-        value = request.qwen35_ane_prefill_max_layers
-        if value is None or value < 1:
-            raise HTTPException(
-                status_code=400, detail="ANE MLP layer limit must be positive."
-            )
-        current_settings.qwen35_ane_prefill_max_layers = int(value)
-    if "qwen35_ane_prefill_dual_ane" in sent:
-        current_settings.qwen35_ane_prefill_dual_ane = bool(
-            request.qwen35_ane_prefill_dual_ane
-        )
-    if "qwen35_ane_prefill_gdn" in sent:
-        current_settings.qwen35_ane_prefill_gdn = bool(request.qwen35_ane_prefill_gdn)
-    if "qwen35_ane_prefill_gdn_fraction" in sent:
-        value = request.qwen35_ane_prefill_gdn_fraction
-        if value is None or not 0.05 <= value <= 0.90:
-            raise HTTPException(
-                status_code=400,
-                detail="GDN ANE fraction must be between 0.05 and 0.90.",
-            )
-        current_settings.qwen35_ane_prefill_gdn_fraction = float(value)
-    if "qwen35_ane_prefill_gdn_max_layers" in sent:
-        value = request.qwen35_ane_prefill_gdn_max_layers
-        if value is None or value < 0:
-            raise HTTPException(
-                status_code=400,
-                detail="ANE GDN layer limit must be zero or greater.",
-            )
-        current_settings.qwen35_ane_prefill_gdn_max_layers = int(value)
-    if "qwen35_ane_prefill_cpu_enabled" in sent:
-        current_settings.qwen35_ane_prefill_cpu_enabled = bool(
-            request.qwen35_ane_prefill_cpu_enabled
-        )
-    if "qwen35_ane_prefill_fused_down" in sent:
-        current_settings.qwen35_ane_prefill_fused_down = bool(
-            request.qwen35_ane_prefill_fused_down
-        )
-    if "qwen35_ane_prefill_cpu_fraction" in sent:
-        value = request.qwen35_ane_prefill_cpu_fraction
-        if value is None or not 0.0 <= value <= 0.25:
-            raise HTTPException(
-                status_code=400,
-                detail="CPU MLP fraction must be between 0.0 and 0.25.",
-            )
-        current_settings.qwen35_ane_prefill_cpu_fraction = float(value)
-    if "qwen35_ane_prefill_cpu_down_fraction" in sent:
-        value = request.qwen35_ane_prefill_cpu_down_fraction
-        if value is None or not 0.0 <= value <= 0.50:
-            raise HTTPException(
-                status_code=400,
-                detail="CPU MLP down fraction must be between 0.0 and 0.50.",
-            )
-        current_settings.qwen35_ane_prefill_cpu_down_fraction = float(value)
-    if "qwen35_ane_prefill_cpu_gdn_fraction" in sent:
-        value = request.qwen35_ane_prefill_cpu_gdn_fraction
-        if value is None or not 0.0 <= value <= 0.50:
-            raise HTTPException(
-                status_code=400,
-                detail="CPU GDN fraction must be between 0.0 and 0.50",
-            )
-        current_settings.qwen35_ane_prefill_cpu_gdn_fraction = float(value)
-    if "qwen35_ane_prefill_cpu_threads" in sent:
-        value = request.qwen35_ane_prefill_cpu_threads
-        if value is None or not 0 <= value <= 64:
-            raise HTTPException(
-                status_code=400,
-                detail="CPU worker count must be between 0 and 64.",
-            )
-        current_settings.qwen35_ane_prefill_cpu_threads = int(value)
-    if "qwen35_ane_prefill_cpu_shared_resource" in sent:
-        current_settings.qwen35_ane_prefill_cpu_shared_resource = bool(
-            request.qwen35_ane_prefill_cpu_shared_resource
-        )
-    if (
-        current_settings.qwen35_ane_prefill_fused_down
-        and current_settings.qwen35_ane_prefill_fraction > 0.50
-    ):
-        # The fused loader reuses the MLP fraction for the down projection and
-        # rejects anything above 0.50 at enable time. Without this check the
-        # save succeeds and the next load silently disables ANE prefill.
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Fused MLP/down offload needs an MLP ANE fraction of 0.50 or "
-                "less."
-            ),
-        )
-    if (
-        current_settings.qwen35_ane_prefill_cpu_enabled
-        and current_settings.qwen35_ane_prefill_fraction
-        * (2 if current_settings.qwen35_ane_prefill_fused_down else 1)
-        + current_settings.qwen35_ane_prefill_cpu_fraction
-        >= 1.0
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Two per-ANE MLP shares and the CPU share must total less than 1.0."
-                if current_settings.qwen35_ane_prefill_fused_down
-                else "MLP ANE and CPU fractions must total less than 1.0."
-            ),
-        )
-    if (
-        current_settings.qwen35_ane_prefill_cpu_enabled
-        and current_settings.qwen35_ane_prefill_gdn
-        and current_settings.qwen35_ane_prefill_gdn_fraction
-        + current_settings.qwen35_ane_prefill_cpu_gdn_fraction
-        >= 1.0
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="GDN ANE and CPU fractions must total less than 1.0.",
-        )
-    # SpecPrefill settings
-    if "specprefill_enabled" in sent:
-        current_settings.specprefill_enabled = request.specprefill_enabled or False
-    if "specprefill_draft_model" in sent:
-        current_settings.specprefill_draft_model = (
-            request.specprefill_draft_model or None
-        )
-    if "specprefill_keep_pct" in sent:
-        current_settings.specprefill_keep_pct = request.specprefill_keep_pct or None
-    if "specprefill_threshold" in sent:
-        current_settings.specprefill_threshold = request.specprefill_threshold or None
-    # DFlash settings
-    if "dflash_enabled" in sent:
-        new_dflash_enabled = (
-            False if is_diffusion_model else bool(request.dflash_enabled)
-        )
-        if new_dflash_enabled:
-            from ..engine.dflash import is_dflash_compatible
-
-            compat_ok, compat_reason = is_dflash_compatible(entry.model_path)
-            if not compat_ok:
-                raise HTTPException(status_code=400, detail=compat_reason)
-        current_settings.dflash_enabled = new_dflash_enabled
-    if "dflash_draft_model" in sent:
-        current_settings.dflash_draft_model = request.dflash_draft_model or None
-    if "dflash_draft_quant_enabled" in sent:
-        current_settings.dflash_draft_quant_enabled = (
-            bool(request.dflash_draft_quant_enabled)
-            if request.dflash_draft_quant_enabled is not None
-            else None
-        )
-    if "dflash_draft_quant_weight_bits" in sent:
-        current_settings.dflash_draft_quant_weight_bits = (
-            int(request.dflash_draft_quant_weight_bits)
-            if request.dflash_draft_quant_weight_bits is not None
-            else None
-        )
-    if "dflash_draft_quant_activation_bits" in sent:
-        current_settings.dflash_draft_quant_activation_bits = (
-            int(request.dflash_draft_quant_activation_bits)
-            if request.dflash_draft_quant_activation_bits is not None
-            else None
-        )
-    if "dflash_draft_quant_group_size" in sent:
-        current_settings.dflash_draft_quant_group_size = (
-            int(request.dflash_draft_quant_group_size)
-            if request.dflash_draft_quant_group_size is not None
-            else None
-        )
-    if "dflash_max_ctx" in sent:
-        # 0/None means "unlimited" — the engine treats None as no fallback threshold
-        value = request.dflash_max_ctx
-        current_settings.dflash_max_ctx = value if value and value > 0 else None
-    if "dflash_in_memory_cache" in sent:
-        current_settings.dflash_in_memory_cache = bool(request.dflash_in_memory_cache)
-    if "dflash_in_memory_cache_max_entries" in sent:
-        value = request.dflash_in_memory_cache_max_entries
-        current_settings.dflash_in_memory_cache_max_entries = (
-            int(value) if value and value > 0 else 4
-        )
-    if (
-        "dflash_in_memory_cache_max_bytes" in sent
-        and request.dflash_in_memory_cache_max_bytes
-    ):
-        current_settings.dflash_in_memory_cache_max_bytes = int(
-            request.dflash_in_memory_cache_max_bytes
-        )
-    if "dflash_ssd_cache" in sent:
-        ssd_requested = bool(request.dflash_ssd_cache)
-        if is_diffusion_model:
-            ssd_requested = False
-        elif ssd_requested:
-            in_mem_after = (
-                bool(request.dflash_in_memory_cache)
-                if "dflash_in_memory_cache" in sent
-                else current_settings.dflash_in_memory_cache
-            )
-            if not in_mem_after:
-                raise HTTPException(
-                    status_code=400,
-                    detail="DFlash SSD cache requires the in-memory cache to be enabled.",
-                )
-            ssd_dir = getattr(
-                getattr(_get_engine_pool(), "_scheduler_config", None),
-                "paged_ssd_cache_dir",
-                None,
-            )
-            if not ssd_dir:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "DFlash SSD cache requires oMLX paged SSD cache to be enabled "
-                        "(set --paged-ssd-cache-dir or configure it in settings)."
-                    ),
-                )
-        current_settings.dflash_ssd_cache = ssd_requested
-    if "dflash_ssd_cache_max_bytes" in sent and request.dflash_ssd_cache_max_bytes:
-        current_settings.dflash_ssd_cache_max_bytes = int(
-            request.dflash_ssd_cache_max_bytes
-        )
-    if "dflash_draft_window_size" in sent:
-        # 0 / None / negative → use config.sliding_window when present.
-        value = request.dflash_draft_window_size
-        current_settings.dflash_draft_window_size = (
-            int(value) if value and value > 0 else None
-        )
-    if "dflash_draft_sink_size" in sent:
-        # Negative / None → oMLX default 0 (no sink tokens).
-        value = request.dflash_draft_sink_size
-        current_settings.dflash_draft_sink_size = (
-            int(value) if value is not None and value >= 0 else 0
-        )
-    if "dflash_block_size" in sent:
-        value = request.dflash_block_size
-        current_settings.dflash_block_size = (
-            int(value) if value is not None and value > 0 else None
-        )
-    if "dflash_verify_mode" in sent:
-        value = request.dflash_verify_mode
-        # dflash-mlx accepts: dflash | adaptive | ddtree | off.
-        # Anything else (including empty string) → revert to dflash default.
-        current_settings.dflash_verify_mode = (
-            value if value in ("dflash", "adaptive", "ddtree", "off") else None
-        )
-
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     if "mtp_enabled" in sent:
         new_mtp_enabled = False if is_diffusion_model else bool(request.mtp_enabled)
@@ -2730,30 +2213,16 @@ async def update_model_settings(
                     detail=f"MTP enabled but failed to read model config: {e}",
                 )
             model_type = cfg.get("model_type")
-            # qwen4_exp routes through the dedicated VLM Lightning MTP path
-            # (see _mtp_compat_for_model); skip the mlx-lm whitelist here but
-            # keep the mtp.* weight check below.
-            if model_type != "qwen4_exp" and not _is_mtp_compatible(cfg, model_type):
+            if not _is_mtp_compatible(cfg, model_type):
                 raise HTTPException(
                     status_code=400,
                     detail=(
                         f"Model is not MTP-compatible (model_type={model_type!r}, "
                         f"mtp_num_hidden_layers={cfg.get('mtp_num_hidden_layers', 0)}). "
-                        "Lightning MTP requires a Qwen3.5/3.6, DeepSeek-V4, "
-                        "GLM-5.2, or merged-assistant Gemma 4 checkpoint with "
+                        "Lightning MTP requires a Qwen3.5/3.6 checkpoint with "
                         "MTP heads."
                     ),
                 )
-            if not _checkpoint_has_mtp_weights(entry.model_path):
-                if model_type == "qwen4_exp":
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            "Qwen4-Exp Lightning MTP requires embedded mtp.* "
-                            "tensors; native nextn layers are not supported by "
-                            "its dedicated runtime."
-                        ),
-                    )
                 raise HTTPException(
                     status_code=400,
                     detail=(
@@ -2763,64 +2232,7 @@ async def update_model_settings(
                         "default mlx-lm sanitize() path strips them."
                     ),
                 )
-            # Mutual exclusion with DFlash — ModelSettings.__post_init__
-            # also enforces this, but we surface a clearer error here.
-            dflash_after = (
-                bool(request.dflash_enabled)
-                if "dflash_enabled" in sent
-                else current_settings.dflash_enabled
-            )
-            if dflash_after:
-                raise HTTPException(
-                    status_code=400,
-                    detail="MTP and DFlash cannot both be enabled; choose one speculative-decoding path.",
-                )
         current_settings.mtp_enabled = new_mtp_enabled
-
-    # VLM MTP (mlx-vlm f96138e+, gemma4_assistant drafter)
-    if "vlm_mtp_enabled" in sent:
-        new_vlm_mtp = False if is_diffusion_model else bool(request.vlm_mtp_enabled)
-        if new_vlm_mtp:
-            drafter_after = (
-                request.vlm_mtp_draft_model
-                if "vlm_mtp_draft_model" in sent
-                else current_settings.vlm_mtp_draft_model
-            )
-            if not drafter_after:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "vlm_mtp_enabled requires vlm_mtp_draft_model "
-                        "(path to a gemma4_assistant drafter, "
-                        "e.g. 'gemma-4-26B-A4B-it-assistant')."
-                    ),
-                )
-            # Mutex enforced again at ModelSettings.__post_init__ for
-            # last-mile safety, but surface a clearer error here.
-            for other_field, other_label in (
-                ("dflash_enabled", "DFlash"),
-                ("specprefill_enabled", "SpecPrefill"),
-                ("mtp_enabled", "MTP"),
-                ("turboquant_kv_enabled", "TurboQuant KV"),
-            ):
-                other_after = (
-                    bool(getattr(request, other_field))
-                    if other_field in sent
-                    else getattr(current_settings, other_field)
-                )
-                if other_after:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            f"vlm_mtp_enabled and {other_label} cannot both be "
-                            "enabled; choose one speculative-decoding path."
-                        ),
-                    )
-        current_settings.vlm_mtp_enabled = new_vlm_mtp
-    if "vlm_mtp_draft_model" in sent:
-        current_settings.vlm_mtp_draft_model = request.vlm_mtp_draft_model or None
-    if "vlm_mtp_draft_block_size" in sent:
-        current_settings.vlm_mtp_draft_block_size = request.vlm_mtp_draft_block_size
 
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
@@ -2925,22 +2337,9 @@ async def update_model_settings(
     requires_reload = entry.engine is not None and (
         ("model_type_override" in sent and entry.engine_type != prev_engine_type)
         # Runtime-signature fields are engine-construction settings. This
-        # catches Qwen ANE controls (and future signature additions) without
+        # catches MTP controls (and future signature additions) without
         # requiring a second hand-maintained field list here.
         or prev_load_signature != current_load_signature
-        or "index_cache_freq" in sent
-        or "dflash_enabled" in sent
-        or "dflash_draft_model" in sent
-        or "dflash_draft_quant_enabled" in sent
-        or "dflash_draft_quant_weight_bits" in sent
-        or "dflash_draft_quant_activation_bits" in sent
-        or "dflash_draft_quant_group_size" in sent
-        or "dflash_max_ctx" in sent
-        or "dflash_in_memory_cache" in sent
-        or "dflash_in_memory_cache_max_entries" in sent
-        or "dflash_in_memory_cache_max_bytes" in sent
-        or "dflash_ssd_cache" in sent
-        or "dflash_ssd_cache_max_bytes" in sent
         # trust_remote_code is plumbed at model load time; toggling it on
         # an already-loaded engine has no effect until reload.
         or "trust_remote_code" in sent
@@ -3615,7 +3014,6 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             ),
             "hot_cache_only": global_settings.cache.hot_cache_only,
             "hot_cache_write_through": global_settings.cache.hot_cache_write_through,
-            "ane_compile_cache": global_settings.cache.ane_compile_cache,
             "gdn_snapshot_storage": global_settings.cache.get_gdn_snapshot_storage(),
             "gdn_ssd_split_enabled": global_settings.cache.get_gdn_ssd_split_enabled(),
             "gdn_ssd_pending_max_size": global_settings.cache.gdn_ssd_pending_max_size,
@@ -4191,15 +3589,6 @@ async def update_global_settings(
     if request.initial_cache_blocks is not None:
         global_settings.cache.initial_cache_blocks = request.initial_cache_blocks
         cache_changed = True
-    # No cache_changed: reloading models cannot re-arm the native gate, which
-    # reads the env var once at the first ANE compile of the process. The env
-    # update covers a process that has not compiled yet; otherwise restart.
-    if request.ane_compile_cache is not None:
-        global_settings.cache.ane_compile_cache = request.ane_compile_cache
-        if request.ane_compile_cache:
-            os.environ["OMLX_QWEN35_ANE_COMPILE_CACHE"] = "1"
-        else:
-            os.environ.pop("OMLX_QWEN35_ANE_COMPILE_CACHE", None)
 
     if cache_changed:
         success, msg = await _apply_cache_settings_runtime(
@@ -4988,8 +4377,6 @@ def _build_runtime_cache_observability(
         core = getattr(async_core, "engine", None) if async_core is not None else None
         scheduler = getattr(core, "scheduler", None) if core is not None else None
         if scheduler is None and async_core is None:
-            # Engines without an AsyncEngineCore (DFlash) expose a scheduler
-            # through their fallback engine once it is active.
             scheduler = getattr(entry.engine, "scheduler", None)
 
         runtime_stats = None
@@ -5004,8 +4391,6 @@ def _build_runtime_cache_observability(
                 )
                 continue
         elif hasattr(entry.engine, "get_runtime_cache_stats"):
-            # DFlash primary mode: the engine adapts its dflash-mlx runtime
-            # cache (L1 in-memory + L2 snapshot dir) to the same shape.
             try:
                 runtime_stats = entry.engine.get_runtime_cache_stats()
             except Exception as exc:  # noqa: BLE001
@@ -5359,8 +4744,6 @@ def _build_active_models_data() -> dict:
 
                     sched = getattr(core, "scheduler", None)
             else:
-                # Engines without an AsyncEngineCore (DFlash) still expose a
-                # scheduler once their fallback engine is active.
                 sched = getattr(entry.engine, "scheduler", None)
             if sched is not None and hasattr(sched, "snapshot_for_admin"):
                 snap = sched.snapshot_for_admin()
@@ -5379,9 +4762,9 @@ def _build_active_models_data() -> dict:
                     for idx, req in enumerate(waiting_queue, start=1)
                 ]
             if hasattr(entry.engine, "get_activity_snapshot"):
-                # Requests the engine tracks itself (non-streaming engines,
-                # DFlash primary mode). Counted on top of any scheduler
-                # snapshot; the two sources never overlap.
+                # Requests the engine tracks itself (non-streaming engines).
+                # Counted on top of any scheduler snapshot; the two sources
+                # never overlap.
                 snapshot = entry.engine.get_activity_snapshot()
                 activity_requests = snapshot.get("active_requests", 0)
                 activities = snapshot.get("activities", [])
@@ -5478,24 +4861,6 @@ def _build_active_models_data() -> dict:
         if is_loaded and effective_ttl is not None and idle_seconds is not None:
             ttl_remaining_seconds = max(0.0, effective_ttl - idle_seconds)
 
-        # DFlash observability (issue #2398): session speculation counters and
-        # the load-time precision pairing warning. None on non-DFlash engines.
-        dflash_info = None
-        if entry is not None and entry.engine is not None:
-            pairing = getattr(entry.engine, "pairing_warning", None)
-            speculation = None
-            get_speculation = getattr(entry.engine, "get_speculation_stats", None)
-            if callable(get_speculation):
-                try:
-                    speculation = get_speculation()
-                except Exception:
-                    logger.debug("get_speculation_stats failed", exc_info=True)
-            if speculation is not None or pairing:
-                dflash_info = {
-                    "speculation": speculation,
-                    "pairing_warning": pairing,
-                }
-
         models.append(
             {
                 "id": model_id,
@@ -5522,7 +4887,6 @@ def _build_active_models_data() -> dict:
                 "generating": generating,
                 "idle_seconds": idle_seconds,
                 "ttl_remaining_seconds": ttl_remaining_seconds,
-                "dflash": dflash_info,
             }
         )
 
@@ -6621,19 +5985,6 @@ async def add_to_accuracy_queue(
     if engine_pool is None:
         raise HTTPException(status_code=503, detail="Engine pool not initialized")
 
-    from .ane_tuning import get_active_run as get_active_ane_tuning
-
-    tuning_active = get_active_ane_tuning()
-    if tuning_active is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"ANE tuning is already running "
-                f"(tuning_id={tuning_active.tuning_id}, "
-                f"model_id={tuning_active.request.model_id})."
-            ),
-        )
-
     from .context_benchmark import get_active_run as get_active_context_run
 
     context_active = get_active_context_run()
@@ -6797,113 +6148,6 @@ async def stream_accuracy_benchmark(
     )
 
 
-# =============================================================================
-# ANE Split Tuning API Routes (MUST be before throughput {bench_id} routes)
-# =============================================================================
-
-
-@router.post("/api/bench/ane-tune/start")
-async def start_ane_tuning(
-    request: Request,
-    is_admin: bool = Depends(require_admin),
-):
-    """Tune the Qwen ANE/GPU split without changing persisted settings."""
-    from .accuracy_benchmark import get_queue_status
-    from .ane_tuning import (
-        ANETuningRequest,
-        cleanup_old_runs,
-        create_run,
-        get_active_run,
-        run_tuning,
-    )
-    from .benchmark import get_active_run as get_active_throughput_run
-    from .context_benchmark import get_active_run as get_active_context_run
-
-    engine_pool = _get_engine_pool()
-    if engine_pool is None:
-        raise HTTPException(status_code=503, detail="Engine pool not initialized")
-
-    active = get_active_run()
-    if active is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"ANE tuning is already running (tuning_id={active.tuning_id}, "
-                f"model_id={active.request.model_id})."
-            ),
-        )
-    throughput = get_active_throughput_run()
-    if throughput is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=f"A throughput benchmark is already running ({throughput.bench_id}).",
-        )
-    context = get_active_context_run()
-    if context is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=f"A context benchmark is already running ({context.bench_id}).",
-        )
-    accuracy = get_queue_status()
-    if accuracy.get("running"):
-        raise HTTPException(
-            status_code=409, detail="An accuracy benchmark is already running."
-        )
-
-    body = await request.json()
-    try:
-        tuning_request = ANETuningRequest(**body)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    entry = engine_pool.get_entry(tuning_request.model_id)
-    if entry is None:
-        raise HTTPException(
-            status_code=404, detail=f"Model not found: {tuning_request.model_id}"
-        )
-    if entry.model_type not in ("llm", "vlm", None):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Model {tuning_request.model_id} is not a supported language model",
-        )
-
-    cleanup_old_runs()
-    run = create_run(tuning_request)
-    run.task = asyncio.create_task(run_tuning(run, engine_pool))
-    return {"tuning_id": run.tuning_id, "status": "started", "total": run.total}
-
-
-@router.get("/api/bench/ane-tune/{tuning_id}/results")
-async def get_ane_tuning_results(
-    tuning_id: str,
-    is_admin: bool = Depends(require_admin),
-):
-    from .ane_tuning import get_run, run_snapshot
-
-    run = get_run(tuning_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail=f"ANE tuning not found: {tuning_id}")
-    return run_snapshot(run)
-
-
-@router.post("/api/bench/ane-tune/{tuning_id}/cancel")
-async def cancel_ane_tuning(
-    tuning_id: str,
-    is_admin: bool = Depends(require_admin),
-):
-    from .ane_tuning import get_run
-
-    run = get_run(tuning_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail=f"ANE tuning not found: {tuning_id}")
-    if run.status != "running":
-        raise HTTPException(
-            status_code=400, detail=f"ANE tuning is not running ({run.status})"
-        )
-    if run.task is not None and not run.task.done():
-        run.task.cancel()
-    return {"status": "cancelled", "tuning_id": tuning_id}
-
 
 # =============================================================================
 # Context Benchmark API Routes (MUST be before throughput {bench_id} routes)
@@ -6971,17 +6215,6 @@ async def start_context_benchmark(
                 f"A throughput benchmark is already running "
                 f"(bench_id={throughput_active.bench_id}, "
                 f"model_id={throughput_active.request.model_id})."
-            ),
-        )
-    from .ane_tuning import get_active_run as get_active_ane_tuning
-
-    tuning_active = get_active_ane_tuning()
-    if tuning_active is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"ANE tuning is already running (tuning_id={tuning_active.tuning_id}, "
-                f"model_id={tuning_active.request.model_id})."
             ),
         )
     accuracy_status = get_queue_status()
@@ -7240,17 +6473,6 @@ async def start_benchmark(
             ),
         )
 
-    from .ane_tuning import get_active_run as get_active_ane_tuning
-
-    tuning_active = get_active_ane_tuning()
-    if tuning_active is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"ANE tuning is already running (tuning_id={tuning_active.tuning_id}, "
-                f"model_id={tuning_active.request.model_id})."
-            ),
-        )
 
     body = await request.json()
     try:
@@ -7733,3 +6955,250 @@ async def remove_upload_task(task_id: str, is_admin: bool = Depends(require_admi
     if not success:
         raise HTTPException(status_code=404, detail="Task not found or still active")
     return {"success": True}
+
+
+# ------------------------------------------------------------------ Tuning
+# Phase-4 kernel tuner: web toggle + sweep launcher + apply. State persists
+# in ~/.omlx/tuning.json ({enabled, values, updated_at}); the server applies
+# `values` as env vars at boot (cli.serve_command) before kernel imports.
+
+import signal as _signal
+import threading as _threading
+import time as _time
+
+# The tuner ships inside the package (omlx/tuning/) so both source
+# checkouts and packaged apps have it; stages run via ``python -m``.
+_TUNING_STAGES = {
+    "kernel": "omlx.tuning.search_s1",
+    "model": "omlx.tuning.search_e2e",
+    "s1": "omlx.tuning.search_s1",   # legacy aliases
+    "s2": "omlx.tuning.search_s2",
+}
+_TUNING_STATE_PATH = Path("~/.omlx").expanduser() / "tuning.json"
+_TUNING_DIR = Path("~/.omlx").expanduser() / "tuning"
+_TUNING_RESULTS_DIR = _TUNING_DIR / "results"
+_TUNING_LOG_DIR = _TUNING_DIR / "logs"
+_TUNING_JOB: dict = {}
+_TUNING_JOB_LOCK = _threading.Lock()
+
+# env keys the tuner may set; C++ read-once statics need a restart, the
+# python-side ones apply at next engine load.
+_TUNING_ENV_KEYS = {
+    "OMLX_FA256_NAX_SPLITS": True,
+    "OMLX_FA256_NAX_BK": True,
+    "OMLX_FA256_NAX_DISPATCH_BUDGET": False,
+    "OMLX_NAX_OCCUPANCY_THREADS": True,
+    "OMLX_NAX_MIN_SPLIT_BLOCKS": True,
+    "OMLX_NAX_MAX_SPLITS": True,
+    "OMLX_GDN_SEGS": False,
+    "OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS": False,
+    "OMLX_MX_CACHE_LIMIT_GB": False,
+}
+
+
+def _tuning_read() -> dict:
+    try:
+        return json.loads(_TUNING_STATE_PATH.read_text()) or {}
+    except Exception:
+        return {}
+
+
+def _tuning_write(state: dict) -> None:
+    state["updated_at"] = _time.strftime("%Y-%m-%dT%H:%M:%S")
+    _TUNING_STATE_PATH.write_text(json.dumps(state, indent=1))
+
+
+def _tuning_job_snapshot() -> dict | None:
+    job = _TUNING_JOB
+    if not job:
+        return None
+    proc = job.get("proc")
+    log_path = job.get("log_path")
+    tail = ""
+    if log_path and Path(log_path).exists():
+        try:
+            tail = Path(log_path).read_text(errors="replace")[-1500:]
+        except Exception:
+            pass
+    return {
+        "stage": job.get("stage"),
+        "started_at": job.get("started_at"),
+        "running": proc is not None and proc.poll() is None,
+        "cancelled": bool(job.get("cancelled")),
+        "returncode": None if proc is None else proc.poll(),
+        "log_tail": tail,
+    }
+
+
+@router.get("/api/tuning")
+async def get_tuning(is_admin: bool = Depends(require_admin)):
+    """Current tuning state: toggle, applied values, job, last results."""
+    state = _tuning_read()
+    results = {}
+    stage_files = {"kernel": "S1.json", "model": "E2E.json", "S1": "S1.json", "S2": "S2.json"}
+    for stage, fname in stage_files.items():
+        path = _TUNING_RESULTS_DIR / fname
+        if path.exists():
+            try:
+                data = json.loads(path.read_text())
+                winner = data.get("winner")
+                results[stage] = {
+                    "winner_env": (winner or {}).get("env"),
+                    "winner_score": (winner or {}).get("tflops"),
+                    "baseline_score": (data.get("baseline") or {}).get("tflops"),
+                    "n_candidates": len(data.get("coarse", data.get("runs", []))),
+                }
+            except Exception:
+                pass
+    values = state.get("values") or {}
+    return {
+        "enabled": bool(state.get("enabled")),
+        "values": values,
+        "env_effective": {
+            k: os.environ.get(k) for k in _TUNING_ENV_KEYS if os.environ.get(k)
+        },
+        "restart_required_keys": [
+            k for k, v in values.items() if _TUNING_ENV_KEYS.get(k) and os.environ.get(k) != str(v)
+        ],
+        "job": _tuning_job_snapshot(),
+        "results": results,
+        "known_keys": sorted(_TUNING_ENV_KEYS),
+    }
+
+
+@router.post("/api/tuning")
+async def set_tuning_enabled(request: Request, is_admin: bool = Depends(require_admin)):
+    """Toggle the tuning panel on/off (persisted)."""
+    body = await request.json()
+    enabled = bool(body.get("enabled"))
+    state = _tuning_read()
+    state["enabled"] = enabled
+    _tuning_write(state)
+    return {"success": True, "enabled": enabled}
+
+
+@router.post("/api/tuning/start")
+async def start_tuning(request: Request, is_admin: bool = Depends(require_admin)):
+    """Launch a tuning stage as a background subprocess (one at a time)."""
+    with _TUNING_JOB_LOCK:
+        if _TUNING_JOB and _TUNING_JOB.get("proc") is not None and (
+            _TUNING_JOB["proc"].poll() is None
+        ):
+            raise HTTPException(status_code=409, detail="A tuning job is already running")
+        body = await request.json()
+        stage = str(body.get("stage", "kernel")).strip().lower()
+        module = _TUNING_STAGES.get(stage)
+        if module is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown stage {stage!r} (expected: kernel / model)",
+            )
+        _TUNING_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        _TUNING_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = _TUNING_LOG_DIR / f"{stage}_run.log"
+        cmd = [sys.executable, "-u", "-m", module]
+        if stage == "model":
+            model_id = str(body.get("model_id") or "").strip()
+            if not model_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Model tuning requires model_id (it benchmarks the "
+                           "downloaded model end-to-end)",
+                )
+            cmd += ["--model-id", model_id]
+            prompt_tokens = body.get("prompt_tokens")
+            if prompt_tokens:
+                try:
+                    pt = int(prompt_tokens)
+                    if not 8192 <= pt <= 262144:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="prompt_tokens must be an integer in [8192, 262144]",
+                    )
+                cmd += ["--prompt-tokens", str(pt)]
+        log_fh = open(log_path, "w")
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+        )
+        _TUNING_JOB.clear()
+        _TUNING_JOB.update(
+            {
+                "proc": proc,
+                "stage": stage,
+                "model_id": body.get("model_id"),
+                "started_at": _time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "log_path": str(log_path),
+                "log_fh": log_fh,
+            }
+        )
+    return {"success": True, "stage": stage, "pid": proc.pid}
+
+
+def _kill_tree(pid: int, sig: int = _signal.SIGTERM) -> None:
+    """Kill *pid* and every descendant (the sweep spawns probe → server)."""
+    try:
+        out = subprocess.run(
+            ["pgrep", "-P", str(pid)], capture_output=True, text=True
+        ).stdout.split()
+    except Exception:
+        out = []
+    for kid in out:
+        try:
+            _kill_tree(int(kid), sig)
+        except (ProcessLookupError, PermissionError, ValueError):
+            pass
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def _tuning_cancel() -> dict:
+    with _TUNING_JOB_LOCK:
+        job = _TUNING_JOB
+        proc = job.get("proc") if job else None
+        if not job or proc is None or proc.poll() is not None:
+            raise HTTPException(status_code=409, detail="No sweep is running")
+        stage = job.get("stage")
+        pid = proc.pid
+        _kill_tree(pid, _signal.SIGTERM)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _kill_tree(pid, _signal.SIGKILL)
+            proc.wait(timeout=10)
+        job["cancelled"] = True
+    return {"success": True, "stage": stage}
+
+
+@router.post("/api/tuning/cancel")
+async def cancel_tuning(is_admin: bool = Depends(require_admin)):
+    """Terminate the running sweep and its whole process tree."""
+    return _tuning_cancel()
+
+
+@router.post("/api/tuning/apply")
+async def apply_tuning(request: Request, is_admin: bool = Depends(require_admin)):
+    """Persist tuning values (env vars) and apply the hot ones immediately."""
+    body = await request.json()
+    values = body.get("values") or {}
+    bad = [k for k in values if k not in _TUNING_ENV_KEYS]
+    if bad:
+        raise HTTPException(status_code=400, detail=f"Unknown tuning keys: {bad}")
+    state = _tuning_read()
+    state["values"] = {k: str(v) for k, v in values.items()}
+    _tuning_write(state)
+    restart_keys = []
+    for key, val in state["values"].items():
+        os.environ[key] = val
+        if _TUNING_ENV_KEYS.get(key):
+            restart_keys.append(key)
+    return {
+        "success": True,
+        "values": state["values"],
+        "restart_required_keys": restart_keys,
+    }

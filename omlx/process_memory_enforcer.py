@@ -86,21 +86,26 @@ _SOFT_THRESHOLD_BY_TIER: dict[str, float] = {
 }
 
 # Fraction of the hard ceiling used by the adaptive prefill chunk sizer.
+# custom = 1.0: the user pinned the ceiling explicitly, so the sizer targets
+# it directly instead of derating by another 10% (the 2026-08-29 262K run
+# throttled at 42.75GB while the tail legitimately needed 45.3GB).
 _PREFILL_HEADROOM_SAFETY: dict[str, float] = {
     "safe": 0.90,
     "balanced": 0.90,
     "aggressive": 0.925,
-    "custom": 0.90,
+    "custom": 1.0,
 }
 
 # Fraction of the effective physical cap used by the pre-chunk prediction
 # guard. Aggressive/custom are user-directed and can run closer to the
-# configured ceiling.
+# configured ceiling; custom = 1.0 lets the sizing target reach the pinned
+# ceiling itself (the abort limit remains min(static, metal_cap), which the
+# enforcer arms via mx.set_wired_limit — the panic net is unchanged).
 _PREFILL_ABORT_MARGIN: dict[str, float] = {
     "safe": 0.90,
     "balanced": 0.90,
     "aggressive": 0.95,
-    "custom": 0.95,
+    "custom": 1.0,
 }
 
 # Last-resort active-request brake. Normal hard pressure starts at the
@@ -1094,18 +1099,13 @@ class ProcessMemoryEnforcer:
 
     @staticmethod
     def _resolve_scheduler(entry: Any) -> Any | None:
-        """Resolve the watermark target (Scheduler or DFlash guard) from an
-        EnginePool entry.
+        """Resolve the watermark target (Scheduler) from an EnginePool entry.
 
         Most engines (BatchedEngine, VLMBatchedEngine) wrap the scheduler
         as ``entry.engine._engine.engine.scheduler`` (AsyncEngineCore →
-        EngineCore → Scheduler). Some non-streaming engines may expose
-        ``entry.engine.scheduler`` directly — including ``DFlashEngine`` in
-        fallback mode, whose ``scheduler`` property resolves the fallback
-        engine's real scheduler. DFlash's *primary* speculative path has no
-        scheduler at all, so it exposes a lightweight ``_prefill_guard`` that
-        carries the same watermark attrs; tried last so standard engines
-        resolve unchanged. Returns None if nothing resolves.
+        EngineCore → Scheduler). Some engines may expose
+        ``entry.engine.scheduler`` directly. Returns None if nothing
+        resolves.
         """
         eng = entry.engine
         if eng is None:
@@ -1120,10 +1120,7 @@ class ProcessMemoryEnforcer:
                 sched = getattr(inner_engine, "scheduler", None)
                 if sched is not None:
                     return sched
-        # DFlash primary mode bypasses the scheduler entirely; the enforcer
-        # still needs to push the ceiling somewhere, so it lands on the
-        # engine's ``_prefill_guard`` (None for every non-DFlash engine).
-        return getattr(eng, "_prefill_guard", None)
+        return None
 
     def _propagate_memory_limit(self) -> None:
         """Propagate ceiling-derived watermarks to all schedulers.
@@ -1187,11 +1184,6 @@ class ProcessMemoryEnforcer:
                     # guard budgets from the signed deployment, so there is no
                     # coordinator scheduler for this enforcer to update.
                     continue
-                if (
-                    type(engine).__name__ == "DFlashEngine"
-                    and getattr(engine, "_fallback_engine", None) is None
-                ):
-                    continue
                 if getattr(engine, "is_diffusion_model", False):
                     continue
                 if isinstance(engine, BaseNonStreamingEngine):
@@ -1234,10 +1226,10 @@ class ProcessMemoryEnforcer:
             scheduler._memory_metal_cap_bytes = breakdown["metal_cap"]
             scheduler._memory_hot_cache_reserved_bytes = hot_cache_reserved
             # Usage-side counterpart of the reservation above: targets whose
-            # usage read is raw phys_footprint (the DFlash primary guard)
-            # subtract this so serialized hot-cache CPU bytes are not charged
-            # both here and in the reserved ceiling. The Scheduler reads its
-            # own live counter instead and ignores this attr.
+            # usage read is raw phys_footprint subtract this so serialized
+            # hot-cache CPU bytes are not charged both here and in the
+            # reserved ceiling. The Scheduler reads its own live counter
+            # instead and ignores this attr.
             scheduler._memory_hot_cache_used_bytes = hot_cache_used
             # Tier name disambiguates dynamic = computed reclaimable
             # (safe/balanced/aggressive) from dynamic = user-pinned

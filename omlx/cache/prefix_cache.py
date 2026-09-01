@@ -130,7 +130,7 @@ def _wrap_cachelist_sub_marker(
     if name is None and sub_idx < len(sub_class_names):
         name = sub_class_names[sub_idx]
     return ("__nstate__", name, list(elements))
-_EXACT_PREFIX_TERMINAL_KEY = "specprefill-static-exact-v1"
+_EXACT_PREFIX_TERMINAL_KEY = "static-exact-v1"
 _POOLING_CACHE_SUB_CLASSES = frozenset({"PoolingCache", "BatchPoolingCache"})
 
 
@@ -806,17 +806,7 @@ class BlockAwarePrefixCache(CacheManager):
         elif is_tensor_data:
             # Try to extract type info from cache_data itself
             layer_cache_types = [
-                # Prefer class_name for TurboQuant (cache_type maps to 'KVCache'),
-                # fall back to cache_type for all standard mlx-lm types.
-                (
-                    layer_state.get(
-                        "class_name", layer_state.get("cache_type", "KVCache")
-                    )
-                    if layer_state.get("class_name", "")
-                    in ("TurboQuantKVCache", "BatchTurboQuantKVCache")
-                    else layer_state.get("cache_type", "KVCache")
-                )
-                for layer_state in cache_data
+                layer_state.get("cache_type", "KVCache") for layer_state in cache_data
             ]
             layer_meta_states = [
                 layer_state.get("meta_state", ()) for layer_state in cache_data
@@ -1461,15 +1451,7 @@ class BlockAwarePrefixCache(CacheManager):
             and "state" in cache_data[0]
         ):
             exact_layer_cache_types = [
-                (
-                    layer_state.get(
-                        "class_name", layer_state.get("cache_type", "KVCache")
-                    )
-                    if layer_state.get("class_name", "")
-                    in ("TurboQuantKVCache", "BatchTurboQuantKVCache")
-                    else layer_state.get("cache_type", "KVCache")
-                )
-                for layer_state in cache_data
+                layer_state.get("cache_type", "KVCache") for layer_state in cache_data
             ]
         if self._gdn_split_layout_supported(exact_layer_cache_types):
             logger.info(
@@ -1704,20 +1686,6 @@ class BlockAwarePrefixCache(CacheManager):
 
                 state = layer_state["state"]
                 keys = state[0] if isinstance(state, (list, tuple)) else state
-                # TurboQuant v2: NamedTuple state with .norms attribute
-                if hasattr(keys, "norms") and hasattr(keys.norms, "shape"):
-                    seq_len = keys.norms.shape[2]
-                    logger.debug(
-                        f"Found TurboQuantKVCache at layer {layer_idx} with seq_len={seq_len}"
-                    )
-                    return seq_len
-                # TurboQuant v2: SplitState with .low/.high sub-states
-                if hasattr(keys, "low") and hasattr(keys.low, "norms"):
-                    seq_len = keys.low.norms.shape[2]
-                    logger.debug(
-                        f"Found TurboQuantKVCache (split) at layer {layer_idx} with seq_len={seq_len}"
-                    )
-                    return seq_len
                 if not hasattr(keys, "shape"):
                     continue
 
@@ -1799,7 +1767,7 @@ class BlockAwarePrefixCache(CacheManager):
     def _strip_rotating_payload(self, block_hash: bytes) -> bool:
         """Replace a superseded tip block's rotating payload with placeholders.
 
-        Sliceable layers (KVCache/TurboQuant slices) in the block are kept —
+        Sliceable layers (KVCache slices) in the block are kept —
         only RotatingKVCache-family layer states are replaced with the same
         ``(mx.zeros((1,)), mx.zeros((1,)))`` placeholder that non-tip blocks
         receive at store time, so restore treats the stripped block exactly
@@ -2148,34 +2116,7 @@ class BlockAwarePrefixCache(CacheManager):
 
                 handler = CacheTypeRegistry.get_handler_by_class_name(cache_type_name)
 
-                if cache_type_name in ("TurboQuantKVCache", "BatchTurboQuantKVCache"):
-                    # TurboQuant v2: NamedTuple state from mlx-vlm
-                    from ..turboquant_kv import _slice_state_range, _state_length
-
-                    state = layer_state["state"]
-                    if not isinstance(state, (list, tuple)) or len(state) < 2:
-                        block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
-                        continue
-                    k_state, v_state = state[0], state[1]
-                    # Unwrap _QuantizedStateProxy if present
-                    if hasattr(k_state, "_state"):
-                        k_state = k_state._state
-                    if hasattr(v_state, "_state"):
-                        v_state = v_state._state
-                    seq_len = _state_length(k_state)
-                    actual_end = min(end_idx, seq_len)
-                    if start_idx >= actual_end:
-                        block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
-                        continue
-                    ks = _slice_state_range(k_state, start_idx, actual_end)
-                    vs = _slice_state_range(v_state, start_idx, actual_end)
-                    block_slices.append(
-                        (
-                            "__turboquant_v2__",
-                            (ks, vs),
-                        )
-                    )
-                elif handler.supports_block_slicing:
+                if handler.supports_block_slicing:
                     # Standard 4D KV cache slicing
                     state = layer_state["state"]
                     if not isinstance(state, (list, tuple)) or len(state) < 2:
@@ -2874,7 +2815,7 @@ class BlockAwarePrefixCache(CacheManager):
             # Cache type information from blocks.
             # Anchor the per-block comparison to the live model's signature
             # rather than block 0's metadata. Bootstrapping from block 0
-            # means a stale block (saved before TurboQuant/MTP toggled)
+            # means a stale block (saved before MTP toggled)
             # silently becomes the truth and every newer, correctly-typed
             # block trips the mismatch warning forever. With the live
             # signature as the reference, the stale block 0 itself gets
@@ -3019,8 +2960,8 @@ class BlockAwarePrefixCache(CacheManager):
                         )
                         break
 
-                    # Expectation-gated signature fields (TurboQuant depth,
-                    # CacheList sub composition). Hot-cache / pending-write
+                    # Expectation-gated signature fields (CacheList sub
+                    # composition). Hot-cache / pending-write
                     # loads bypass the manager's index-scan compatibility
                     # check, so the restore loop must gate them here.
                     signature_gate = getattr(
@@ -3029,9 +2970,7 @@ class BlockAwarePrefixCache(CacheManager):
                     if callable(signature_gate) and not signature_gate(
                         block_metadata.get("cache_signature", "")
                     ):
-                        mismatch_reason = (
-                            "TurboQuant depth or CacheList sub composition"
-                        )
+                        mismatch_reason = "CacheList sub composition"
                         reason_getter = getattr(
                             self.paged_ssd_cache,
                             "signature_mismatch_reason",
@@ -3368,7 +3307,6 @@ class BlockAwarePrefixCache(CacheManager):
 
             # Reconstruct caches for each layer
             reconstructed_caches = []
-            healed_tq_layers = 0
 
             for layer_idx in range(num_layers):
                 # Determine cache type for this layer
@@ -3842,202 +3780,6 @@ class BlockAwarePrefixCache(CacheManager):
                     reconstructed_caches.append(cache)
                     continue
 
-                # === TurboQuant KV: payload-driven per-block handling ===
-                # One block chain can mix payload formats: blocks stored
-                # while TurboQuant KV conversion was active carry tagged
-                # ('__turboquant_v2__', (ks, vs)) NamedTuple states, while
-                # blocks stored without the conversion (chains written by
-                # versions that skipped it on chunked-prefill completion,
-                # or stored under a different TQ setting) carry plain dense
-                # (keys, values) tensors in the SAME chain via dedup.
-                # The per-block layer_cache_types mismatch check above
-                # truncates such chains when every block's type metadata is
-                # present and accurate, but block metadata is optional at
-                # load time (missing/corrupt metadata files, failed
-                # layer_cache_types round-trips, chains typed from a later
-                # block when the first block lacks types) — so the payload
-                # itself is the ground truth. Each block must be dispatched
-                # on its own payload format: typing the whole chain from
-                # the chain-level metadata feeds dense arrays into
-                # TurboQuant _concat_state (AttributeError: 'array' object
-                # has no attribute 'norms') and rejects the hit. The
-                # reverse mixing direction (dense-typed chain with
-                # TQ-tagged blocks appended later) is routed here by payload
-                # scan for the same reason.
-                if cache_type_name in (
-                    "TurboQuantKVCache",
-                    "BatchTurboQuantKVCache",
-                ) or (
-                    handler.supports_block_slicing
-                    and self._layer_has_turboquant_payload(all_block_data, layer_idx)
-                ):
-                    entries: list[tuple[int, str, Any, Any]] = []
-                    for block_idx, block_data in enumerate(all_block_data):
-                        if layer_idx >= len(block_data):
-                            continue
-                        bd = block_data[layer_idx]
-                        if not (isinstance(bd, tuple) and len(bd) == 2):
-                            logger.warning(
-                                f"TQ layer {layer_idx}: block {block_idx} has "
-                                f"unsupported payload type "
-                                f"{type(bd).__name__}. Rejecting cache hit."
-                            )
-                            return None
-                        if isinstance(bd[0], str) and bd[0] == "__turboquant_v2__":
-                            ks, vs = bd[1]
-                            entries.append((block_idx, "tq", ks, vs))
-                        elif self._is_placeholder_state(bd):
-                            # Empty-slice placeholder written by the TQ store
-                            # path: this block carries no KV for the layer,
-                            # so the chain cannot be reconstructed.
-                            logger.info(
-                                f"TQ layer {layer_idx}: block {block_idx} is "
-                                f"an empty-slice placeholder. Rejecting cache "
-                                f"hit; request will reprocess from scratch."
-                            )
-                            return None
-                        elif (
-                            hasattr(bd[0], "shape")
-                            and len(bd[0].shape) == 4
-                            and hasattr(bd[1], "shape")
-                        ):
-                            # Plain dense KV slice stored without TQ
-                            # conversion (e.g. chunked-prefill completion).
-                            entries.append((block_idx, "plain", bd[0], bd[1]))
-                        else:
-                            logger.warning(
-                                f"TQ layer {layer_idx}: block {block_idx} "
-                                f"payload is neither a tagged TurboQuant "
-                                f"state nor a dense KV slice. Rejecting "
-                                f"cache hit."
-                            )
-                            return None
-                    if not entries:
-                        logger.debug(f"TQ layer {layer_idx}: no block data")
-                        return None
-
-                    # Group consecutive TQ blocks that share (bits, seed) so
-                    # each run concatenates in quantized form and dequantizes
-                    # once. A homogeneous TQ chain stays a single run — one
-                    # concat + one codec rebuild, restored as a quantized
-                    # TurboQuantKVCache (upstream #1842: restored long-context
-                    # prefixes stay quantized, avoiding full-state
-                    # materialization). Mixed chains (plain dense blocks, or
-                    # runs with differing (bits, seed)) are dequantized per run
-                    # and merged into a dense KVCache, cast back to the dense
-                    # blocks' stored dtype: dequantize() emits float32, and an
-                    # uncast fp32 layer would silently promote the whole merged
-                    # batch cache (2x KV memory) on servers where the TurboQuant
-                    # requantize epilogue does not run (TQ disabled, skip_last).
-                    # The healed request trades TurboQuant's memory savings for
-                    # that one restored prefix.
-                    try:
-                        from mlx_lm.models.cache import KVCache
-
-                        groups: list[tuple[str, Any, Any]] = []
-                        for block_idx, kind, part_k, part_v in entries:
-                            if kind == "plain":
-                                groups.append(("plain", part_k, part_v))
-                                continue
-                            params = self._tq_block_params(
-                                all_block_meta_states,
-                                first_block_meta_states,
-                                block_idx,
-                                layer_idx,
-                            )
-                            if params is None:
-                                logger.warning(
-                                    f"TQ layer {layer_idx}: block {block_idx} "
-                                    f"has no TurboQuant (bits, seed) metadata "
-                                    f"and no server-configured KV bit depth "
-                                    f"is available. Rejecting cache hit "
-                                    f"instead of guessing the codec width."
-                                )
-                                return None
-                            if (
-                                groups
-                                and groups[-1][0] == "tq"
-                                and groups[-1][2] == params
-                            ):
-                                groups[-1][1].append((part_k, part_v))
-                            else:
-                                groups.append(("tq", [(part_k, part_v)], params))
-
-                        # Homogeneous TQ chain (single quantized run, no dense
-                        # blocks): keep it quantized end-to-end like the
-                        # pre-payload-driven path, so restored prefixes don't
-                        # materialize full state.
-                        if len(groups) == 1 and groups[0][0] == "tq":
-                            from mlx_vlm.turboquant import TurboQuantKVCache
-
-                            from ..turboquant_kv import (
-                                _concat_state_token_axis,
-                                _rebuild_codecs,
-                                _state_length,
-                            )
-
-                            tq_bits, tq_seed = groups[0][2]
-                            run_states = groups[0][1]
-                            cat_ks = _concat_state_token_axis(
-                                [ks for ks, _ in run_states]
-                            )
-                            cat_vs = _concat_state_token_axis(
-                                [vs for _, vs in run_states]
-                            )
-                            tq = TurboQuantKVCache(bits=tq_bits, seed=tq_seed)
-                            tq.keys = cat_ks
-                            tq.values = cat_vs
-                            tq.offset = _state_length(cat_ks)
-                            _rebuild_codecs(tq, cat_ks, cat_vs)
-                            reconstructed_caches.append(tq)
-                            continue
-
-                        key_parts = []
-                        value_parts = []
-                        dense_dtype = None
-                        for group in groups:
-                            if group[0] == "plain":
-                                key_parts.append(group[1])
-                                value_parts.append(group[2])
-                                if dense_dtype is None:
-                                    dense_dtype = group[1].dtype
-                                continue
-                            tq_bits, tq_seed = group[2]
-                            dq = self._dequantize_tq_run(
-                                group[1], tq_bits, tq_seed, layer_idx
-                            )
-                            if dq is None:
-                                return None
-                            key_parts.append(dq[0])
-                            value_parts.append(dq[1])
-
-                        keys = mx.concatenate(key_parts, axis=2)
-                        values = mx.concatenate(value_parts, axis=2)
-                        if dense_dtype is not None and keys.dtype != dense_dtype:
-                            keys = keys.astype(dense_dtype)
-                            values = values.astype(dense_dtype)
-                        cache = KVCache()
-                        cache.keys = keys
-                        cache.values = values
-                        cache.offset = keys.shape[2]
-                        reconstructed_caches.append(cache)
-                        healed_tq_layers += 1
-                        if healed_tq_layers == 1:
-                            n_tq = sum(1 for g in groups if g[0] == "tq")
-                            n_plain = len(groups) - n_tq
-                            logger.info(
-                                f"Healed mixed-format TQ chain: layer "
-                                f"{layer_idx} has {n_tq} quantized run(s) and "
-                                f"{n_plain} dense block group(s); restoring "
-                                f"affected layers as dense KVCache "
-                                f"(dtype={keys.dtype})"
-                            )
-                    except Exception as e:
-                        logger.error(
-                            f"TQ layer {layer_idx}: reconstruction failed: {e}"
-                        )
-                        return None
-                    continue
 
                 # === Generic N-tuple sliceable cache: concatenate block slices ===
                 last_block_layer_data = all_block_data[-1][layer_idx]
@@ -4283,110 +4025,6 @@ class BlockAwarePrefixCache(CacheManager):
             logger.debug(traceback.format_exc())
             return None
 
-    @staticmethod
-    def _layer_has_turboquant_payload(
-        all_block_data: list[list[Any]],
-        layer_idx: int,
-    ) -> bool:
-        """True if any block's payload for this layer is TurboQuant-tagged.
-
-        Used to route dense-typed (KVCache) layers whose chain later
-        accumulated TQ-converted blocks into the payload-driven TurboQuant
-        reconstruction path. layer_cache_types comes from the first block
-        only, so the chain-level type cannot detect this mixing.
-        """
-        for block_data in all_block_data:
-            if layer_idx >= len(block_data):
-                continue
-            bd = block_data[layer_idx]
-            if (
-                isinstance(bd, tuple)
-                and len(bd) == 2
-                and isinstance(bd[0], str)
-                and bd[0] == "__turboquant_v2__"
-            ):
-                return True
-        return False
-
-    def _tq_block_params(
-        self,
-        all_block_meta_states: list[Any],
-        first_block_meta_states: Any,
-        block_idx: int,
-        layer_idx: int,
-    ) -> tuple[float, int] | None:
-        """Resolve (bits, seed) for one block's TurboQuant payload.
-
-        Prefers the block's own per-block meta_state (TurboQuantKVCache
-        stores ``(offset, bits, seed)``; mixed chains can carry different
-        parameters per block), then the first block's chain-level meta, then
-        the server-configured TurboQuant KV bit depth (blocks admitted for
-        reconstruction already passed the bit-depth eligibility check, and
-        seed 0 is the universal codec default). Returns None when none of
-        these resolve: rebuilding a codec at a guessed width dequantizes to
-        plausible-but-wrong tensors — silent output corruption after a cache
-        hit — so the caller must reject the hit and re-prefill instead.
-        """
-        candidates = []
-        if block_idx < len(all_block_meta_states):
-            bms = all_block_meta_states[block_idx]
-            if bms and layer_idx < len(bms):
-                candidates.append(bms[layer_idx])
-        if first_block_meta_states and layer_idx < len(first_block_meta_states):
-            candidates.append(first_block_meta_states[layer_idx])
-        for ms in candidates:
-            if isinstance(ms, (list, tuple)) and len(ms) >= 3:
-                try:
-                    return float(ms[1]), int(ms[2])
-                except (TypeError, ValueError):
-                    continue
-        expected_bits = getattr(
-            self.paged_ssd_cache, "_expected_turboquant_kv_bits", None
-        )
-        if isinstance(expected_bits, (int, float)):
-            from mlx_vlm.turboquant import DEFAULT_TURBOQUANT_SEED
-
-            return float(expected_bits), int(DEFAULT_TURBOQUANT_SEED)
-        return None
-
-    def _dequantize_tq_run(
-        self,
-        run_states: list[tuple[Any, Any]],
-        bits: float,
-        seed: int,
-        layer_idx: int,
-    ) -> tuple[Any, Any] | None:
-        """Dequantize a run of consecutive TurboQuant block slices to dense KV.
-
-        Concatenates the quantized (ks, vs) states in block order and
-        dequantizes once, with codecs rebuilt deterministically from
-        (bits, seed). TurboQuant states are per-token (no cross-token
-        coupling), so dequantizing a run equals dequantizing its blocks
-        individually and concatenating — which makes payload-driven
-        per-block reconstruction valid.
-
-        Returns:
-            (keys, values) dense float32 arrays, or None when the run cannot
-            be decoded (caller rejects the cache hit).
-        """
-        from mlx_vlm.turboquant import TurboQuantKVCache
-
-        from ..turboquant_kv import _concat_state_token_axis, _rebuild_codecs
-
-        try:
-            cat_ks = _concat_state_token_axis([ks for ks, _ in run_states])
-            cat_vs = _concat_state_token_axis([vs for _, vs in run_states])
-            tq = TurboQuantKVCache(bits=bits, seed=seed)
-            _rebuild_codecs(tq, cat_ks, cat_vs)
-            return tq.dequantize(cat_ks, cat_vs)
-        except Exception as e:
-            logger.error(
-                f"TQ layer {layer_idx}: failed to dequantize "
-                f"{len(run_states)} block state(s) "
-                f"(bits={bits}, seed={seed}): {e}"
-            )
-            return None
-
     def _fallback_reconstruct_layer(
         self,
         layer_states: list[dict[str, Any]],
@@ -4596,8 +4234,6 @@ class BlockAwarePrefixCache(CacheManager):
         sliceable_types = {
             "KVCache",
             "BatchKVCache",
-            "TurboQuantKVCache",
-            "BatchTurboQuantKVCache",
             "MiniMaxM3KVCache",
         }
         non_sliceable_types = {

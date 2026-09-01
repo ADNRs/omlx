@@ -225,9 +225,8 @@ def _canonicalize_layer_cache_types(
     """Normalize wrapper class names for metadata compatibility checks.
 
     Wrapper classes that keep the same tensor representation compare equal.
-    Types that change tensor representation (e.g., ``TurboQuantKVCache`` vs
-    ``KVCache``) are NOT collapsed -- that mismatch is real and the block must
-    be invalidated.
+    Types that change tensor representation are NOT collapsed -- that
+    mismatch is real and the block must be invalidated.
     """
     if layer_cache_types is None:
         return None
@@ -235,13 +234,6 @@ def _canonicalize_layer_cache_types(
         "SizedArraysCache": "ArraysCache",
         "PrefillReadyRotatingKVCache": "RotatingKVCache",
         POOLING_CACHE_DELTA_CLASS: "PoolingCache",
-        # Batch and single-request TurboQuant caches persist the same packed
-        # per-request state (the save path records whichever class name it
-        # extracted; the restore path rebuilds a TurboQuantKVCache from
-        # either). Collapsing them keeps the predicted layout from
-        # refresh_ssd_layer_signature — which always says
-        # "TurboQuantKVCache" — from sweeping valid batch-form blocks.
-        "BatchTurboQuantKVCache": "TurboQuantKVCache",
     }
     return [
         wrapper_to_canonical.get(cache_type, cache_type)
@@ -255,7 +247,6 @@ def _cache_compat_signature(
     num_layers: int = 0,
     block_size: int = 0,
     layer_cache_types: list[str] | None = None,
-    turboquant_kv_bits: float | None = None,
     cachelist_subtypes: dict[str, list[str]] | None = None,
     payload_layout: str | None = None,
     gdn_sidecar_state_dtype: str | None = None,
@@ -267,13 +258,6 @@ def _cache_compat_signature(
         "block_size": int(block_size or 0),
         "layer_cache_types": list(layer_cache_types or []),
     }
-    # TurboQuant packed state width depends on the bit depth
-    # (packed_width = ceil(head_dim * bits / 32)), so blocks written at
-    # different bit depths are shape-incompatible (#2045). Only stamped
-    # when TurboQuant is active so non-TurboQuant signatures stay
-    # byte-identical to the previous format.
-    if turboquant_kv_bits is not None:
-        payload["turboquant_kv_bits"] = float(turboquant_kv_bits)
     # Mixed CacheList layers (a non-sliceable sub next to a KVCache, e.g.
     # inkling's CacheList(KVCache, ArraysCache(4))) additionally stamp
     # their sub composition: the flat "CacheList" type name cannot tell a
@@ -295,7 +279,6 @@ def cache_signature_for(
     num_layers: int,
     block_size: int,
     layer_cache_types: list[str],
-    turboquant_kv_bits: float | None = None,
     cachelist_subtypes: dict[str, list[str]] | None = None,
     gdn_sidecar_state_dtype: str | None = None,
 ) -> str:
@@ -304,66 +287,16 @@ def cache_signature_for(
     This is the public, stateless counterpart of
     :meth:`PagedSSDCacheManager.cache_signature_for`.  The manager method
     additionally stamps its configured payload layout and supplies its
-    expected TurboQuant/CacheList values when those arguments are omitted.
+    expected CacheList values when those arguments are omitted.
     """
     return _cache_compat_signature(
         model_name=model_name,
         num_layers=num_layers,
         block_size=block_size,
         layer_cache_types=layer_cache_types,
-        turboquant_kv_bits=turboquant_kv_bits,
         cachelist_subtypes=cachelist_subtypes,
         gdn_sidecar_state_dtype=gdn_sidecar_state_dtype,
     )
-
-
-def _signature_turboquant_bits(cache_signature: str) -> float | None:
-    """Extract ``turboquant_kv_bits`` from a stored signature, or None."""
-    if not cache_signature:
-        return None
-    try:
-        payload = json.loads(cache_signature)
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(payload, dict):
-        # Corrupted/foreign signature that parses as a JSON scalar or list.
-        # Report "no recorded depth" instead of raising: an AttributeError
-        # here would abort the whole stale-signature sweep.
-        return None
-    bits = payload.get("turboquant_kv_bits")
-    if bits is None:
-        return None
-    try:
-        return float(bits)
-    except (TypeError, ValueError):
-        return None
-
-
-def _block_turboquant_bits(
-    layer_cache_types: list[str] | None,
-    layer_meta_states: list[tuple] | None,
-) -> float | None:
-    """Read the bit depth a block's own TurboQuant layers were packed at.
-
-    TurboQuant meta_state is ``(offset, bits, seed, ...)`` — the same tuple
-    the restore path reads back at reconstruction. Deriving the signature
-    stamp from the block itself keeps it truthful even when the manager's
-    expectation is stale or not yet learned.
-    """
-    if not layer_cache_types or not layer_meta_states:
-        return None
-    for i, cache_type in enumerate(layer_cache_types):
-        if cache_type not in ("TurboQuantKVCache", "BatchTurboQuantKVCache"):
-            continue
-        if i >= len(layer_meta_states):
-            continue
-        meta_state = layer_meta_states[i]
-        if isinstance(meta_state, (list, tuple)) and len(meta_state) >= 3:
-            try:
-                return float(meta_state[1])
-            except (TypeError, ValueError):
-                return None
-    return None
 
 
 _CACHELIST_NON_SLICEABLE_SUB_CLASSES = frozenset(
@@ -1683,20 +1616,14 @@ class PagedSSDCacheManager(CacheManager):
         self._payload_layout = (
             "split_recurrent_v1" if self._gdn_ssd_split_enabled else "embedded"
         )
-        # TurboQuant bit depth requests will quantize at; learned together
-        # with the layer signature via ``set_expected_layer_signature``
-        # (the depth is only known once the engine has applied the model's
-        # TurboQuant settings, after this manager is constructed).
-        self._expected_turboquant_kv_bits: float | None = None
         # Sub composition of mixed CacheList layers (see
         # ``cachelist_subtypes_from_cache_list``); learned together with
         # the layer signature. None disables the check (legacy managers /
         # models without mixed CacheList layers).
         self._expected_cachelist_subtypes: dict[str, list[str]] | None = None
         # Set once we have swept stale-signature blocks for the current
-        # ``_expected_layer_cache_types`` / ``_expected_turboquant_kv_bits``.
-        # Re-assigning the signature (e.g., via
-        # ``adopt_layer_signature_if_unset``) resets this so the new
+        # ``_expected_layer_cache_types``. Re-assigning the signature (e.g.,
+        # via ``adopt_layer_signature_if_unset``) resets this so the new
         # signature triggers its own one-shot sweep.
         self._signature_sweep_completed = False
         self._lock = threading.RLock()
@@ -2684,33 +2611,13 @@ class PagedSSDCacheManager(CacheManager):
         ):
             return False
 
-        if not self._signature_bits_match(metadata.cache_signature):
-            return False
-
         return True
-
-    def _signature_bits_match(self, cache_signature: str) -> bool:
-        """True when a block's recorded TurboQuant depth satisfies expectations.
-
-        With no expected depth every block passes. With one, the block must
-        PROVE a matching depth: the packed state width is
-        ``ceil(head_dim * bits / 32)``, so a block written at another depth —
-        or one with no recorded depth (pre-depth-stamping saves) — has an
-        incompatible or unverifiable width, and restoring it poisons batch
-        concatenation (#2045).
-        """
-        if self._expected_turboquant_kv_bits is None:
-            return True
-        return (
-            _signature_turboquant_bits(cache_signature)
-            == self._expected_turboquant_kv_bits
-        )
 
     def is_signature_compatible(self, cache_signature: str) -> bool:
         """Per-block signature gate for restore paths that bypass the
         index scan (hot-cache / pending-write loads never pass through
         ``_is_compatible_block``). Checks the expectation-gated signature
-        fields: TurboQuant depth and CacheList sub composition.
+        fields: CacheList sub composition.
         """
         return self.signature_mismatch_reason(cache_signature) is None
 
@@ -2728,13 +2635,6 @@ class PagedSSDCacheManager(CacheManager):
             return (
                 f"payload layout: expected {self._payload_layout}, "
                 f"got {actual_layout}"
-            )
-        if not self._signature_bits_match(cache_signature):
-            actual_bits = _signature_turboquant_bits(cache_signature)
-            actual = "missing" if actual_bits is None else str(actual_bits)
-            return (
-                "TurboQuant depth: expected "
-                f"{self._expected_turboquant_kv_bits}, got {actual}"
             )
 
         expected_subtypes = self._expected_cachelist_subtypes
@@ -2773,14 +2673,13 @@ class PagedSSDCacheManager(CacheManager):
         num_layers: int,
         block_size: int,
         layer_cache_types: list[str],
-        turboquant_kv_bits: float | None = None,
         cachelist_subtypes: dict[str, list[str]] | None = None,
     ) -> str:
         """Build a signature using this manager's expected layout settings.
 
-        Omitted TurboQuant and CacheList arguments inherit the manager's
-        expectation, which lets prefix-cache callers produce the exact same
-        signature as ``save_block`` without reaching into private fields.
+        Omitted CacheList arguments inherit the manager's expectation, which
+        lets prefix-cache callers produce the exact same signature as
+        ``save_block`` without reaching into private fields.
 
         GDN sidecar lookups hash this signature into a directory name, so
         unlike block metadata checks there is no compare-time normalization.
@@ -2789,8 +2688,6 @@ class PagedSSDCacheManager(CacheManager):
         ``ArraysCache``, and without canonicalization the commit and restore
         paths address different sidecar directories.
         """
-        if turboquant_kv_bits is None:
-            turboquant_kv_bits = self._expected_turboquant_kv_bits
         if cachelist_subtypes is None:
             cachelist_subtypes = self._expected_cachelist_subtypes
         return _cache_compat_signature(
@@ -2799,7 +2696,6 @@ class PagedSSDCacheManager(CacheManager):
             block_size=block_size,
             layer_cache_types=_canonicalize_layer_cache_types(layer_cache_types)
             or [],
-            turboquant_kv_bits=turboquant_kv_bits,
             cachelist_subtypes=cachelist_subtypes,
             payload_layout=self._payload_layout,
         )
@@ -2811,7 +2707,6 @@ class PagedSSDCacheManager(CacheManager):
         num_layers: int,
         block_size: int,
         layer_cache_types: list[str],
-        turboquant_kv_bits: float | None = None,
         cachelist_subtypes: dict[str, list[str]] | None = None,
     ) -> str:
         """Build a sidecar namespace signature without invalidating KV blocks."""
@@ -2820,7 +2715,6 @@ class PagedSSDCacheManager(CacheManager):
             num_layers=num_layers,
             block_size=block_size,
             layer_cache_types=layer_cache_types,
-            turboquant_kv_bits=turboquant_kv_bits,
             cachelist_subtypes=cachelist_subtypes,
         )
         if self._gdn_sidecar_state_dtype == "fp32":
@@ -2879,7 +2773,6 @@ class PagedSSDCacheManager(CacheManager):
             num_layers=self._expected_num_layers,
             block_size=self._expected_block_size,
             layer_cache_types=self._expected_layer_cache_types,
-            turboquant_kv_bits=self._expected_turboquant_kv_bits,
             cachelist_subtypes=self._expected_cachelist_subtypes,
         )
 
@@ -3156,7 +3049,7 @@ class PagedSSDCacheManager(CacheManager):
         layer_cache_types = _storage_layer_cache_types(layer_cache_types)
 
         # First save call after a model load is the canonical source for
-        # the live layer-cache signature (post-TurboQuant / post-MTP). If
+        # the live layer-cache signature (post-MTP). If
         # the manager wasn't told the signature at construction, adopt it
         # now and sweep any index entries left over from a prior config.
         if self.adopt_layer_signature_if_unset(layer_cache_types):
@@ -3239,8 +3132,6 @@ class PagedSSDCacheManager(CacheManager):
             # - ``('__cache_list__', sub_tensors)`` — composite layer; each
             #   sub_tensor may itself be a 2-tuple ``(keys, values)`` (V2
             #   legacy from prefix_cache) or an ``__nstate__`` marker.
-            # - ``('__turboquant__'/'__turboquant_v2__', ...)`` — bespoke
-            #   TurboQuant payload, unchanged.
             # - ``(keys, values)`` 2-tuple — V2 legacy. Promoted to V3 by
             #   storing as a length-2 ``__nstate__`` so the on-disk shape
             #   is uniform regardless of whether the producer (prefix_cache,
@@ -3318,27 +3209,6 @@ class PagedSSDCacheManager(CacheManager):
                                 f"sub {j}: {type(sub_tensor).__name__}"
                             )
                             return False
-                elif (
-                    isinstance(layer_data, tuple)
-                    and len(layer_data) == 2
-                    and isinstance(layer_data[0], str)
-                    and layer_data[0] in ("__turboquant__", "__turboquant_v2__")
-                ):
-                    # TurboQuant v2: NamedTuple states (ks, vs)
-                    ks, vs = layer_data[1]
-                    # Flatten NamedTuple fields into individual tensors
-                    tq_tensor_idx = 0
-                    for prefix, state in [("k", ks), ("v", vs)]:
-                        for field_name in state._fields:
-                            val = getattr(state, field_name)
-                            if isinstance(val, mx.array):
-                                arrays[f"layer_{i}_tq_{prefix}_{field_name}"] = val
-                                tq_tensor_idx += 1
-                    cache_list_meta[f"layer_{i}_turboquant_v2"] = "1"
-                    cache_list_meta[f"layer_{i}_tq_key_type"] = type(ks).__name__
-                    cache_list_meta[f"layer_{i}_tq_value_type"] = type(vs).__name__
-                    cache_list_meta[f"layer_{i}_tq_key_fields"] = ",".join(ks._fields)
-                    cache_list_meta[f"layer_{i}_tq_value_fields"] = ",".join(vs._fields)
                 else:
                     # V2 legacy: 2-tuple (keys, values). Upgrade to V3
                     # __nstate__ on disk so all readers see a uniform shape.
@@ -3353,23 +3223,12 @@ class PagedSSDCacheManager(CacheManager):
                     _store_nstate_elements(f"layer_{i}", list(layer_data))
 
             block_size = self._expected_block_size or token_count
-            # Stamp the depth the block's own TurboQuant layers were packed
-            # at (observation), falling back to the manager's expectation
-            # only when the block carries no meta_state. A signature must
-            # never vouch for a width the payload does not have.
-            block_bits = _block_turboquant_bits(layer_cache_types, layer_meta_states)
             cache_signature = _cache_compat_signature(
                 model_name=model_name,
                 num_layers=len(cache_data),
                 block_size=block_size,
                 layer_cache_types=layer_cache_types,
-                turboquant_kv_bits=(
-                    block_bits
-                    if block_bits is not None
-                    else self._expected_turboquant_kv_bits
-                ),
-                # Stamped from the block's own payload (observation), like
-                # the TurboQuant depth above.
+                # Stamped from the block's own payload (observation).
                 cachelist_subtypes=_block_cachelist_subtypes(
                     cache_data, layer_cache_types, layer_meta_states
                 ),
@@ -3577,7 +3436,6 @@ class PagedSSDCacheManager(CacheManager):
         - ``('__nstate__', class_name, [elem0, elem1, ...])`` — V3 N-tuple.
         - ``('__cache_list__', sub_tensors)`` where each sub_tensor is an
           ``__nstate__`` marker — composite layer.
-        - ``('__turboquant_v2__', (ks, vs))`` — TurboQuant payload (unchanged).
 
         V2 blocks (`layer_{i}_keys` / `layer_{i}_values` keys, no
         ``state_count`` metadata) are read via a polyfill that converts
@@ -3667,42 +3525,6 @@ class PagedSSDCacheManager(CacheManager):
                         logger.error(f"Missing N-tuple state for layer {i}")
                         return None
                     cache_data.append(_maybe_unwrap_legacy(layer_marker))
-            elif file_metadata and f"layer_{i}_turboquant_v2" in file_metadata:
-                # TurboQuant v2: reconstruct NamedTuple states from flattened tensors
-                from ..turboquant_kv import (
-                    TurboQuantMSEState,
-                    TurboQuantPolarProdState,
-                    TurboQuantPolarState,
-                    TurboQuantProdState,
-                    TurboQuantSplitState,
-                )
-
-                key_type = file_metadata.get(f"layer_{i}_tq_key_type", "")
-                value_type = file_metadata.get(f"layer_{i}_tq_value_type", "")
-                key_fields = file_metadata.get(f"layer_{i}_tq_key_fields", "").split(
-                    ","
-                )
-                value_fields = file_metadata.get(
-                    f"layer_{i}_tq_value_fields", ""
-                ).split(",")
-                _type_map = {
-                    "TurboQuantMSEState": TurboQuantMSEState,
-                    "TurboQuantProdState": TurboQuantProdState,
-                    "TurboQuantPolarState": TurboQuantPolarState,
-                    "TurboQuantPolarProdState": TurboQuantPolarProdState,
-                    "TurboQuantSplitState": TurboQuantSplitState,
-                }
-                try:
-                    k_cls = _type_map[key_type]
-                    v_cls = _type_map[value_type]
-                    k_tensors = [arrays[f"layer_{i}_tq_k_{f}"] for f in key_fields]
-                    v_tensors = [arrays[f"layer_{i}_tq_v_{f}"] for f in value_fields]
-                    ks = k_cls(*k_tensors)
-                    vs = v_cls(*v_tensors)
-                    cache_data.append(("__turboquant_v2__", (ks, vs)))
-                except (KeyError, TypeError) as e:
-                    logger.error(f"TurboQuant v2 layer {i}: reconstruction failed: {e}")
-                    return None
             else:
                 # Standard cache layer (KVCache, RotatingKVCache,
                 # PoolingCache, ...). V3 stores all state elements as
@@ -4243,7 +4065,7 @@ class PagedSSDCacheManager(CacheManager):
         """Adopt ``layer_cache_types`` as the expected signature if none was set.
 
         The scheduler may not be able to derive the post-patch cache layout
-        before constructing this manager (TurboQuant / MTP / dtype changes
+        before constructing this manager (MTP / dtype changes
         happen at model-load time). Save sites pass the live signature on
         every call, so the manager can adopt it the first time it sees one.
 
@@ -4273,19 +4095,13 @@ class PagedSSDCacheManager(CacheManager):
         self,
         layer_cache_types: list[str] | None,
         *,
-        turboquant_kv_bits: float | None = None,
         cachelist_subtypes: dict[str, list[str]] | None = None,
     ) -> bool:
         """Set the live layer-cache signature, replacing stale expectations.
 
         Unlike ``adopt_layer_signature_if_unset``, this is used by callers that
         learn the final cache layout after manager construction (for example
-        TurboQuant settings applied by the engine after the scheduler starts).
-
-        ``turboquant_kv_bits`` is the live TurboQuant bit depth (None when
-        TurboQuant is inactive). A bit-depth change alone also triggers the
-        sweep: blocks written at another depth have a different packed state
-        width and would crash batch concatenation if mixed (#2045).
+        engine-level settings applied after the scheduler starts).
 
         Returns True when the canonical signature changed and a stale-signature
         sweep should run. Returns False for empty input or a canonical no-op.
@@ -4295,45 +4111,33 @@ class PagedSSDCacheManager(CacheManager):
 
         new_signature = list(layer_cache_types)
         new_canonical = _canonicalize_layer_cache_types(new_signature)
-        new_bits = (
-            float(turboquant_kv_bits) if turboquant_kv_bits is not None else None
-        )
 
         with self._lock:
             old_signature = self._expected_layer_cache_types
             old_canonical = _canonicalize_layer_cache_types(old_signature)
-            bits_changed = new_bits != self._expected_turboquant_kv_bits
             subtypes_changed = (
                 cachelist_subtypes != self._expected_cachelist_subtypes
             )
-            if (
-                old_canonical == new_canonical
-                and not bits_changed
-                and not subtypes_changed
-            ):
+            if old_canonical == new_canonical and not subtypes_changed:
                 if old_signature != new_signature:
                     self._expected_layer_cache_types = new_signature
                 return False
 
             self._expected_layer_cache_types = new_signature
-            self._expected_turboquant_kv_bits = new_bits
             self._expected_cachelist_subtypes = cachelist_subtypes
             self._signature_sweep_completed = False
 
         logger.info(
             "PagedSSDCacheManager updated layer cache signature "
-            "(%d layers, %d unique types, turboquant_kv_bits=%s, "
-            "cachelist_subtypes=%s)",
+            "(%d layers, %d unique types, cachelist_subtypes=%s)",
             len(new_signature),
             len(set(new_canonical or ())),
-            new_bits,
             "yes" if cachelist_subtypes else "no",
         )
         return True
 
     def invalidate_stale_layer_signature(self) -> int:
-        """Drop in-memory index entries whose layer_cache_types — or, when a
-        TurboQuant depth is expected, whose recorded bit depth — disagree
+        """Drop in-memory index entries whose layer_cache_types disagree
         with the current expected signature.
 
         Scoped to the current ``_expected_model_name``: blocks belonging to
@@ -4357,7 +4161,6 @@ class PagedSSDCacheManager(CacheManager):
             return 0
 
         expected = _canonicalize_layer_cache_types(self._expected_layer_cache_types)
-        expects_bits = self._expected_turboquant_kv_bits is not None
 
         with self._index._lock:
             stale: list[bytes] = []
@@ -4367,13 +4170,8 @@ class PagedSSDCacheManager(CacheManager):
                 got = _canonicalize_layer_cache_types(meta.layer_cache_types)
                 if got is None:
                     # Pre-signature blocks lack the metadata to judge the
-                    # layout. Without a depth expectation, skip rather than
-                    # guess — newer saves will replace them. With one, the
-                    # block can no more prove its packed width than its
-                    # layout, so it is unsafe to keep (see
-                    # _signature_bits_match).
-                    if expects_bits:
-                        stale.append(h)
+                    # layout; skip rather than guess — newer saves will
+                    # replace them.
                     continue
                 if got != expected:
                     stale.append(h)
@@ -4386,9 +4184,6 @@ class PagedSSDCacheManager(CacheManager):
                     signature_payload.get("payload_layout", "embedded")
                     != self._payload_layout
                 ):
-                    stale.append(h)
-                    continue
-                if not self._signature_bits_match(meta.cache_signature):
                     stale.append(h)
                     continue
                 if self._expected_cachelist_subtypes is not None and (

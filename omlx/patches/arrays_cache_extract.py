@@ -12,7 +12,7 @@ A request that is aborted or removed with ``return_prompt_caches=True``
 before its first forward reaches ``BatchGenerator.extract_cache`` →
 ``CacheList.extract`` → ``ArraysCache.extract`` with such all-``None``
 slots and dies on ``TypeError: 'NoneType' object is not subscriptable``.
-Models wrapping ArraysCache inside CacheList per layer (inkling-style
+Models wrapping ArraysCache inside CacheList per layer (nested
 hybrid attention + short-conv) hit this on every early abort.
 
 The patch replaces ``extract`` with the same body plus the guard

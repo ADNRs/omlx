@@ -617,64 +617,6 @@ class TestQwen35MoeSanitize:
         assert not any(f"{pfx}.experts." in k for k in result)
 
 
-class TestDeepseekV4Model:
-    def test_skip_when_base_patch_not_applied(self, monkeypatch):
-        """deepseek_v4 MTP patch must skip cleanly if the base
-        DeepSeek-V4 module hasn't been registered (= non-DeepSeek model)."""
-        from omlx.patches.mlx_lm_mtp import deepseek_v4_model
-
-        # Simulate the base patch not having run by removing the module.
-        # No module-level _PATCHED to reset anymore — sub-patcher does its
-        # own marker-based idempotency check against the live class state.
-        monkeypatch.setitem(
-            __import__("sys").modules, "mlx_lm.models.deepseek_v4", None
-        )
-        # When the module is None / missing, apply() returns False without
-        # raising — that's the contract for non-DeepSeek models.
-        applied = deepseek_v4_model.apply()
-        assert applied is False
-
-    def test_apply_with_base_patch_registers_mtp_block(self):
-        """When the DeepSeek-V4 base patch has run, our patch should attach
-        ``MTPBlock`` to the module + ``mtp_forward`` / ``make_mtp_cache``
-        to the Model class. Skipped if the base patch's prerequisites are
-        not satisfied in this environment.
-        """
-        try:
-            from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
-        except ImportError:
-            pytest.skip("omlx.patches.deepseek_v4 not importable")
-        if not apply_deepseek_v4_patch():
-            pytest.skip("DeepSeek-V4 base patch refused to apply in this env")
-
-        from omlx.patches.mlx_lm_mtp import deepseek_v4_model
-
-        applied = deepseek_v4_model.apply()
-        assert applied is True
-        import sys
-
-        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
-        assert hasattr(dsv4, "MTPBlock")
-        assert hasattr(dsv4.Model, "mtp_forward")
-        assert hasattr(dsv4.Model, "make_mtp_cache")
-        assert hasattr(dsv4.Model, "_omlx_mtp_patched")
-        # Idempotent.
-        applied_again = deepseek_v4_model.apply()
-        assert applied_again is True
-
-    def test_mtp_patch_materializes_backbone_and_mtp_cache(self):
-        """DeepSeek-V4 MTP override must keep the base Metal leak fix."""
-        import inspect
-
-        from omlx.patches.mlx_lm_mtp import deepseek_v4_model
-
-        call_source = inspect.getsource(deepseek_v4_model._patch_deepseek_v4_model_call)
-        model_source = inspect.getsource(deepseek_v4_model._patch_model)
-
-        assert "materialize_cache_arrays(cache)" in call_source
-        assert "materialize_cache_arrays(cache)" in model_source
-
-
 class TestBatchGeneratorDispatch:
     @pytest.fixture(autouse=True)
     def _apply(self):
@@ -1921,24 +1863,6 @@ class TestModelSettingsMtp:
         s = ModelSettings.from_dict({"display_name": "qwen3.6"})
         assert s.mtp_enabled is False
 
-    def test_mutual_exclusion_with_dflash(self):
-        with pytest.raises(ValueError, match="speculative-decoding"):
-            ModelSettings(mtp_enabled=True, dflash_enabled=True)
-
-    def test_mtp_with_turboquant_allowed(self):
-        # TurboQuant's attention patch routes MTP's decode-shaped multi-row
-        # verify through the quantized decode kernels, so the combo is valid.
-        s = ModelSettings(mtp_enabled=True, turboquant_kv_enabled=True)
-        assert s.mtp_enabled is True
-        assert s.turboquant_kv_enabled is True
-
-    def test_mtp_with_specprefill_allowed(self):
-        # SpecPrefill targets a different code path (sparse prefill scoring),
-        # so mixing it with MTP is permitted at config construction time.
-        s = ModelSettings(mtp_enabled=True, specprefill_enabled=True)
-        assert s.mtp_enabled is True
-        assert s.specprefill_enabled is True
-
 
 # ---------------------------------------------------------------------------
 # utils.model_loading — compatibility helpers + dispatch
@@ -1952,16 +1876,6 @@ class TestMtpCompatibilityHelpers:
     def test_has_mtp_heads_nextn_field(self):
         assert _has_mtp_heads({"num_nextn_predict_layers": 2}) is True
 
-    def test_has_mtp_heads_dspark_fields(self):
-        assert (
-            _has_mtp_heads(
-                {
-                    "dspark_block_size": 5,
-                    "dspark_target_layer_ids": [40, 41, 42],
-                }
-            )
-            is True
-        )
 
     def test_has_mtp_heads_text_config_field(self):
         assert _has_mtp_heads({"text_config": {"mtp_num_hidden_layers": 1}}) is True
@@ -1981,19 +1895,6 @@ class TestMtpCompatibilityHelpers:
     def test_is_mtp_compatible_qwen3_6(self):
         assert _is_mtp_compatible({"mtp_num_hidden_layers": 1}, "qwen3_6") is True
 
-    def test_is_mtp_compatible_deepseek_v4(self):
-        assert (
-            _is_mtp_compatible({"num_nextn_predict_layers": 1}, "deepseek_v4") is True
-        )
-
-    def test_is_mtp_compatible_gemma4_unified(self):
-        config = {
-            "text_config": {
-                "mtp_num_hidden_layers": 4,
-                "mtp_assistant_config": {"model_type": "gemma4_unified_assistant"},
-            }
-        }
-        assert _is_mtp_compatible(config, "gemma4_unified") is True
 
     def test_is_mtp_compatible_llama_rejected(self):
         assert _is_mtp_compatible({"mtp_num_hidden_layers": 1}, "llama") is False

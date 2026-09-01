@@ -16,7 +16,7 @@ tolerates exactly the parameters this loop rejects. So the guard is stricter
 than the code it guards.
 
 That difference matters for architectures oMLX patches in. GLM-5.2
-(``glm_moe_dsa``) declares sparse-attention indexer parameters that its
+(a vendored family) declared sparse-attention indexer parameters that its
 checkpoint legitimately does not carry — oMLX's own patch exists because
 "pinned mlx-lm ... cannot load checkpoints whose shared DSA layers carry no
 indexer weights". The model loads fine on one Mac and is refused the moment it

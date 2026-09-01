@@ -11,10 +11,9 @@ memory, so nothing about the Python heap tells the collector to run.
 
 Caches that grow in place (``KVCache`` reuses its preallocated buffer) hide
 this: the stranded references alias the live chain and cost no extra bytes.
-Caches that reallocate on growth do not — with TurboQuant KV every turn
-stranded a full extra chain, measured at 0.74 GiB per turn on a 32k
-Qwen3.8-27B conversation (usage 20.4 -> 24.5 GiB over six turns, flat once
-collected).
+Caches that reallocate on growth do not — there every turn stranded a full
+extra chain, measured at 0.74 GiB per turn on a 32k Qwen3.8-27B conversation
+(usage 20.4 -> 24.5 GiB over six turns, flat once collected).
 """
 
 import gc

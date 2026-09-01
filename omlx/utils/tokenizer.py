@@ -110,31 +110,6 @@ def is_harmony_model(model_name: str, config: dict[str, Any] | None = None) -> b
     return False
 
 
-def is_gemma4_model(model_name: str, config: dict[str, Any] | None = None) -> bool:
-    """
-    Check if the model is a Gemma 4 model.
-
-    Detection priority:
-    1. Gemma 4 model_type in config.json
-    2. Fallback: model_name contains "gemma-4" or "gemma4" (case-insensitive)
-    """
-    if config is not None:
-        model_type = config.get("model_type", "")
-        # diffusion_gemma shares Gemma 4's wire protocol (channel markers,
-        # call:name{...} tool calls), so it uses the same parser/extractor.
-        if model_type in {"gemma4", "gemma4_unified", "diffusion_gemma"}:
-            logger.debug(f"Gemma 4 model detected via config.model_type: {model_name}")
-            return True
-
-    if model_name:
-        name_lower = model_name.lower()
-        if "gemma-4" in name_lower or "gemma4" in name_lower:
-            logger.debug(f"Gemma 4 model detected via model name pattern: {model_name}")
-            return True
-
-    return False
-
-
 def is_qwen3_model(model_name: str) -> bool:
     """
     Check if the model is a Qwen3 model.
@@ -193,58 +168,6 @@ def _find_tokenizer_json(
 
 
 @lru_cache(maxsize=128)
-def _is_misconverted_unlimited_ocr_tokenizer(tokenizer_file: str) -> bool:
-    """Detect Unlimited-OCR exports re-saved through LlamaTokenizer.
-
-    Some converted checkpoints retain Unlimited-OCR's byte-level BPE
-    vocabulary but replace its pre-tokenizer and decoder with Llama's
-    Metaspace/SentencePiece pipeline.  The resulting tokenizer emits literal
-    GPT-2 byte glyphs (``Ġ``, ``Ċ``) and mojibake for UTF-8 text.
-    """
-    tokenizer_path = Path(tokenizer_file)
-    config = _read_json_file(tokenizer_path.parent / "config.json")
-    if config is None:
-        return False
-    model_type = str(config.get("model_type") or "").lower().replace("_", "-")
-    if model_type != "unlimited-ocr":
-        return False
-
-    tokenizer_content = _read_json_file(tokenizer_path)
-    if tokenizer_content is None:
-        return False
-
-    pre_tokenizer = tokenizer_content.get("pre_tokenizer")
-    decoder = tokenizer_content.get("decoder")
-    model = tokenizer_content.get("model")
-    vocab = model.get("vocab") if isinstance(model, dict) else None
-    decoder_steps = decoder.get("decoders") if isinstance(decoder, dict) else None
-    replace_step = decoder_steps[0] if isinstance(decoder_steps, list) else None
-    return (
-        isinstance(pre_tokenizer, dict)
-        and pre_tokenizer.get("type") == "Metaspace"
-        and pre_tokenizer.get("replacement") == "▁"
-        and pre_tokenizer.get("split") is False
-        and isinstance(decoder, dict)
-        and decoder.get("type") == "Sequence"
-        and isinstance(decoder_steps, list)
-        and len(decoder_steps) >= 3
-        and isinstance(replace_step, dict)
-        and isinstance(decoder_steps[1], dict)
-        and isinstance(decoder_steps[2], dict)
-        and replace_step.get("type") == "Replace"
-        and replace_step.get("pattern") == {"String": "▁"}
-        and replace_step.get("content") == " "
-        and decoder_steps[1].get("type") == "ByteFallback"
-        and decoder_steps[2].get("type") == "Fuse"
-        and isinstance(model, dict)
-        and model.get("type") == "BPE"
-        and model.get("fuse_unk") is True
-        and model.get("byte_fallback") is True
-        and isinstance(vocab, dict)
-        and "Ġ" in vocab
-        and "Ċ" in vocab
-    )
-
 
 def _tokenizer_backend(tokenizer: Any) -> Any | None:
     backend = getattr(tokenizer, "backend_tokenizer", None)
@@ -256,63 +179,6 @@ def _tokenizer_backend(tokenizer: Any) -> Any | None:
         return None
     return getattr(inner, "backend_tokenizer", inner)
 
-
-def repair_misconverted_unlimited_ocr_tokenizer(
-    tokenizer: Any,
-    model_path: str | Path | None = None,
-) -> bool:
-    """Restore Unlimited-OCR's byte-level tokenizer pipeline in memory.
-
-    Returns ``True`` only when the known misconverted checkpoint signature was
-    detected and repaired.  Canonical Unlimited-OCR checkpoints and unrelated
-    tokenizer families are left untouched.
-    """
-    tokenizer_file = _find_tokenizer_json(tokenizer, model_path)
-    if tokenizer_file is None or not _is_misconverted_unlimited_ocr_tokenizer(
-        str(tokenizer_file)
-    ):
-        return False
-
-    backend = _tokenizer_backend(tokenizer)
-    if backend is None:
-        raise RuntimeError(
-            "Cannot repair the misconverted Unlimited-OCR tokenizer: "
-            "no tokenizers backend is available."
-        )
-
-    from tokenizers import Regex, decoders, normalizers, pre_tokenizers
-
-    # Match baidu/Unlimited-OCR's canonical tokenizer.json exactly.  The
-    # converted model keeps the original vocab and merges; only these runtime
-    # pipeline components and BPE flags were rewritten by LlamaTokenizer.
-    backend.model.fuse_unk = False
-    backend.model.byte_fallback = False
-    backend.normalizer = normalizers.Sequence([])
-    backend.pre_tokenizer = pre_tokenizers.Sequence(
-        [
-            pre_tokenizers.Split(
-                Regex(r"\p{N}{1,3}"), behavior="isolated", invert=False
-            ),
-            pre_tokenizers.Split(
-                Regex(r"[一-龥぀-ゟ゠-ヿ]+"),
-                behavior="isolated",
-                invert=False,
-            ),
-            pre_tokenizers.Split(
-                Regex(
-                    r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+"
-                    r"|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+"
-                    r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+"
-                    r"|\s+(?!\S)|\s+"
-                ),
-                behavior="isolated",
-                invert=False,
-            ),
-            pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
-        ]
-    )
-    backend.decoder = decoders.ByteLevel()
-    return True
 
 
 @lru_cache(maxsize=128)
@@ -433,20 +299,6 @@ def create_streaming_detokenizer(
     tokenizer.json decoder detection before falling back to the naive decoder.
     """
     tokenizer_file = _find_tokenizer_json(tokenizer, model_path)
-    if tokenizer_file is not None and _is_misconverted_unlimited_ocr_tokenizer(
-        str(tokenizer_file)
-    ):
-        # The file incorrectly declares an SPM decoder even though its vocab
-        # contains byte-level BPE tokens.  Always create a fresh request-local
-        # BPE detokenizer so concurrent streams cannot share mutable state.
-        try:
-            from mlx_lm.tokenizer_utils import BPEStreamingDetokenizer
-
-            return BPEStreamingDetokenizer(tokenizer)
-        except Exception as exc:
-            raise RuntimeError(
-                "Failed to create a byte-level Unlimited-OCR detokenizer."
-            ) from exc
 
     has_existing_attr = True
     try:
@@ -530,12 +382,6 @@ def _is_lfm2_text_lm(model_name: str) -> bool:
     )
 
 
-def _is_laguna_model(model_name: str) -> bool:
-    """Return True only for a local checkpoint declaring ``model_type: laguna``."""
-    config = _read_json_file(Path(model_name) / "config.json")
-    return config is not None and config.get("model_type") == "laguna"
-
-
 def _is_mistral_common_model(model_name: str) -> bool:
     """True for local model dirs transformers would route to MistralCommonBackend.
 
@@ -581,18 +427,6 @@ def get_tokenizer_config(
     if _is_lfm2_text_lm(model_name):
         config.setdefault("tool_parser_type", "pythonic")
         logger.debug("LFM2 text LM detected: setting tool_parser_type to pythonic")
-
-    if _is_laguna_model(model_name):
-        # Laguna's Mistral-derived tokenizer ships the legacy regex that
-        # Transformers identifies as tokenization-incorrect without this flag.
-        config["fix_mistral_regex"] = True
-        # mlx-lm's template sniffing sees Laguna's <arg_key> markers and picks
-        # the glm47 parser; pin the vendored Laguna parser instead.
-        config.setdefault("tool_parser_type", "laguna")
-        logger.debug(
-            "Laguna detected: enabling the Mistral tokenizer regex fix and "
-            "the laguna tool parser"
-        )
 
     if _is_mistral_common_model(model_name):
         # MistralCommonBackend renders chat templates whose output cannot be

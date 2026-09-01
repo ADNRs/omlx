@@ -540,13 +540,8 @@ class EngineCore:
         vlm_image_hash: Optional[str] = None,
         vlm_cache_key_start: int = 0,
         vlm_cache_key_ranges: Optional[List[Tuple[int, str]]] = None,
-        specprefill: Optional[bool] = None,
-        specprefill_keep_pct: Optional[float] = None,
-        specprefill_threshold: Optional[int] = None,
-        specprefill_system_end: Optional[int] = None,
         skip_cache_store: bool = False,
         benchmark_trace: bool = False,
-        benchmark_ane_sequence_length: int = 0,
         tools: list[dict[str, Any]] | None = None,
     ) -> str:
         """
@@ -561,9 +556,6 @@ class EngineCore:
             vlm_inputs_embeds: Pre-computed vision+text embeddings for VLM
             vlm_extra_kwargs: Model-specific VLM kwargs (e.g., position_ids)
             vlm_image_hash: SHA256 hash of images for prefix cache
-            specprefill: Per-request SpecPrefill override (True/False/None)
-            specprefill_keep_pct: Per-request keep rate override
-            specprefill_threshold: Per-request threshold override (min tokens)
 
         Returns:
             The request ID
@@ -588,22 +580,7 @@ class EngineCore:
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             skip_cache_store=skip_cache_store,
             benchmark_trace=benchmark_trace,
-            benchmark_ane_sequence_length=benchmark_ane_sequence_length,
         )
-
-        # SpecPrefill: resolve per-request settings.
-        # The scheduler checks _specprefill_enabled to decide whether to score.
-        if specprefill is not None:
-            request._specprefill_enabled = specprefill
-        elif self.scheduler._specprefill_draft_model is not None:
-            # Draft model is loaded → enable by default
-            request._specprefill_enabled = True
-        if specprefill_keep_pct is not None:
-            request._specprefill_keep_pct = specprefill_keep_pct
-        if specprefill_threshold is not None:
-            request._specprefill_threshold = specprefill_threshold
-        if specprefill_system_end is not None and specprefill_system_end > 0:
-            request.specprefill_system_end = specprefill_system_end
 
         # Setup output collector with stream_interval from config
         self._output_collectors[request_id] = RequestOutputCollector(aggregate=True)

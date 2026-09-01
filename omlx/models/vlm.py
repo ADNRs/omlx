@@ -53,7 +53,6 @@ class VLMModelAdapter(nn.Module):
         super().__init__()
         self._vlm_model = vlm_model
         self._language_model = vlm_model.language_model
-        self._uses_minimax_m3_positions = self._detect_minimax_m3(vlm_model)
         self._uses_mrope = self._detect_mrope(vlm_model)
 
         # Pending vision embeddings state (set before prefill, cleared after)
@@ -149,11 +148,6 @@ class VLMModelAdapter(nn.Module):
         return "vlm"
 
     @property
-    def supports_skip_lm_head(self) -> bool:
-        """Whether the wrapped official language model has a cache-only pass."""
-        return self.model_type == "qwen4_exp"
-
-    @property
     def config(self):
         """Expose model config."""
         return self._vlm_model.config
@@ -208,22 +202,8 @@ class VLMModelAdapter(nn.Module):
         self._embed_offset = 0
 
     @staticmethod
-    def _detect_minimax_m3(vlm_model) -> bool:
-        """Check if VLM model uses MiniMax M3 position-id semantics."""
-        config = getattr(vlm_model, "config", None)
-        if config is None:
-            return False
-        minimax_types = {"minimax_m3", "minimax_m3_vl"}
-        if getattr(config, "model_type", None) in minimax_types:
-            return True
-        text_config = getattr(config, "text_config", None)
-        return getattr(text_config, "model_type", None) in minimax_types
-
-    @staticmethod
     def _detect_mrope(vlm_model) -> bool:
         """Check if VLM model uses multi-dimensional RoPE (mRoPE)."""
-        if VLMModelAdapter._detect_minimax_m3(vlm_model):
-            return True
         config = getattr(vlm_model, "config", None)
         if config is None:
             return False
@@ -277,13 +257,6 @@ class VLMModelAdapter(nn.Module):
         deltas = self._batch_rope_deltas.reshape(-1)
         if deltas.size == batch_size:
             return deltas
-        if not self._uses_minimax_m3_positions:
-            logger.debug(
-                "Skipping mRoPE batch deltas with %d rows for %d-row input",
-                deltas.size,
-                batch_size,
-            )
-            return None
         if deltas.size > batch_size:
             logger.debug(
                 "Truncating mRoPE batch deltas from %d to %d rows",
@@ -317,8 +290,6 @@ class VLMModelAdapter(nn.Module):
         starts = starts.reshape(-1)[:batch_size]
         steps = mx.arange(seq_len, dtype=starts.dtype)
         seq_positions = starts[:, None] + steps[None, :]
-        if self._uses_minimax_m3_positions:
-            return seq_positions
         return mx.broadcast_to(seq_positions[None, :, :], (3, batch_size, seq_len))
 
     def get_last_rope_deltas(self) -> float:
@@ -365,12 +336,6 @@ class VLMModelAdapter(nn.Module):
             Model output (logits as mx.array)
         """
         return_hidden = bool(kwargs.get("return_hidden", False))
-        if skip_lm_head:
-            # Scheduler prefill chunks discard their logits. Translate the
-            # shared cache-only contract into the official Qwen model hook so
-            # those chunks do not project every token over the full vocabulary.
-            if self.model_type == "qwen4_exp":
-                kwargs["skip_logits"] = True
         inputs_embeds = kwargs.pop("inputs_embeds", None)
         vlm_extra = kwargs.pop("vlm_extra_kwargs", None) or {}
         vlm_extra.pop("_captured_rope_deltas", None)

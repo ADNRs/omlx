@@ -19,7 +19,6 @@ import gc
 import json
 import logging
 import time
-from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -56,127 +55,6 @@ from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
 
-_FP16_BYTES = 2
-_MAX_AFFINE_BYTES_PER_WEIGHT = 1.0625  # q8 plus fp16 scale/bias per group
-_CPU_SHARE_MATERIALIZATION_HEADROOM = 1.5
-
-
-def _positive_int(value: object) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return 0
-    return parsed if parsed > 0 else 0
-
-
-def _aligned_share_rows(outputs: int, fraction: float) -> int:
-    if outputs <= 0 or fraction <= 0:
-        return 0
-    return min(outputs, (int(outputs * fraction) // 64) * 64)
-
-
-def _qwen35_cpu_share_estimated_bytes(
-    model_path: str,
-    settings: object | None,
-) -> int | None:
-    """Estimate peak bytes added while materializing Qwen CPU-share rows.
-
-    The source checkpoint retains its packed weights. Gate/up and GDN add
-    eager FP16 row slices, while down sharing additionally retains a copied
-    quantized GPU suffix. The final multiplier covers the per-layer
-    dequantize/concatenate scratch observed during eager preparation. ``None``
-    means CPU sharing was requested for a Qwen checkpoint whose geometry could
-    not be established safely; callers must use a conservative fallback.
-    """
-
-    if (
-        settings is None
-        or not bool(getattr(settings, "qwen35_ane_prefill_enabled", False))
-        or not bool(getattr(settings, "qwen35_ane_prefill_cpu_enabled", False))
-    ):
-        return 0
-
-    config_path = Path(model_path) / "config.json"
-    try:
-        config = json.loads(config_path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(config, dict):
-        return None
-    text = config.get("text_config")
-    if not isinstance(text, dict):
-        text = config
-    model_type = str(text.get("model_type") or config.get("model_type") or "")
-    if not any(token in model_type for token in ("qwen3_5", "qwen3_6", "qwen3_8")):
-        return 0
-
-    hidden = _positive_int(text.get("hidden_size"))
-    intermediate = _positive_int(text.get("intermediate_size"))
-    layer_count = _positive_int(text.get("num_hidden_layers"))
-    if not hidden or not intermediate or not layer_count:
-        return None
-    layer_count = min(
-        layer_count,
-        max(0, int(getattr(settings, "qwen35_ane_prefill_max_layers", 64) or 0)),
-    )
-
-    extra = 0.0
-    gate_fraction = float(
-        getattr(settings, "qwen35_ane_prefill_cpu_fraction", 0.0) or 0.0
-    )
-    gate_rows = _aligned_share_rows(intermediate, gate_fraction)
-    if gate_rows:
-        extra += layer_count * 2 * gate_rows * hidden * _FP16_BYTES
-        if bool(getattr(settings, "qwen35_ane_prefill_fused_down", False)):
-            # The fused CPU branch keeps the matching hidden-channel columns
-            # of down_proj in FP16 as well as the gate/up rows above.
-            extra += layer_count * gate_rows * hidden * _FP16_BYTES
-
-    down_fraction = float(
-        getattr(settings, "qwen35_ane_prefill_cpu_down_fraction", 0.0) or 0.0
-    )
-    down_rows = _aligned_share_rows(hidden, down_fraction)
-    if down_rows and down_rows < hidden:
-        cpu_weight = down_rows * intermediate * _FP16_BYTES
-        gpu_suffix = (hidden - down_rows) * intermediate * _MAX_AFFINE_BYTES_PER_WEIGHT
-        extra += layer_count * (cpu_weight + gpu_suffix)
-
-    gdn_fraction = float(
-        getattr(settings, "qwen35_ane_prefill_cpu_gdn_fraction", 0.0) or 0.0
-    )
-    if gdn_fraction > 0 and bool(getattr(settings, "qwen35_ane_prefill_gdn", True)):
-        key_heads = _positive_int(text.get("linear_num_key_heads"))
-        key_dim = _positive_int(text.get("linear_key_head_dim"))
-        value_heads = _positive_int(text.get("linear_num_value_heads"))
-        value_dim = _positive_int(text.get("linear_value_head_dim"))
-        qkv_outputs = 2 * key_heads * key_dim + value_heads * value_dim
-        z_outputs = value_heads * value_dim
-        if not qkv_outputs or not z_outputs:
-            return None
-        gdn_rows = min(
-            qkv_outputs,
-            _aligned_share_rows(qkv_outputs + z_outputs, gdn_fraction),
-        )
-        layer_types = text.get("layer_types")
-        if isinstance(layer_types, list):
-            gdn_layers = sum(
-                "linear" in str(layer_type).lower() for layer_type in layer_types
-            )
-        else:
-            # Qwen hybrid checkpoints use full attention periodically. Without
-            # the explicit map, charging every layer is the safe estimate.
-            gdn_layers = _positive_int(text.get("num_hidden_layers"))
-        gdn_layers = min(
-            gdn_layers,
-            max(
-                0,
-                int(getattr(settings, "qwen35_ane_prefill_gdn_max_layers", 48) or 0),
-            ),
-        )
-        extra += gdn_layers * gdn_rows * hidden * _FP16_BYTES
-
-    return int(extra * _CPU_SHARE_MATERIALIZATION_HEADROOM)
-
 
 @dataclass
 class EngineEntry:
@@ -202,7 +80,7 @@ class EngineEntry:
     actual_size: int | None = None  # Observed process-memory delta after load settles
     runtime_estimated_size: int | None = None  # Includes active load-time variants
     config_model_type: str = (
-        ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
+        ""  # Raw model_type from config.json
     )
     thinking_default: bool | None = (
         None  # True if model thinks by default, False if not, None if unknown
@@ -288,13 +166,6 @@ class EnginePool:
         self._settings_manager: object | None = None  # Set by server
         self._cluster_registry: ClusterRegistry | None = None  # Set by server
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
-        # Requests whose prefill already got a pooled-buffer reclaim pass.
-        # Prefill continuously refills MLX's buffer cache, so the reclaim
-        # rung can "succeed" marginally on every pass of a long prompt while
-        # the durable rung behind it (ANE bank release) is never reached; a
-        # request coming back for more headroom escalates instead of
-        # reclaiming again first. Bounded FIFO — request ids are transient.
-        self._prefill_headroom_recurring: OrderedDict[str, None] = OrderedDict()
         self._load_seconds_per_gb_ema: float | None = None
         self._load_time_observations: int = 0
         self._lease_release_tasks: set[asyncio.Task[None]] = set()
@@ -336,88 +207,6 @@ class EnginePool:
             if assignment is not None
             else entry.estimated_size
         )
-
-    def _entry_runtime_resident_size(
-        self,
-        entry: EngineEntry,
-        runtime_settings: object | None,
-        *,
-        base_size: int | None = None,
-    ) -> int:
-        """Include eager CPU-share storage in load and prefill accounting."""
-
-        base = self._entry_resident_size(entry) if base_size is None else base_size
-        if self._distributed_deployment_for_entry(entry) is not None:
-            return base
-        qwen4_offload, _, qwen4_estimate = self._qwen4_ple_offload_status(
-            entry, runtime_settings
-        )
-        if qwen4_offload and qwen4_estimate is not None:
-            base = min(base, qwen4_estimate.mmap_bytes)
-        extra = _qwen35_cpu_share_estimated_bytes(entry.model_path, runtime_settings)
-        if extra is None:
-            # An enabled CPU path with unreadable geometry must not silently
-            # retain the quantized estimate. One additional model-sized charge
-            # is conservative and lets normal admission produce useful errors.
-            extra = entry.estimated_size
-            logger.warning(
-                "Could not determine Qwen CPU-share geometry for %s; "
-                "reserving one additional model-sized memory allowance",
-                entry.model_id,
-            )
-        if extra > 0:
-            logger.info(
-                "Qwen CPU sharing adds %s to the projected memory for %s",
-                format_size(extra),
-                entry.model_id,
-            )
-        return base + extra
-
-    def _qwen4_ple_offload_status(
-        self,
-        entry: EngineEntry,
-        settings: object | None,
-    ) -> tuple[bool, bool, object | None]:
-        """Resolve requested/forced Qwen4 PLE mmap mode for this process."""
-
-        model_type = (entry.config_model_type or "").replace("-", "_").lower()
-        if model_type != "qwen4_exp":
-            return False, False, None
-        try:
-            from .patches.mlx_vlm_qwen4_exp_compat.residency import (
-                qwen4_exp_residency_estimate,
-            )
-
-            estimate = qwen4_exp_residency_estimate(entry.model_path)
-        except (OSError, TypeError, ValueError):
-            logger.debug(
-                "Could not inspect Qwen4-Exp PLE residency for %s",
-                entry.model_id,
-                exc_info=True,
-            )
-            return False, False, None
-        ceiling = self._fallback_admission_ceiling()
-        if ceiling <= 0:
-            ceiling = self._current_ceiling()
-        forced = estimate.force_ssd_offload(ceiling)
-        requested = bool(
-            settings is not None and getattr(settings, "qwen4_ple_ssd_offload", False)
-        )
-        return requested or forced, forced, estimate if estimate.supported else None
-
-    def _effective_qwen4_model_settings(
-        self,
-        entry: EngineEntry,
-        settings: object | None,
-    ) -> object | None:
-        """Apply a forced mmap decision without mutating persisted settings."""
-
-        enabled, forced, _ = self._qwen4_ple_offload_status(entry, settings)
-        if not enabled or not forced or settings is None:
-            return settings
-        effective = copy.copy(settings)
-        setattr(effective, "qwen4_ple_ssd_offload", True)
-        return effective
 
     @property
     def current_model_memory(self) -> int:
@@ -564,13 +353,6 @@ class EnginePool:
             value = data.get(key)
             return value is not None and value != ""
 
-        def normalized_index_cache_freq() -> int | None:
-            value = data.get("index_cache_freq")
-            try:
-                freq = int(value) if value is not None else None
-            except (TypeError, ValueError):
-                return None
-            return freq if freq is not None and freq >= 2 else None
 
         signature: list[tuple[str, str]] = []
 
@@ -579,8 +361,6 @@ class EnginePool:
 
         # Security/load gates.
         add("trust_remote_code", bool(data.get("trust_remote_code", False)))
-        add("index_cache_freq", normalized_index_cache_freq())
-
         # Load-time model variants. Dependent fields only matter when their
         # feature is active; stale draft paths or tuning defaults must not
         # force a reload when the corresponding feature is disabled.
@@ -591,130 +371,6 @@ class EnginePool:
         # engine, but a stale value must not force one when MTP is off.
         if mtp_active:
             add("mtp_num_draft_tokens", data.get("mtp_num_draft_tokens"))
-        if entry is not None:
-            qwen4_offload, _, _ = self._qwen4_ple_offload_status(entry, settings)
-            add("qwen4_ple_ssd_offload", qwen4_offload)
-
-        turboquant_active = bool(data.get("turboquant_kv_enabled", False))
-        add("turboquant_kv_enabled", turboquant_active)
-        if turboquant_active:
-            add("turboquant_kv_bits", data.get("turboquant_kv_bits", 4))
-            add("turboquant_skip_last", data.get("turboquant_skip_last", True))
-
-        qwen_ane_active = bool(data.get("qwen35_ane_prefill_enabled", False))
-        add("qwen35_ane_prefill_enabled", qwen_ane_active)
-        if qwen_ane_active:
-            add(
-                "qwen35_ane_prefill_sequence_length",
-                data.get("qwen35_ane_prefill_sequence_length", 2048),
-            )
-            add(
-                "qwen35_ane_prefill_tail_padding_min_tokens",
-                data.get("qwen35_ane_prefill_tail_padding_min_tokens", 0),
-            )
-            add("qwen35_ane_prefill_fraction", data.get("qwen35_ane_prefill_fraction", 0.53))
-            add(
-                "qwen35_ane_prefill_fused_down",
-                data.get("qwen35_ane_prefill_fused_down", False),
-            )
-            add("qwen35_ane_prefill_max_layers", data.get("qwen35_ane_prefill_max_layers", 64))
-            add("qwen35_ane_prefill_dual_ane", data.get("qwen35_ane_prefill_dual_ane", True))
-            add("qwen35_ane_prefill_gdn", data.get("qwen35_ane_prefill_gdn", True))
-            if data.get("qwen35_ane_prefill_gdn", True):
-                add(
-                    "qwen35_ane_prefill_gdn_fraction",
-                    data.get("qwen35_ane_prefill_gdn_fraction", 0.50),
-                )
-                add(
-                    "qwen35_ane_prefill_gdn_max_layers",
-                    data.get("qwen35_ane_prefill_gdn_max_layers", 48),
-                )
-            cpu_active = bool(data.get("qwen35_ane_prefill_cpu_enabled", False))
-            add("qwen35_ane_prefill_cpu_enabled", cpu_active)
-            if cpu_active:
-                add(
-                    "qwen35_ane_prefill_cpu_fraction",
-                    data.get("qwen35_ane_prefill_cpu_fraction", 0.135),
-                )
-                add(
-                    "qwen35_ane_prefill_cpu_down_fraction",
-                    data.get("qwen35_ane_prefill_cpu_down_fraction", 0.0),
-                )
-                add(
-                    "qwen35_ane_prefill_cpu_gdn_fraction",
-                    data.get("qwen35_ane_prefill_cpu_gdn_fraction", 0.0),
-                )
-                add(
-                    "qwen35_ane_prefill_cpu_threads",
-                    data.get("qwen35_ane_prefill_cpu_threads", 8),
-                )
-                add(
-                    "qwen35_ane_prefill_cpu_shared_resource",
-                    data.get("qwen35_ane_prefill_cpu_shared_resource", True),
-                )
-
-        specprefill_active = bool(data.get("specprefill_enabled", False)) and has_value(
-            "specprefill_draft_model"
-        )
-        add("specprefill_enabled", specprefill_active)
-        if specprefill_active:
-            add("specprefill_draft_model", data.get("specprefill_draft_model"))
-            add("specprefill_keep_pct", data.get("specprefill_keep_pct", 0.2))
-            add("specprefill_threshold", data.get("specprefill_threshold"))
-
-        dflash_active = (
-            bool(data.get("dflash_enabled", False))
-            and has_value("dflash_draft_model")
-            and not is_diffusion
-        )
-        add("dflash_enabled", dflash_active)
-        if dflash_active:
-            add("dflash_draft_model", data.get("dflash_draft_model"))
-            add(
-                "dflash_draft_quant_enabled",
-                bool(data.get("dflash_draft_quant_enabled", False)),
-            )
-            if data.get("dflash_draft_quant_enabled", False):
-                add(
-                    "dflash_draft_quant_weight_bits",
-                    data.get("dflash_draft_quant_weight_bits", 4),
-                )
-                add(
-                    "dflash_draft_quant_activation_bits",
-                    data.get("dflash_draft_quant_activation_bits", 16),
-                )
-                add(
-                    "dflash_draft_quant_group_size",
-                    data.get("dflash_draft_quant_group_size", 64),
-                )
-            add("dflash_max_ctx", data.get("dflash_max_ctx"))
-            add("dflash_in_memory_cache", data.get("dflash_in_memory_cache", True))
-            add(
-                "dflash_in_memory_cache_max_entries",
-                data.get("dflash_in_memory_cache_max_entries", 4),
-            )
-            add(
-                "dflash_in_memory_cache_max_bytes",
-                data.get("dflash_in_memory_cache_max_bytes"),
-            )
-            add("dflash_ssd_cache", bool(data.get("dflash_ssd_cache", False)))
-            if data.get("dflash_ssd_cache", False):
-                add(
-                    "dflash_ssd_cache_max_bytes", data.get("dflash_ssd_cache_max_bytes")
-                )
-            add("dflash_draft_window_size", data.get("dflash_draft_window_size"))
-            add("dflash_draft_sink_size", data.get("dflash_draft_sink_size"))
-            add("dflash_block_size", data.get("dflash_block_size"))
-            add("dflash_verify_mode", data.get("dflash_verify_mode"))
-
-        vlm_mtp_active = bool(data.get("vlm_mtp_enabled", False)) and has_value(
-            "vlm_mtp_draft_model"
-        )
-        add("vlm_mtp_enabled", vlm_mtp_active)
-        if vlm_mtp_active:
-            add("vlm_mtp_draft_model", data.get("vlm_mtp_draft_model"))
-            add("vlm_mtp_draft_block_size", data.get("vlm_mtp_draft_block_size"))
-
         return tuple(signature)
 
     @property
@@ -1563,16 +1219,6 @@ class EnginePool:
                 and (force_lm or entry.engine_type == "batched")
             ):
                 admission_size = entry.text_only_size
-            admission_settings = runtime_settings
-            if admission_settings is None and self._settings_manager is not None:
-                get_settings = getattr(self._settings_manager, "get_settings", None)
-                if callable(get_settings):
-                    admission_settings = get_settings(model_id)
-            admission_size = self._entry_runtime_resident_size(
-                entry,
-                admission_settings,
-                base_size=admission_size,
-            )
             admission_kind = "local shard" if deployment is not None else "model"
             ceiling = self._current_ceiling()
             best_effort = False
@@ -1818,50 +1464,6 @@ class EnginePool:
         candidates.sort()  # Sort by last_access (oldest first)
         return candidates[0][1]
 
-    async def _unload_other_dflash_engines(self, model_id: str) -> None:
-        """Unload other idle DFlash engines before starting a new one.
-
-        dflash-mlx installs target hooks on shared Python classes and owns a
-        process-global runtime cache manager, so multiple loaded DFlash engines
-        can leak state across model switches.
-        """
-        victims: list[str] = []
-        blocked: list[str] = []
-        for mid, e in self._entries.items():
-            if mid == model_id or e.engine is None:
-                continue
-            if type(e.engine).__name__ != "DFlashEngine":
-                continue
-            if e.is_loading or e.in_use > 0:
-                blocked.append(mid)
-                continue
-            try:
-                if e.engine.has_active_requests():
-                    blocked.append(mid)
-                    continue
-            except AttributeError:
-                pass
-            if e.is_pinned:
-                blocked.append(f"{mid} (pinned)")
-                continue
-            victims.append(mid)
-
-        if blocked:
-            raise RuntimeError(
-                "Cannot load DFlash model "
-                f"'{model_id}' while another DFlash engine is active: "
-                f"{', '.join(blocked)}"
-            )
-
-        for victim in victims:
-            logger.info(
-                "Unloading DFlash model '%s' before loading '%s' because "
-                "dflash runtime hooks/cache are process-global",
-                victim,
-                model_id,
-            )
-            await self._unload_engine(victim)
-
     @staticmethod
     def _resolve_scheduler_from_engine(engine: object) -> object | None:
         scheduler = getattr(engine, "scheduler", None)
@@ -1914,10 +1516,6 @@ class EnginePool:
 
         evicted_any = False
         reclaim_attempted = False
-        ane_release_attempted = False
-        # Snapshot once per call: "a PREVIOUS pass for this request already
-        # got a reclaim". Marking inside this call must not flip it.
-        recurring = request_id in self._prefill_headroom_recurring
         async with self._lock:
             while True:
                 current = max(
@@ -1933,7 +1531,7 @@ class EnginePool:
                     # process-wide and can be masked by concurrent
                     # allocation, but reaching this check with headroom
                     # after an attempt means admission will now succeed.
-                    return evicted_any or reclaim_attempted or ane_release_attempted
+                    return evicted_any or reclaim_attempted
 
                 victim = self._find_lru_prefill_eviction_victim(
                     exclude_model_id=exclude_model_id
@@ -1941,24 +1539,8 @@ class EnginePool:
                 if victim is None:
                     # No idle model left to evict -- the "No idle model
                     # evicted" case that used to reject outright even when
-                    # tens of GB were reclaimable. Two rungs remain: the
-                    # cheap pooled-buffer reclaim, and shedding the
-                    # requesting model's own ANE prefill banks. Ordering
-                    # matters: prefill continuously refills MLX's buffer
-                    # cache, so on a long prompt the reclaim can "succeed"
-                    # by a marginal few GB on every pass while the durable
-                    # rung is never reached — a request that already had a
-                    # reclaim pass and is back for more headroom escalates
-                    # straight to the bank release instead.
-                    if recurring and not ane_release_attempted:
-                        ane_release_attempted = True
-                        await self._release_ane_prefill_for_headroom(
-                            exclude_model_id, request_id
-                        )
-                        # Re-measure regardless of the reported delta: the
-                        # footprint reading is process-wide, so concurrent
-                        # allocation can mask a real release as 0 bytes.
-                        continue
+                    # tens of GB were reclaimable. One rung remains: the
+                    # cheap pooled-buffer reclaim.
                     if not reclaim_attempted:
                         # Return MLX's pooled Metal buffers (freed by
                         # finished requests but still cached, so
@@ -1966,9 +1548,6 @@ class EnginePool:
                         # requesting engine's own MLX thread, then let the
                         # loop re-measure.
                         reclaim_attempted = True
-                        self._prefill_headroom_recurring[request_id] = None
-                        while len(self._prefill_headroom_recurring) > 512:
-                            self._prefill_headroom_recurring.popitem(last=False)
                         await self._reclaim_pooled_buffers_for_prefill(
                             exclude_model_id, request_id
                         )
@@ -1978,23 +1557,6 @@ class EnginePool:
                         # real reclaim as 0 bytes freed. The loop re-checks
                         # the target with a fresh reading; reclaim_attempted
                         # keeps this branch from running twice.
-                        continue
-                    if not ane_release_attempted:
-                        # Last rung before giving up: shed the requesting
-                        # model's own ANE prefill banks. They hold the packed
-                        # weight blobs mapped into the native programs (~13 GB
-                        # for a 27B at the default fractions) and are purely
-                        # an accelerator — the per-module failure-latch
-                        # fallback serves the same modules on GPU — so at
-                        # long context the trade is a slower-but-unthrottled
-                        # prefill instead of chunks collapsing to the floor.
-                        # Banks come back at the model's next load.
-                        ane_release_attempted = True
-                        await self._release_ane_prefill_for_headroom(
-                            exclude_model_id, request_id
-                        )
-                        # Re-measure regardless of the reported delta, for
-                        # the same reason as the pooled reclaim above.
                         continue
                     if evicted_any:
                         logger.info(
@@ -2098,103 +1660,6 @@ class EnginePool:
             )
         return freed
 
-    async def _release_ane_prefill_for_headroom(
-        self, model_id: str, request_id: str
-    ) -> int:
-        """Release the requesting model's ANE prefill banks; report bytes freed.
-
-        The compiled banks keep the packed weight blobs mapped into the
-        native ANE programs for the model's whole residency, so a config
-        tuned at a short calibration length silently competes with the KV
-        cache at long context — on a 27B at mlp 0.35 / gdn 0.45 the banks
-        hold ~13 GB, which is the difference between full 2048-token prefill
-        chunks and the guard throttling to the floor. Shedding them is safe:
-        the release latches every sliced module through the existing
-        per-module failure flags, so the dispatch sites fall back to stock
-        GPU compute exactly as they do after a warmup failure. The banks are
-        rebuilt at the model's next load.
-
-        Runs on the requesting engine's own MLX thread; its step loop is
-        parked awaiting this eviction callback, so no prefill dispatch is in
-        flight while references are dropped. A failing release is contained:
-        the request is then throttled exactly as if nothing had been
-        releasable.
-
-        Returns:
-            Bytes handed back to the OS (``get_phys_footprint`` delta, >= 0),
-            0 when nothing was released.
-        """
-        entry = self._entries.get(model_id)
-        engine = entry.engine if entry is not None else None
-        core = (
-            self._resolve_engine_core_from_engine(engine)
-            if engine is not None
-            else None
-        )
-        executor = getattr(core, "_mlx_executor", None)
-        model = (
-            getattr(engine, "_model", None) or getattr(engine, "_vlm_model", None)
-            if engine is not None
-            else None
-        )
-        if executor is None or model is None:
-            logger.info(
-                "ANE bank release skipped for request %s: %s not resolvable "
-                "on '%s'",
-                request_id,
-                "executor" if executor is None else "model object",
-                model_id,
-            )
-            return 0
-        try:
-            from .patches.qwen35_ane_prefill import release_qwen35_ane_prefill
-        except Exception:  # noqa: BLE001 - patch optional at runtime
-            return 0
-
-        def _release_on_engine_thread() -> tuple[int, int]:
-            released, programs = release_qwen35_ane_prefill(model)
-            if released:
-                gc.collect()
-            return released, programs
-
-        before = get_phys_footprint()
-        loop = asyncio.get_running_loop()
-        try:
-            released, programs = await loop.run_in_executor(
-                executor, _release_on_engine_thread
-            )
-        except Exception as e:
-            logger.warning(
-                "ANE prefill bank release failed for request %s: %s",
-                request_id,
-                e,
-            )
-            return 0
-        if not released:
-            logger.info(
-                "No ANE prefill slices to release on '%s' for request %s",
-                model_id,
-                request_id,
-            )
-            return 0
-        freed = max(0, before - get_phys_footprint())
-        # The load-time admission reservation priced these I/O surfaces; drop
-        # it so later passes stop pausing for memory that no longer exists.
-        # The next load re-prices it from the rebuilt banks.
-        monitor = getattr(getattr(core, "scheduler", None), "memory_monitor", None)
-        if monitor is not None and hasattr(monitor, "clear_ane_prefill_transient"):
-            monitor.clear_ane_prefill_transient()
-        logger.warning(
-            "Released ANE prefill banks on '%s' for prefill headroom "
-            "(request=%s, %d modules, %d programs, freed %s); the model "
-            "serves GPU-only prefill until its next load",
-            model_id,
-            request_id,
-            released,
-            programs,
-            format_size(freed),
-        )
-        return freed
 
     def _other_entries_serving(self, model_id: str) -> bool:
         """True when any other entry is serving or loading.
@@ -2521,96 +1986,25 @@ class EnginePool:
             model_settings = runtime_settings
             if model_settings is None and self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
-            model_settings = self._effective_qwen4_model_settings(entry, model_settings)
 
             deployment = self._distributed_deployment_for_entry(entry)
-            base_resident_size = self._entry_resident_size(entry)
+            resident_size = self._entry_resident_size(entry)
             if (
                 deployment is None
                 and entry.text_only_size
                 and (force_lm or entry.engine_type == "batched")
             ):
-                base_resident_size = entry.text_only_size
-            resident_size = self._entry_runtime_resident_size(
-                entry,
-                model_settings,
-                base_size=base_resident_size,
-            )
+                resident_size = entry.text_only_size
             entry.runtime_estimated_size = resident_size
 
             # Wire the correct model_id / model_path into the shared scheduler
-            # config so every engine (Batched/VLM/DFlash/Embedding) sees the
+            # config so every engine (Batched/VLM/Embedding) sees the
             # right values when it builds `SchedulerConfig` internally.
             self._scheduler_config.model_name = model_id
             self._scheduler_config.model_path = entry.model_path
 
-            # Native MTP forces LM-only dispatch even for VLM models. Vision
-            # encoder weights are ignored because the patched mtp_forward only
-            # exists on the language model path. mtp_enabled was already
-            # validated as mutually exclusive with dflash in
-            # metal-knowledge: with the mlx-vlm runtime MTP patch (see
-            # omlx/patches/mlx_vlm_mtp/qwen35_moe_vlm_runtime.py) VLM models
-            # can run MTP natively while keeping vision intact. The old
-            # force-LM-dispatch shortcut here is obsolete for patched
-            # model families; let VLMBatchedEngine handle MTP-enabled VLMs.
-            pass
-
-            # Check if DFlash is enabled -- takes priority over engine type
-            # since DFlash has its own model loading pipeline
             engine = None
             deployment = deployment if effective_type == "batched" else None
-            if deployment is None and model_settings is not None:
-                dflash_enabled = getattr(model_settings, "dflash_enabled", False)
-                dflash_draft = getattr(model_settings, "dflash_draft_model", None)
-                if (
-                    dflash_enabled
-                    and dflash_draft
-                    and self._entry_is_diffusion_model(entry)
-                ):
-                    logger.warning(
-                        "DFlash is not supported for diffusion models; "
-                        "loading %s with its native VLM engine",
-                        model_id,
-                    )
-                elif dflash_enabled and dflash_draft:
-                    try:
-                        from .engine.dflash import DFlashEngine
-
-                        engine = DFlashEngine(
-                            model_name=entry.model_path,
-                            draft_model_path=dflash_draft,
-                            draft_quant_enabled=getattr(
-                                model_settings, "dflash_draft_quant_enabled", False
-                            ),
-                            draft_quant_weight_bits=getattr(
-                                model_settings, "dflash_draft_quant_weight_bits", 4
-                            ),
-                            draft_quant_activation_bits=getattr(
-                                model_settings, "dflash_draft_quant_activation_bits", 16
-                            ),
-                            draft_quant_group_size=getattr(
-                                model_settings, "dflash_draft_quant_group_size", 64
-                            ),
-                            model_settings=model_settings,
-                            fallback_engine_type=effective_type,
-                            scheduler_config=self._scheduler_config,
-                            omlx_ssd_cache_dir=getattr(
-                                self._scheduler_config, "paged_ssd_cache_dir", None
-                            ),
-                        )
-                        logger.info(
-                            f"DFlash enabled for {model_id}, draft={dflash_draft}"
-                        )
-                    except ImportError:
-                        logger.warning(
-                            f"DFlash enabled for {model_id} but dflash-mlx is not installed. "
-                            f"Falling back to default engine."
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            f"DFlash init failed for {model_id}: {e}. "
-                            f"Falling back to default engine."
-                        )
 
             # Per-model trust_remote_code (security opt-in, issue #926).
             # When unset, defaults to False -- repos with custom modeling_*.py
@@ -2632,7 +2026,7 @@ class EnginePool:
                     eviction_request=eviction_request,
                 )
 
-            # Create engine based on engine type (if DFlash not active)
+            # Create engine based on engine type.
             if engine is None:
                 if deployment is not None:
                     from .engine.distributed import DistributedBatchedEngine
@@ -2693,62 +2087,10 @@ class EnginePool:
                         prefill_eviction_callback=prefill_eviction_callback,
                     )
 
-            _is_dflash_engine = (
-                engine is not None and type(engine).__name__ == "DFlashEngine"
-            )
-            if _is_dflash_engine:
-                await self._unload_other_dflash_engines(model_id)
-
             try:
                 await engine.start()
             except Exception as start_error:
-                if _is_dflash_engine:
-                    # DFlash engine failed to start -- fall back to the
-                    # model's natural engine type (VLM or Batched)
-                    logger.warning(
-                        f"DFlash start failed for {model_id}: {start_error}. "
-                        f"Falling back to {effective_type} engine."
-                    )
-                    try:
-                        await engine.stop()
-                    except Exception:
-                        pass
-                    gc.collect()
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(
-                        get_mlx_executor(),
-                        lambda: (mx.synchronize(), mx.clear_cache()),
-                    )
-
-                    if effective_type == "vlm":
-                        engine = VLMBatchedEngine(
-                            model_name=entry.model_path,
-                            trust_remote_code=trc,
-                            scheduler_config=self._scheduler_config,
-                            model_settings=model_settings,
-                            prefill_eviction_callback=prefill_eviction_callback,
-                        )
-                    else:
-                        engine = BatchedEngine(
-                            model_name=entry.model_path,
-                            trust_remote_code=trc,
-                            scheduler_config=self._scheduler_config,
-                            model_settings=model_settings,
-                            prefill_eviction_callback=prefill_eviction_callback,
-                        )
-                    try:
-                        await engine.start()
-                    except Exception as fallback_error:
-                        raise RuntimeError(
-                            f"DFlash load failed: {start_error}; "
-                            f"{effective_type} fallback also failed: {fallback_error}"
-                        ) from start_error
-                    logger.info(
-                        f"Successfully loaded {model_id} as {effective_type} "
-                        f"(fallback from DFlash)"
-                    )
-
-                elif force_lm and entry.engine_type == "vlm":
+                if force_lm and entry.engine_type == "vlm":
                     # force_lm created a BatchedEngine but mlx-lm can't
                     # load this VLM model -- fall back to VLMBatchedEngine.
                     logger.warning(
@@ -2851,48 +2193,11 @@ class EnginePool:
             load_completed = True
             self._clear_load_failure(entry)
 
-            # VLM MTP: load MTP drafter (gemma4_assistant or qwen3_5_mtp) and attach to engine.
-            # Fail-soft -- drafter load issues never block the target engine.
-            if (
-                model_settings is not None
-                and getattr(model_settings, "vlm_mtp_enabled", False)
-                and getattr(model_settings, "vlm_mtp_draft_model", None)
-                and hasattr(engine, "set_vlm_mtp_drafter")
-            ):
-                drafter_id = model_settings.vlm_mtp_draft_model
-                drafter_entry = self._entries.get(drafter_id)
-                drafter_path = drafter_entry.model_path if drafter_entry else drafter_id
 
-                def _load_drafter_sync(path: str = drafter_path):
-                    from .speculative.vlm_mtp import load_vlm_mtp_drafter
-
-                    return load_vlm_mtp_drafter(path)
-
-                loop = asyncio.get_running_loop()
-                try:
-                    drafter = await loop.run_in_executor(
-                        get_mlx_executor(), _load_drafter_sync
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"VLM MTP drafter load raised for {model_id} "
-                        f"(drafter={drafter_id}): {e} -- toggle ignored"
-                    )
-                    drafter = None
-                if drafter is not None:
-                    engine.set_vlm_mtp_drafter(drafter)
-                    logger.info(f"VLM MTP enabled for {model_id}, drafter={drafter_id}")
-                else:
-                    logger.warning(
-                        f"VLM MTP toggle on for {model_id} but drafter "
-                        f"load failed; toggle ignored"
-                    )
-
-            # Keep the requested construction variant as the reuse key. DFlash
-            # and VLM MTP are fail-soft: either can leave a normal engine in
-            # place. Recording that effective engine as a different variant
-            # makes the next identical concurrent request attempt a reload and
-            # fail with ModelBusyError before it reaches the scheduler (#2406).
+            # Keep the requested construction variant as the reuse key so an
+            # effective engine left by a fail-soft path is not recorded as a
+            # different variant; that would make the next identical concurrent
+            # request attempt a reload and fail with ModelBusyError (#2406).
             entry.runtime_settings_signature = self._engine_runtime_signature(
                 model_id, model_settings
             )

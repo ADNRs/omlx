@@ -118,28 +118,6 @@ def test_global_hide_helper_excludes_helper_source_profile(tmp_path):
     assert _list_ids(state) == ["chat-a"]
 
 
-def test_global_hide_helper_excludes_referenced_draft(tmp_path):
-    # A plain-LLM draft is a helper only because another model references it.
-    models = [_model("chat-a"), _model("draft-llm", config_model_type="llama")]
-    state = _state(models, tmp_path, hide_helpers=True)
-    state.settings_manager.set_settings(
-        "chat-a", ModelSettings(dflash_draft_model="/models/draft-llm")
-    )
-    ids = _list_ids(state)
-    assert "chat-a" in ids
-    assert "draft-llm" not in ids
-
-
-def test_referenced_parent_stays_visible(tmp_path):
-    # The referencing chat model itself is never treated as a helper.
-    models = [_model("chat-a"), _model("draft-llm")]
-    state = _state(models, tmp_path, hide_helpers=True)
-    state.settings_manager.set_settings(
-        "chat-a", ModelSettings(vlm_mtp_draft_model="/models/draft-llm")
-    )
-    assert "chat-a" in _list_ids(state)
-
-
 def test_favorites_listed_first(tmp_path):
     models = [_model("chat-a"), _model("chat-b"), _model("chat-c")]
     state = _state(models, tmp_path)

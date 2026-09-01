@@ -56,20 +56,14 @@ from .exceptions import (
     describe_ceiling_binding,
     is_cache_corruption_error,
 )
-from .patches.sdpa256_attention import set_unfused_headroom_provider
+from .patches.sdpa256_attention import (
+    set_physical_headroom_provider,
+    set_unfused_headroom_provider,
+)
 from .decode_activity import get_decode_activity
 from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
-from .speculative.processing_sampler import (
-    MTPProcessingSampler,
-    supports_vlm_mtp_processing,
-)
-from .speculative.vlm_mtp import (
-    VLMMTPDrafter,
-    run_vlm_mtp_decode,
-    vlm_mtp_positioned_sampling_available,
-)
 from .utils.fatal import FATAL_TEARDOWN_TIMEOUT_S, fatal_exit
 from .utils.generation_config import load_generation_config_token_ids
 from .utils.hardware import format_bytes
@@ -81,6 +75,23 @@ from .utils.metal_sync import (
 from .utils.proc_memory import get_phys_footprint
 from .utils.sampling import make_sampler as omlx_make_sampler
 from .utils.tokenizer import create_streaming_detokenizer
+
+
+def _mx_pool_bytes() -> int:
+    """Current MLX buffer-cache pool size, 0 when unavailable.
+
+    The pool holds FREED wired buffers for reuse. Its growth inside a
+    chunk window is refill, not per-token chunk cost: a capped pool
+    cycling at its limit makes every window measure several GB of
+    pool refill that the per-token normalization then extrapolates
+    into a fake multi-GB admission charge (measured at 260K context:
+    7.5GB windows on 288-token chunks, 26MB/token, chunks collapsed
+    to the floor). The transient sampler subtracts pool growth so
+    those windows record only the genuine chunk allocation."""
+    try:
+        return int(mx.get_cache_memory())
+    except Exception:
+        return 0
 
 
 def _compact_boundary_snapshot_value(
@@ -135,10 +146,6 @@ def _make_suppress_logits_processor(
     def _suppress_logits(tokens: Any, logits: Any) -> Any:
         return _apply_suppress_token_ids(logits, suppress_tuple)
 
-    # Marker for _route_to_vlm_mtp: this model-level processor is the one
-    # kind the vlm_mtp path reproduces on its own (folded into the sampler
-    # via _make_suppressing_sampler), so it must not block routing.
-    _suppress_logits._omlx_suppress_processor = True  # type: ignore[attr-defined]
 
     return _suppress_logits
 
@@ -191,44 +198,6 @@ class _AdmissionEstimate:
     estimated: int
 
 
-@dataclass
-class _VLMMTPDecodeState:
-    """Per-request state for vlm_mtp decode that bypasses BatchGenerator.
-
-    The wrapper generator yields plain Python ints (single-request mode).
-    Scheduler iterates it one token per ``step()`` and feeds each token
-    into ``_process_batch_responses`` via a synthesized ``_VLMMTPResponse``.
-    """
-
-    generator: Any  # Generator[int, None, None] from run_vlm_mtp_decode
-    request: Request
-    prompt_cache: list[Any]
-    sampler: Callable[[Any], Any]
-    state_machine: Any
-    max_tokens: int
-    # Plain stop-token set (EOS + request-specific) for direct membership
-    # check; mlx-lm's SequenceStateMachine doesn't expose a "did the last
-    # token finish" helper, so we keep a copy.
-    stop_token_ids: set[int] = field(default_factory=set)
-    emitted: int = 0
-    finished: bool = False
-
-
-@dataclass
-class _VLMMTPResponse:
-    """BatchGenerator.Response shim emitted by the vlm_mtp decode loop.
-
-    Same field surface used by ``_process_batch_responses``: ``uid``,
-    ``token``, ``finish_reason``, ``logprobs``, and an optional
-    ``prompt_cache`` returned on the terminal yield so paged-cache reuse
-    keeps working.
-    """
-
-    uid: int
-    token: int
-    finish_reason: Optional[str] = None
-    logprobs: Any = None
-    prompt_cache: Any = None
 
 
 @dataclass
@@ -358,8 +327,6 @@ try:
         MemoryMonitor,
         collect_kv_layer_specs,
         estimate_mla_kv_bytes_per_token,
-        estimate_qwen4_exp_kv_bytes_per_token,
-        make_prefill_memory_profile,
     )
 
     HAS_TIERED_CACHE = True
@@ -369,8 +336,6 @@ except ImportError:
     MemoryMonitor = None
     collect_kv_layer_specs = None
     estimate_mla_kv_bytes_per_token = None
-    estimate_qwen4_exp_kv_bytes_per_token = None
-    make_prefill_memory_profile = None
     HAS_TIERED_CACHE = False
 
 # Import cache type handlers for hybrid cache support
@@ -808,21 +773,6 @@ def _patched_generation_batch_filter(self, keep):
 GenerationBatch.filter = _patched_generation_batch_filter
 
 
-_TQ_SINGLETON_CACHE_TYPE: type[Any] | None = None
-
-# Monkey-patch TurboQuantKVCache.merge so _merge_caches() works
-try:
-    from mlx_vlm.turboquant import TurboQuantKVCache as _TQCache
-
-    from .turboquant_kv import BatchTurboQuantKVCache as _BTQCache
-
-    _TQ_SINGLETON_CACHE_TYPE = _TQCache
-    if not hasattr(_TQCache, "merge"):
-        _TQCache.merge = _BTQCache.merge
-except ImportError:
-    pass
-
-
 # Regular singleton KV caches are already the fastest decode representation.
 # mlx-lm's default _merge_caches([cache]) turns them into BatchKVCache even
 # when there is only one active row, which slows text-only VLM decode. Install
@@ -879,27 +829,6 @@ def _regular_cache_extend_singleton(self, other):
     )
 
 
-def _turboquant_filter_singleton(self, batch_indices):
-    n = _batch_indices_len(batch_indices)
-    if n == 0:
-        self.keys = None
-        self.values = None
-        self.offset = 0
-        self._cached_state = None
-        self._cached_state_offset = -1
-        if hasattr(self, "_shadow_keys"):
-            self._shadow_keys = None
-        if hasattr(self, "_shadow_values"):
-            self._shadow_values = None
-        return
-    if n == 1:
-        return
-    raise NotImplementedError(
-        f"{type(self).__name__}.filter only supports singleton pass-through; "
-        "convert to a batched cache before keeping multiple rows."
-    )
-
-
 if not hasattr(_MLXKVCache, "filter"):
     _MLXKVCache.filter = _regular_kv_filter_singleton
 if not hasattr(_MLXKVCache, "extract"):
@@ -913,14 +842,6 @@ if not hasattr(_MLXRotatingKVCache, "extract"):
     _MLXRotatingKVCache.extract = _regular_cache_extract_singleton
 if not hasattr(_MLXRotatingKVCache, "extend"):
     _MLXRotatingKVCache.extend = _regular_cache_extend_singleton
-
-if _TQ_SINGLETON_CACHE_TYPE is not None:
-    if not hasattr(_TQ_SINGLETON_CACHE_TYPE, "filter"):
-        _TQ_SINGLETON_CACHE_TYPE.filter = _turboquant_filter_singleton
-    if not hasattr(_TQ_SINGLETON_CACHE_TYPE, "extract"):
-        _TQ_SINGLETON_CACHE_TYPE.extract = _regular_cache_extract_singleton
-    if not hasattr(_TQ_SINGLETON_CACHE_TYPE, "extend"):
-        _TQ_SINGLETON_CACHE_TYPE.extend = _regular_cache_extend_singleton
 
 _mlx_lm_generate_module = importlib.import_module("mlx_lm.generate")
 _original_make_cache = _mlx_lm_generate_module._make_cache
@@ -987,15 +908,10 @@ def _to_batched_cache_layer(cache_obj: Any) -> Any:
         return type(cache_obj)(*converted)
     if isinstance(cache_obj, _REGULAR_SINGLETON_CACHE_TYPES):
         return cache_obj.merge([cache_obj])
-    if (
-        _TQ_SINGLETON_CACHE_TYPE is not None
-        and type(cache_obj) is _TQ_SINGLETON_CACHE_TYPE
-    ):
-        return cache_obj.merge([cache_obj])
-    # Model-owned singletons (e.g. qwen4_exp QSAKVCache) declare their batch
-    # conversion via to_batch, which _patched_make_cache honors at creation;
-    # honor it on the continuous-batching join path too, or extend() hits a
-    # singleton without the method. A warm singleton is one unpadded row.
+    # Model-owned singletons may declare their batch conversion via
+    # to_batch, which _patched_make_cache honors at creation; honor it on
+    # the continuous-batching join path too, or extend() hits a singleton
+    # without the method. A warm singleton is one unpadded row.
     to_batch = getattr(cache_obj, "to_batch", None)
     if callable(to_batch):
         return to_batch([0])
@@ -1059,10 +975,6 @@ def _patched_ppb_split(self, indices):
         new_batch.logits_processors = lps
         new_batch.state_machines = self.state_machines
         new_batch.max_tokens = self.max_tokens
-        if hasattr(self, "_omlx_glm_dsa_adaptive_prefill"):
-            new_batch._omlx_glm_dsa_adaptive_prefill = (
-                self._omlx_glm_dsa_adaptive_prefill
-            )
 
         self.uids = []
         self.prompt_cache = []
@@ -1081,109 +993,6 @@ _mlx_lm_generate_module._extend_cache = _patched_extend_cache
 PromptProcessingBatch.split = _patched_ppb_split
 
 
-# Monkey-patch ChunkedKVCache for Llama-4 (Scout / Maverick): mlx_lm's
-# ChunkedKVCache lacks the batch-aware methods (`merge`, `filter`, `extract`,
-# `size`, `extend`) that BatchGenerator's continuous-batching code path
-# expects, so any chat completion targeting a Llama-4 model raises
-# `Cache corruption not recoverable: <ChunkedKVCache> does not yet support
-# batching with history` and returns 500.
-#
-# Real continuous batching with chunked attention is unimplemented upstream;
-# this patch installs batch=1 pass-throughs so serialized requests work.
-# Run the server with `--max-concurrent-requests 1` to honor the assumption.
-try:
-    from mlx_lm.models.cache import ChunkedKVCache as _CKVCache
-
-    _ckvcache_methods_skipped: list[str] = []
-
-    if not hasattr(_CKVCache, "merge"):
-
-        @classmethod
-        def _ckvcache_merge_passthrough(cls, caches):
-            if len(caches) == 1:
-                return caches[0]
-            raise NotImplementedError(
-                "ChunkedKVCache.merge for batch_size > 1 is not implemented. "
-                "Run with --max-concurrent-requests 1 when serving Llama-4."
-            )
-
-        _CKVCache.merge = _ckvcache_merge_passthrough
-    else:
-        _ckvcache_methods_skipped.append("merge")
-
-    if not hasattr(_CKVCache, "filter"):
-
-        def _ckvcache_filter_passthrough(self, batch_indices):
-            try:
-                n = len(batch_indices)
-            except TypeError:
-                n = int(getattr(batch_indices, "shape", (0,))[0] or 0)
-            if n == 0:
-                self.keys = None
-                self.values = None
-                self.offset = 0
-                self.start_position = 0
-                return
-            if n == 1:
-                return
-            raise NotImplementedError(
-                f"ChunkedKVCache.filter with batch_size={n} > 1 is not "
-                "implemented. Run with --max-concurrent-requests 1 when "
-                "serving Llama-4."
-            )
-
-        _CKVCache.filter = _ckvcache_filter_passthrough
-    else:
-        _ckvcache_methods_skipped.append("filter")
-
-    if not hasattr(_CKVCache, "extract"):
-
-        def _ckvcache_extract_passthrough(self, idx):
-            return self
-
-        _CKVCache.extract = _ckvcache_extract_passthrough
-    else:
-        _ckvcache_methods_skipped.append("extract")
-
-    if not hasattr(_CKVCache, "size"):
-
-        def _ckvcache_size(self):
-            return max(0, self.offset - self.start_position)
-
-        _CKVCache.size = _ckvcache_size
-    else:
-        _ckvcache_methods_skipped.append("size")
-
-    if not hasattr(_CKVCache, "extend"):
-
-        def _ckvcache_extend_passthrough(self, other):
-            if other is None or other.empty():
-                return
-            if self.empty():
-                self.keys = other.keys
-                self.values = other.values
-                self.offset = other.offset
-                self.start_position = other.start_position
-                return
-            raise NotImplementedError(
-                "ChunkedKVCache.extend across non-empty caches is not "
-                "supported. Run with --max-concurrent-requests 1."
-            )
-
-        _CKVCache.extend = _ckvcache_extend_passthrough
-    else:
-        _ckvcache_methods_skipped.append("extend")
-
-    if _ckvcache_methods_skipped:
-        # Upstream may have landed implementations between mlx_lm upgrades.
-        # Surface which ones so a regression in Llama-4 batching is visible
-        # to operators without diffing the patch against installed mlx_lm.
-        logger.info(
-            "ChunkedKVCache patch: methods already present upstream, " "skipped: %s",
-            ", ".join(_ckvcache_methods_skipped),
-        )
-except ImportError:
-    pass
 
 
 # ---------------------------------------------------------------------------
@@ -1219,41 +1028,13 @@ PromptProcessingBatch.prompt = _patched_ppb_prompt
 
 
 # Cache class names known to be sliceable (no boundary snapshots needed).
-# ChunkedKVCache is included once the batch=1 patch above installs its
-# extract/filter/size pass-throughs; without it Llama-4 requests fall
-# back to the snapshot path unnecessarily.
 _KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
     {
         "KVCache",
         "BatchKVCache",
         "QuantizedKVCache",
-        "TurboQuantKVCache",
-        "BatchTurboQuantKVCache",
-        "ChunkedKVCache",
-        "MiniMaxM3KVCache",
-        # Both QSA handlers support block slicing, so their growing KV and
-        # index state must not be copied into every boundary snapshot.
-        "QSAKVCache",
-        "QSAQuantizedKVCache",
     }
 )
-
-
-_TURBOQUANT_KV_CACHE_TYPES = frozenset(
-    {
-        "TurboQuantKVCache",
-        "BatchTurboQuantKVCache",
-    }
-)
-
-
-def _is_turboquant_kv_cache(cache_obj: Any) -> bool:
-    return type(cache_obj).__name__ in _TURBOQUANT_KV_CACHE_TYPES
-
-
-def _is_turboquant_kv_family_cache(cache_obj: Any) -> bool:
-    """Cache layer counted by TurboQuant's skip-last full-attention rule."""
-    return isinstance(cache_obj, _MLXKVCache) or _is_turboquant_kv_cache(cache_obj)
 
 
 class _BoundaryStoreUnavailable(Exception):
@@ -1468,10 +1249,8 @@ _CONTENDED_PREFILL_CHUNK = int(
     os.environ.get("OMLX_CONTENDED_PREFILL_CHUNK", "512")
 )
 _CONTENDED_CHUNK_FLOOR = 256  # below this, per-chunk overheads dominate
-# Contended chunks stay on the 64-token grid: the DSv4 native indexer only
-# engages when the chunk length is a multiple of 64 (deepseek_v4_model.py
-# L % 64 gate), and an arbitrary tps-derived cap (e.g. 297) would silently
-# route every contended chunk onto the ~4x-slower MLX fallback.
+# Contended chunks stay on the 64-token grid so an arbitrary tps-derived
+# cap never lands off the kernel's preferred alignment.
 _CONTENDED_CHUNK_GRID = 64
 _DECODE_ACTIVITY_TTL_S = 2.5
 
@@ -1485,30 +1264,6 @@ def _chunk_snap_enabled() -> bool:
     """OMLX_CHUNK_SNAP=0 disables chunk quantization (A/B measurement)."""
     return os.environ.get("OMLX_CHUNK_SNAP", "1") != "0"
 
-
-def _model_declares_llama4(model: Any) -> bool:
-    """Return True if the loaded model/config tree declares Llama 4."""
-    seen: set[int] = set()
-    stack = [model]
-    while stack:
-        obj = stack.pop()
-        if obj is None:
-            continue
-        obj_id = id(obj)
-        if obj_id in seen:
-            continue
-        seen.add(obj_id)
-
-        if _get_attr_or_key(obj, "model_type") == "llama4":
-            return True
-
-        for attr in ("config", "args", "text_config", "language_config", "llm_config"):
-            child = _get_attr_or_key(obj, attr)
-            if child is not None and not isinstance(
-                child, (str, bytes, int, float, bool)
-            ):
-                stack.append(child)
-    return False
 
 
 class SchedulingPolicy(Enum):
@@ -1756,22 +1511,15 @@ class Scheduler:
         self.tokenizer = copy.deepcopy(tokenizer)
         self.config = copy.copy(config) if config else SchedulerConfig()
         self._stream = stream if stream is not None else _default_generation_stream
-        self._serialize_llama4_requests = _model_declares_llama4(model)
-        if self._serialize_llama4_requests and self.config.max_num_seqs > 1:
-            logger.info(
-                "Llama 4 detected; serializing requests because ChunkedKVCache "
-                "does not support multi-row batching yet"
-            )
 
         # Load additional EOS tokens from generation_config.json.
-        # Some models (e.g. GLM-4.6V) define multiple EOS tokens there
         # that are not in tokenizer.eos_token_id.
         self._generation_config_eos: set[int] | None = (
             self._load_generation_config_eos()
         )
 
         # Load generation_config.suppress_tokens once and apply them on every
-        # sampling path. Gemma 4 uses this to suppress multimodal close markers.
+        # sampling path.
         self._model_suppress_tokens: set[int] = self._load_model_suppress_tokens()
 
         # Compute model-specific prefill geometry before aligning paged-cache
@@ -1787,54 +1535,8 @@ class Scheduler:
         # size to reduce boundary snapshot overhead during prefill.
         self._enlarge_block_size_for_arrays_cache()
 
-        # TurboQuant KV cache (set by engine if model_settings has it enabled)
-        self._turboquant_kv_bits: float | None = None
-        self._turboquant_skip_last: bool = True
         # Memoized MLA-architecture detection (see _model_uses_mla / #1613).
         self._mla_model: bool | None = None
-        self._glm_dsa_adaptive_prefill = None
-        try:
-            from .patches.glm_moe_dsa.generate_patch import (
-                _glm_dsa_adaptive_prefill_config,
-            )
-
-            self._glm_dsa_adaptive_prefill = _glm_dsa_adaptive_prefill_config(
-                model, self.config.prefill_step_size
-            )
-        except Exception:
-            logger.debug("GLM DSA adaptive prefill config unavailable", exc_info=True)
-        if self._glm_dsa_adaptive_prefill is not None:
-            logger.info(
-                "GLM DSA adaptive scheduler prefill enabled: step=%d after=%d "
-                "min_remaining=%d",
-                self._glm_dsa_adaptive_prefill.step_size,
-                self._glm_dsa_adaptive_prefill.after,
-                self._glm_dsa_adaptive_prefill.min_remaining,
-            )
-        self._minimax_m3_adaptive_prefill = None
-        try:
-            from .patches.minimax_m3.generate_patch import (
-                _minimax_m3_adaptive_prefill_config,
-            )
-
-            self._minimax_m3_adaptive_prefill = _minimax_m3_adaptive_prefill_config(
-                model,
-                self.config.prefill_step_size,
-                getattr(self.config, "model_name", None),
-            )
-        except Exception:
-            logger.debug(
-                "MiniMax M3 adaptive prefill config unavailable", exc_info=True
-            )
-        if self._minimax_m3_adaptive_prefill is not None:
-            logger.info(
-                "MiniMax M3 adaptive scheduler prefill enabled: step=%d after=%d "
-                "min_remaining=%d",
-                self._minimax_m3_adaptive_prefill.step_size,
-                self._minimax_m3_adaptive_prefill.after,
-                self._minimax_m3_adaptive_prefill.min_remaining,
-            )
-
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
         self.running: dict[str, Request] = {}  # Running requests by ID
@@ -1978,6 +1680,17 @@ class Scheduler:
         self._prefill_transient_tracker = PrefillTransientTracker(
             model_id=_tracker_model_id
         )
+        # Footprint at the end of the last measured chunk window. Releases
+        # that happen BETWEEN windows (enforcer soft-pressure reclaim, async
+        # SSD writeback, inter-chunk _consume_pressure_clear pool drains)
+        # are invisible to the per-window delta: the next window then
+        # measures the pool REFILL as a huge positive "chunk transient".
+        # Feeding the inter-window drop into the reclaim ledger lets the
+        # existing pool-reallocation filter skip that refill sample
+        # (measured: a ~13GB enforcer release made the next 2048-token
+        # chunk measure 12.4GB/6220KB-per-token, poisoning the admission
+        # re-preflight into rejecting a request that actually fit).
+        self._throttle_last_post_bytes: int = 0
         # One-shot probe of the GDN/Mamba fixed recurrent-state footprint,
         # armed by _set_model_info_for_monitor when ArraysCache layers exist
         # and taken after the first prefill chunk's eval.
@@ -1988,13 +1701,7 @@ class Scheduler:
         # unfused fallback would not fit (issue #2204). Weakly held; harmless
         # when the patch is never applied.
         set_unfused_headroom_provider(self._sdpa256_unfused_headroom)
-
-        # SpecPrefill: draft model for attention-based sparse prefill
-        self._specprefill_draft_model: Any | None = None
-        self._draft_paged_ssd_cache_manager: Any | None = None
-        self._draft_prefix_cache: Any | None = None
-        # Track active specprefill request for RoPE cleanup
-        self._specprefill_active_request_id: str | None = None
+        set_physical_headroom_provider(self._sdpa256_physical_headroom)
 
         # DEBUG-only prefix-cache divergence probe (issue #1003): recent
         # stored cache sequences, so a miss can be traced to the exact
@@ -2011,13 +1718,8 @@ class Scheduler:
         # is exhausted long before any byte limit — the
         # "[metal::malloc] Resource limit (499000) exceeded" failure (#3226).
         # Periodic materialization collapses the chain; enable it for every
-        # ArraysCache hybrid, not just MiniMax.
-        model_name_lower = (self.config.model_name or "").lower()
-        default_kv_eval_interval = (
-            256
-            if "minimax" in model_name_lower or self._model_has_arrays_cache()
-            else 0
-        )
+        # ArraysCache hybrid.
+        default_kv_eval_interval = 256 if self._model_has_arrays_cache() else 0
         self._decode_eval_kv_cache_interval: int = max(
             0,
             _env_int(
@@ -2032,17 +1734,6 @@ class Scheduler:
                 self._decode_eval_kv_cache_interval,
             )
 
-        # VLM MTP: gemma4_assistant drafter attached by VLMBatchedEngine.
-        # When set, eligible requests bypass mlx-lm BatchGenerator for decode
-        # and run through mlx-vlm's _mtp_rounds round loop instead.
-        self._vlm_mtp_drafter: VLMMTPDrafter | None = None
-        # Active vlm_mtp decode generators keyed by synthesized negative uid
-        # (negative to make collision with BatchGenerator uids impossible).
-        self._vlm_mtp_active: dict[int, _VLMMTPDecodeState] = {}
-        self._vlm_mtp_next_uid: int = -1
-        # Per-request settings snapshot for vlm_mtp routing (block size etc.).
-        # Injected by VLMBatchedEngine.set_vlm_mtp_drafter alongside the drafter.
-        self._vlm_mtp_draft_block_size: int | None = None
 
         # Phase timing instrumentation for cache-on overhead diagnostics.
         # Accumulated wall-time per phase + invocation count, dumped at request
@@ -2353,7 +2044,8 @@ class Scheduler:
 
         Walks the per-layer dict format produced by _extract_cache_states:
         each layer is {state, meta_state, class_name, cache_type}, where
-        state is a tuple of mx.arrays (or nested for CacheList / TurboQuant).
+        state is a tuple of mx.arrays (or nested for CacheList / NamedTuple-state
+        caches).
         """
         arrays: list[Any] = []
         for layer in extracted_cache or []:
@@ -2373,7 +2065,7 @@ class Scheduler:
                         if isinstance(sub, mx.array):
                             arrays.append(sub)
                         elif hasattr(sub, "_fields"):
-                            # NamedTuple state (TurboQuant). Walk fields.
+                            # NamedTuple state. Walk fields.
                             for fname in sub._fields:
                                 val = getattr(sub, fname, None)
                                 if isinstance(val, mx.array):
@@ -2731,15 +2423,7 @@ class Scheduler:
                     getattr(getattr(self.model, "config", None), "model_type", "") or ""
                 )
             is_qwen35 = model_type.startswith("qwen3_5")
-            is_qwen4 = model_type.startswith("qwen4_exp")
-            if is_qwen4:
-                from .custom_kernels.glm_moe_dsa import fast
-
-                if not fast.is_native_available() or not fast.has_symbol(
-                    "qwen4_qsa_sparse_gqa_attention"
-                ):
-                    return 0
-            if is_qwen35 or is_qwen4:
+            if is_qwen35:
                 from .custom_kernels.nax import is_nax_available
                 from .settings import get_system_memory
 
@@ -3118,286 +2802,6 @@ class Scheduler:
     # External prefill (composition pattern — replaces _process_prompts)
     # ------------------------------------------------------------------
 
-    def _model_uses_mla(self) -> bool:
-        """Detect Multi-head Latent Attention models (DeepSeek-V2/V3/V4,
-        GLM-4-MoE / GLM-4.7-Flash, Kimi-K2, ...).
-
-        MLA compresses K/V into a low-rank latent plus a separate rope key and
-        reads the *fetched* cache tensors directly — e.g.
-        ``kv_latent, k_pe = cache.update_and_fetch(...)`` then
-        ``k_pe.swapaxes(-1, -2)`` (mlx_lm/models/glm4_moe_lite.py). TurboQuant
-        replaces the cache state with quantized NamedTuples that have no array
-        methods, so that ``.swapaxes`` raises ``AttributeError`` (#1613). MLA
-        also stores keys/values with mismatched head dims, which the codec does
-        not support. Such models stay fp16 — no crash, no TurboQuant.
-
-        Result is memoized: the model never changes for a scheduler instance.
-        """
-        cached = getattr(self, "_mla_model", None)
-        if cached is not None:
-            return cached
-
-        detected = False
-        model = getattr(self, "model", None)
-
-        # kv_lora_rank is the defining MLA hyperparameter and is an int on real
-        # models. It may sit on the top-level config or be nested under a
-        # text/LM sub-config (VLM MLA, e.g. kimi_vl -> text_config). The
-        # isinstance(int) check guards against mocks where it is a sentinel.
-        def _cfg_has_kv_lora(cfg: Any, depth: int = 0) -> bool:
-            if cfg is None or depth > 3:
-                return False
-            if isinstance(getattr(cfg, "kv_lora_rank", None), int):
-                return True
-            return any(
-                _cfg_has_kv_lora(getattr(cfg, sub, None), depth + 1)
-                for sub in (
-                    "text_config",
-                    "llm_config",
-                    "language_config",
-                    "thinker_config",
-                )
-            )
-
-        # Config signal. For VLMs the scheduler sees VLMModelAdapter, whose
-        # .args delegates to the language model; also probe (_)language_model.
-        for holder in (
-            model,
-            getattr(model, "_language_model", None),
-            getattr(model, "language_model", None),
-        ):
-            if holder is None:
-                continue
-            if _cfg_has_kv_lora(getattr(holder, "args", None)) or _cfg_has_kv_lora(
-                getattr(holder, "config", None)
-            ):
-                detected = True
-                break
-
-        # Architecture signal: an attention submodule carrying the MLA
-        # down-projection, latent layernorm, or latent rank. Covers models
-        # whose config does not surface kv_lora_rank where the scheduler can
-        # see it (e.g. a directly-loaded VLM with a nested text config).
-        if not detected and model is not None and hasattr(model, "modules"):
-            try:
-                for m in model.modules():
-                    if (
-                        hasattr(m, "kv_a_proj_with_mqa")
-                        or hasattr(m, "kv_a_layernorm")
-                        or isinstance(getattr(m, "kv_lora_rank", None), int)
-                    ):
-                        detected = True
-                        break
-            except Exception:
-                pass
-
-        if detected:
-            logger.info(
-                "TurboQuant disabled: model uses Multi-head Latent Attention "
-                "(MLA), which is incompatible with quantized KV cache states; "
-                "keeping fp16 KV cache (#1613)."
-            )
-        self._mla_model = detected
-        return detected
-
-    def _model_uses_attention_sinks(self) -> bool:
-        """Detect models whose attention path passes sink logits to SDPA.
-
-        TurboQuant's quantized attention kernels currently do not implement the
-        sink term used by attention-sink models. Ignoring it silently changes
-        the model's attention distribution, so these models must keep fp16 KV
-        unless the attention patch falls back to dequantized sink-aware SDPA.
-        """
-        cached = getattr(self, "_attention_sink_model", None)
-        if cached is not None:
-            return cached
-
-        detected = False
-        model = getattr(self, "model", None)
-
-        def _has_real_sink_attr(obj: Any) -> bool:
-            for name in ("sinks", "attention_sink_bias", "attn_sink"):
-                value = None
-                if isinstance(obj, dict):
-                    value = obj.get(name)
-                if value is None:
-                    data = getattr(obj, "__dict__", {})
-                    if isinstance(data, dict):
-                        value = data.get(name)
-                if isinstance(value, mx.array):
-                    return True
-                if value is not None and isinstance(value, (int, float, list, tuple)):
-                    return True
-            return False
-
-        try:
-            modules = getattr(model, "modules", None)
-        except Exception:
-            modules = None
-        if type(modules).__module__.startswith("unittest.mock"):
-            modules = None
-        if not detected and callable(modules):
-            try:
-                for m in modules():
-                    if _has_real_sink_attr(m):
-                        detected = True
-                        break
-            except Exception:
-                pass
-
-        if detected:
-            logger.info(
-                "TurboQuant disabled: model uses attention sinks, which are "
-                "not supported by TurboQuant's quantized attention kernels; "
-                "keeping fp16 KV cache."
-            )
-        self._attention_sink_model = detected
-        return detected
-
-    def _turboquant_eligible(self, prompt_cache: list[Any]) -> bool:
-        """True if this cache layout can safely mix TQ and pass-through caches.
-
-        Plain KVCache layers are TurboQuant-convertible. State-array caches and
-        rotating/sliding-window caches are pass-through: they stay in their
-        native form while adjacent full-attention KVCache layers are converted.
-
-        MLA models (DeepSeek / GLM-4.7-Flash) and attention-sink models are
-        excluded because their attention paths need semantics TurboQuant's
-        quantized cache states/kernels do not currently provide.
-        """
-        from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
-
-        if self._model_uses_mla():
-            return False
-        if self._model_uses_attention_sinks():
-            return False
-
-        def _ok(c: Any) -> bool:
-            if isinstance(c, KVCache):
-                return True
-            if isinstance(c, ArraysCache):
-                return True
-            class_name = type(c).__name__
-            if class_name in (
-                "SizedArraysCache",
-                "RotatingKVCache",
-                "BatchRotatingKVCache",
-                "PrefillReadyRotatingKVCache",
-                "BufferedRotatingKVCache",
-                "TurboQuantKVCache",
-                "BatchTurboQuantKVCache",
-            ):
-                return True
-            if class_name in ("MiniMaxM3KVCache", "MiniMaxM3BatchKVCache"):
-                return False
-            if isinstance(c, CacheList):
-                # A KVCache member inside a CacheList converts fine at
-                # runtime, but the prefix/SSD store paths dispatch on the
-                # layer class ("CacheList") and have no TurboQuant
-                # sub-state serialization: the converted member's
-                # NamedTuple state is flattened to an anonymous tuple on
-                # store and rebuilt as a corrupt dense cache on restore.
-                # Until CacheList-level TQ serialization exists, exclude
-                # composite layers that contain a convertible KVCache
-                # (e.g. inkling's CacheList(KVCache, ArraysCache)).
-                if any(type(inner) is KVCache for inner in c.caches):
-                    if not getattr(self, "_tq_cachelist_guard_logged", False):
-                        self._tq_cachelist_guard_logged = True
-                        logger.info(
-                            "TurboQuant KV disabled: composite CacheList "
-                            "layers with KVCache members have no TQ "
-                            "store/restore path yet"
-                        )
-                    return False
-                return all(_ok(inner) for inner in c.caches)
-            return False
-
-        return bool(prompt_cache) and all(_ok(c) for c in prompt_cache)
-
-    def _apply_turboquant_kv_empty(self, prompt_cache: list[Any]) -> None:
-        """Replace empty KVCache layers with empty TurboQuantKVCache.
-
-        Tokens are quantized on the fly during update_and_fetch, avoiding
-        the peak memory spike from storing full-precision KV then converting.
-        Used only when there is no prefill history to preserve (the single
-        last token is quantized during insert()'s prompt step). Skips the
-        last KVCache layer if turboquant_skip_last is set.
-        """
-        from mlx_lm.models.cache import CacheList, KVCache
-        from mlx_vlm.turboquant import TurboQuantKVCache
-
-        kv_indices = [
-            i for i, c in enumerate(prompt_cache) if _is_turboquant_kv_family_cache(c)
-        ]
-        skip_last = self._turboquant_skip_last and len(kv_indices) > 1
-        last_kv_idx = kv_indices[-1] if skip_last else -1
-
-        converted = 0
-        bits = float(self._turboquant_kv_bits)
-        for i, cache_obj in enumerate(prompt_cache):
-            if isinstance(cache_obj, KVCache):
-                if i == last_kv_idx:
-                    continue
-                prompt_cache[i] = TurboQuantKVCache(bits=bits)
-                converted += 1
-            elif isinstance(cache_obj, CacheList):
-                new_caches = []
-                for c in cache_obj.caches:
-                    if isinstance(c, KVCache):
-                        new_caches.append(TurboQuantKVCache(bits=bits))
-                        converted += 1
-                    else:
-                        new_caches.append(c)
-                cache_obj.caches = tuple(new_caches)
-        if converted > 0:
-            skip_msg = ", skipped last KVCache layer" if skip_last else ""
-            logger.info(
-                f"TurboQuant: {converted}/{len(prompt_cache)} "
-                f"cache layers set to {bits}-bit{skip_msg}"
-            )
-
-    def _apply_turboquant_kv_convert(self, prompt_cache: list[Any]) -> None:
-        """Convert populated KVCache data to TurboQuantKVCache via from_cache().
-
-        Called AFTER fp16 prefill completes (or on an SSD-restored fp16
-        cache): the completed full-precision KV is quantized once, so prefill
-        hidden states stay exact and quantization error only enters at
-        decode-time reads. This is the key difference from #717/#771, which
-        quantized on the fly during prefill and corrupted hidden states.
-        """
-        from mlx_lm.models.cache import CacheList, KVCache
-        from mlx_vlm.turboquant import TurboQuantKVCache
-
-        kv_indices = [
-            i for i, c in enumerate(prompt_cache) if _is_turboquant_kv_family_cache(c)
-        ]
-        skip_last = self._turboquant_skip_last and len(kv_indices) > 1
-        last_kv_idx = kv_indices[-1] if skip_last else -1
-
-        converted = 0
-        bits = float(self._turboquant_kv_bits)
-        for i, cache_obj in enumerate(prompt_cache):
-            if isinstance(cache_obj, KVCache):
-                if i == last_kv_idx:
-                    continue
-                prompt_cache[i] = TurboQuantKVCache.from_cache(cache_obj, bits=bits)
-                converted += 1
-            elif isinstance(cache_obj, CacheList):
-                new_caches = []
-                for c in cache_obj.caches:
-                    if isinstance(c, KVCache):
-                        new_caches.append(TurboQuantKVCache.from_cache(c, bits=bits))
-                        converted += 1
-                    else:
-                        new_caches.append(c)
-                cache_obj.caches = tuple(new_caches)
-        if converted > 0:
-            skip_msg = ", skipped last KVCache layer" if skip_last else ""
-            logger.info(
-                f"TurboQuant: converted {converted}/{len(prompt_cache)} "
-                f"cache layers to {bits}-bit{skip_msg}"
-            )
-
     def _do_external_prefill(
         self,
         request: "Request",
@@ -3430,17 +2834,6 @@ class Scheduler:
         if n_tokens <= 1:
             # Nothing to prefill, return cache + tokens as-is.
             cache = existing_cache or make_prompt_cache(self.model)
-            # TurboQuant: a TQ cache here makes _merge_caches() build a
-            # BatchTurboQuantKVCache (via the monkey-patched merge), so the
-            # one decode token quantizes against TQ history. An empty fresh
-            # cache gets empty TQ layers; a restored cache preserves its data.
-            if self._turboquant_kv_bits is not None and self._turboquant_eligible(
-                cache
-            ):
-                if existing_cache is None:
-                    self._apply_turboquant_kv_empty(cache)
-                else:
-                    self._apply_turboquant_kv_convert(cache)
             return cache, tokens
 
         # Create or reuse cache
@@ -3448,12 +2841,6 @@ class Scheduler:
             prompt_cache = existing_cache
         else:
             prompt_cache = make_prompt_cache(self.model)
-
-        # Fresh TurboQuant requests run fp16 during the cold prefill loop and
-        # are quantized once at the end. Restored TurboQuant prefix caches stay
-        # quantized while pre-filling the uncached suffix, then keep using TQ for
-        # decode. Rotating/sliding-window layers remain native pass-through
-        # caches; only full-attention KVCache layers are converted.
 
         # Clear stale mRoPE position state for text-only requests.
         if vlm_embeds is None and hasattr(self.model, "clear_vlm_position_state"):
@@ -3490,6 +2877,38 @@ class Scheduler:
                     request.cached_tokens,
                 )
                 base_size = request.cached_tokens
+
+        # Restored-prefix KV refund filter: the SSD/paged lazy restore
+        # materializes the cached KV across the FIRST FEW chunk windows as
+        # ACTIVE memory (not pool), so each window's phys delta carries a
+        # multi-GB restore share that the per-token normalization turns
+        # into fake per-token cost (measured: 72MB/token samples shrank
+        # chunks 2048->320->64 and spiraled into a safety-cap pause). The
+        # reclaim ledger cannot price this: it clears on the first positive
+        # delta, and the restore spans several windows. This counter is
+        # decremented by each window's covered growth until exhausted, and
+        # is re-armed (or zeroed) at every prefill start — so it can never
+        # leak across requests. The restored KV itself is priced by the
+        # admission estimate's kv_exact term (cached_tokens), not by the
+        # transient tracker.
+        if (
+            base_size > 0
+            and self._prefill_transient_tracker is not None
+            and self.memory_monitor is not None
+        ):
+            restored_estimate = int(
+                self.memory_monitor.estimate_resident_kv_bytes(base_size)
+            )
+            if restored_estimate > 0:
+                self._restore_refill_pending_bytes = restored_estimate
+                logger.debug(
+                    "Restored-prefix KV %.2fGB (%d tokens) armed as a "
+                    "multi-window refill filter for the transient tracker",
+                    restored_estimate / 1024**3,
+                    base_size,
+                )
+        else:
+            self._restore_refill_pending_bytes = 0
 
         # Prepare VLM embeddings for prefill
         embeds_array: mx.array | None = None
@@ -3584,6 +3003,7 @@ class Scheduler:
                 request.benchmark_requested_steps.append(int(prefill_step_size))
 
             _throttle_pre = get_phys_footprint()
+            _throttle_pool_pre = _mx_pool_bytes()
             # External prefill bypasses BatchGenerator, so it must establish
             # the per-engine stream context itself. Native lazy primitives
             # otherwise bind to the worker's unrelated default stream and can
@@ -3626,6 +3046,7 @@ class Scheduler:
                 loop_label="external",
                 kv_len=base_size + processed_tokens,
                 requested_step=prefill_step_size,
+                pool_growth=_mx_pool_bytes() - _throttle_pool_pre,
             )
             self._maybe_record_fixed_state_bytes(prompt_cache)
             # Enforcer-requested hard-pressure drain. The flag's normal
@@ -3750,23 +3171,18 @@ class Scheduler:
 
             # Reclaim Metal intermediates between prefill chunks.
             _sync_and_clear_cache(self._stream)
+
+            # Reclaim Metal intermediates between prefill chunks.
+            _sync_and_clear_cache(self._stream)
+
             if getattr(request, "benchmark_trace", False):
                 _trace_total_ms = (
                     time.perf_counter() - _trace_chunk_start
                 ) * 1000.0
-                _ane_sequence = int(
-                    getattr(request, "benchmark_ane_sequence_length", 0) or 0
-                )
-                _ane_full_tiles, _ane_tail_tokens = (0, n_to_process)
-                if _ane_sequence > 0:
-                    _ane_full_tiles, _ane_tail_tokens = divmod(
-                        n_to_process, _ane_sequence
-                    )
                 logger.info(
                     "[benchmark-prefill] rid=%s path=external chunk_tokens=%d "
                     "processed=%d->%d kv_before=%d requested_step=%d "
-                    "boundary_enabled=%s cache_block_size=%d ane_tile=%d "
-                    "ane_full_tiles=%d ane_tail_tokens=%d model_cache_ms=%.3f "
+                    "boundary_enabled=%s cache_block_size=%d model_cache_ms=%.3f "
                     "total_ms=%.3f overhead_ms=%.3f",
                     request.request_id,
                     n_to_process,
@@ -3776,9 +3192,6 @@ class Scheduler:
                     prefill_step_size,
                     boundary_enabled,
                     block_size if boundary_enabled else 0,
-                    _ane_sequence,
-                    _ane_full_tiles,
-                    _ane_tail_tokens,
                     _trace_model_ms,
                     _trace_total_ms,
                     max(0.0, _trace_total_ms - _trace_model_ms),
@@ -3802,17 +3215,6 @@ class Scheduler:
         if vlm_embeds is not None and _saved_rope_deltas is not None:
             self.model._language_model._rope_deltas = _saved_rope_deltas
         request._prefill_saved_rope_deltas = None
-
-        # Quantize the completed fp16 KV cache to TurboQuant for decode.
-        # Done here (after the prefill loop, after boundary snapshots are
-        # captured fp16) so prefill hidden states stay exact and the paged-SSD
-        # format is unchanged. _merge_caches() then builds a
-        # BatchTurboQuantKVCache when this request is inserted. Gated to dense
-        # KVCache models — chunked/rotating caches stay fp16.
-        if self._turboquant_kv_bits is not None and self._turboquant_eligible(
-            prompt_cache
-        ):
-            self._apply_turboquant_kv_convert(prompt_cache)
 
         if getattr(request, "cached_tokens", 0) > 0:
             with mx.stream(self._stream):
@@ -3850,7 +3252,9 @@ class Scheduler:
     _MEMORY_ADMISSION_STALL_TIMEOUT_S: float = 60.0
     _STORE_CACHE_ADMISSION_STALL_TIMEOUT_S: float = 60.0
 
-    def _predicted_chunk_transient(self, n_tokens: int, kv_len: int) -> float:
+    def _predicted_chunk_transient(
+        self, n_tokens: int, kv_len: int, *, include_reclaim: bool = True
+    ) -> float:
         """Conservative predicted Metal peak growth for one prefill chunk.
 
         The per-chunk SDPA/MoE transient scales with ``query_len * kv_len``, so
@@ -3873,9 +3277,23 @@ class Scheduler:
         tracker = self._prefill_transient_tracker
         if tracker is not None:
             if tracker.last_n_tokens > 0 and tracker.last_delta_bytes > 0:
-                per_token = max(
-                    per_token, tracker.last_delta_bytes / tracker.last_n_tokens
-                )
+                last_rate = tracker.last_delta_bytes / tracker.last_n_tokens
+                # The raw last-delta anchor has no outlier protection (the
+                # tracker records it unfiltered by design), so one window
+                # that catches a pool refill after an out-of-band release
+                # flows straight into admission as a fake per-token cost
+                # (measured: 6220KB/token vs a 1420KB EWMA -> a 16.5GB
+                # predicted transient rejected a request that fit). Genuine
+                # per-token growth within a session stays well under 2x the
+                # EWMA (Qwen3.8-27B at 2048-token chunks: 1316->1596KB,
+                # 1.21x, over 190K tokens); cap the anchor there and let a
+                # real regime change arrive through the EWMA blend instead.
+                if (
+                    tracker.bytes_per_token > 0
+                    and last_rate > tracker.bytes_per_token * 2.0
+                ):
+                    last_rate = tracker.bytes_per_token * 2.0
+                per_token = max(per_token, last_rate)
             if tracker.bytes_per_token > 0:
                 per_token = max(per_token, tracker.bytes_per_token)
             recent_reclaim = tracker.recent_reclaim_bytes
@@ -3891,14 +3309,23 @@ class Scheduler:
             static_per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
             + recent_reclaim
         )
+        if not include_reclaim:
+            # Sizing rate (see _adaptive_chunk_size): the one-shot reclaim
+            # refill is an absolute add-on, not a per-token cost. Dividing
+            # it into a per-token rate collapses n_fit on small chunks
+            # (measured: a 5.1GB ledger over a 64-token chunk -> 81MB/token
+            # -> floor-size chunks -> safety-cap pause -> requeue spiral).
+            return base_prediction
         return max(base_prediction, reallocation_prediction)
 
-    def _admission_transient_bound(self, n_tokens: int, kv_len: int) -> float:
+    def _admission_transient_bound(
+        self, n_tokens: int, kv_len: int, *, include_reclaim: bool = True
+    ) -> float:
         """Transient charge for admission and the guard's pass/abort gates.
 
         The largest FLOOR-SIZE chunk transient observed this session is a
         floor no prediction should undercut: a throttled prefill cannot get
-        under it by shrinking (gemma-4 measured 786-1177MB at 32-token
+        under it by shrinking (measured 786-1177MB at 32-token
         chunks), so admitting below it converts a deterministic pre-abort
         into a probabilistic mid-prefill abort. Only floor-size samples
         feed the max — big-chunk transients differ by an order of magnitude
@@ -3909,11 +3336,25 @@ class Scheduler:
         predicted term, and the abort cap itself keeps a margin below the
         ceiling.
 
+        ``include_reclaim=False`` (front-door admission only) drops the
+        one-shot reclaim ledger: the ledger prices the pool REFILL the
+        next chunk performs after a mid-prefill reclaim, which is real for
+        the throttle/guard of a running prefill — but at request admission
+        the ledger is typically the previous request's TEARDOWN (snapshot
+        writeback, freed KV, cleared pool), which is released permanently
+        and never refilled by the new request's chunks. Charging it
+        rejected a fresh 240K after a completed 200K with a phantom
+        ~22GB "refill" (2026-08-28: warmup booked the 41→19GB teardown
+        into the ledger 4s before the 240K preflight; an engine reload
+        between runs dodged it by resetting the tracker).
+
         Never use this for chunk *sizing* — the throttle and the guard's
         shrink arithmetic stay on ``_predicted_chunk_transient``; a flat
         size-invariant bound would zero out their proportional response.
         """
-        bound = self._predicted_chunk_transient(n_tokens, kv_len)
+        bound = self._predicted_chunk_transient(
+            n_tokens, kv_len, include_reclaim=include_reclaim
+        )
         tracker = self._prefill_transient_tracker
         if tracker is not None:
             bound = max(bound, float(tracker.observed_max_bytes))
@@ -3989,12 +3430,28 @@ class Scheduler:
             target = min(target, abort_cap)
         return target - self._current_usage_bytes()
 
+    def _sdpa256_physical_headroom(self) -> int:
+        """Live headroom (bytes) under the EFFECTIVE physical limit for the
+        sdpa256 Q-tile sizer: the enforcer's admission limit (hard watermark
+        — where running requests get killed) minus current usage, NOT the
+        raw hard limit: the watermark is where the enforcer acts, and the
+        tile peak also carries the chunk's other activations on top. The
+        patch-side fraction/cap keeps the tile a minority share of this
+        headroom (anchoring to the raw limit at 0.80 was the 2026-08-28
+        262K regression: 3.5-5GB tiles cycled the capped pool against the
+        enforcer at 170K+, spiraling into requeue rejections). Same
+        thread-safety notes as _sdpa256_unfused_headroom."""
+        limit = self._admission_limit_bytes()
+        if limit <= 0:
+            return -1
+        return limit - self._current_usage_bytes()
+
     # Two pauses, not one: a marginal pooled-buffer reclaim can satisfy the
     # first pass's target check while buying only a couple of minutes of KV
-    # growth on a long prompt — and the durable rung behind it (shedding the
-    # requesting model's ANE prefill banks) is then unreachable when the
-    # pressure returns, because the request has spent its only retry. The
-    # second pause is bounded the same way the first is: every rung in
+    # growth on a long prompt — and a second pause gives the ladder another
+    # chance to find headroom when the pressure returns, instead of the
+    # request throttling for the rest of the prefill after a single retry.
+    # The second pause is bounded the same way the first is: every rung in
     # EnginePool's ladder is attempt-once per call, idle victims are
     # naturally exhausted, and a pass with nothing left to give costs one
     # ~100ms pause before the guard falls back to throttling as before.
@@ -4076,7 +3533,16 @@ class Scheduler:
         else:
             min_chunk = max(1, self._prefill_min_chunk_tokens)
         current = self._current_usage_bytes()
-        if current + self._admission_transient_bound(n_tokens, kv_len) <= cap:
+        # Same recyclable-pool netting as _adaptive_chunk_size: a chunk that
+        # fits by recycling pooled buffers must pass here too, else the guard
+        # reclaims (clears) the pool on EVERY chunk near the ceiling — the
+        # churn that defeats the pool's purpose. The reclaim/abort ladder
+        # below still runs on the raw post-reclaim footprint.
+        if (
+            max(0, current - _mx_pool_bytes())
+            + self._admission_transient_bound(n_tokens, kv_len)
+            <= cap
+        ):
             return n_tokens
 
         # Predicted to breach — reclaim transients and re-measure once.
@@ -4117,19 +3583,13 @@ class Scheduler:
             observed_max = (
                 float(tracker.observed_max_bytes) if tracker is not None else 0.0
             )
-            ane_reservation = (
-                float(getattr(self.memory_monitor, "_ane_prefill_transient_bytes", 0))
-                if self.memory_monitor is not None
-                else 0.0
-            )
             logger.warning(
                 "[guard:%s] admission terms: current=%.2fGB predicted_transient=%.2fGB "
-                "observed_max_bytes=%.2fGB ane_prefill_transient_bytes=%.2fGB",
+                "observed_max_bytes=%.2fGB",
                 loop_label,
                 current / 1024**3,
                 min_transient / 1024**3,
                 observed_max / 1024**3,
-                ane_reservation / 1024**3,
             )
             binding_str, advice = describe_ceiling_binding(
                 static=self._memory_static_ceiling_bytes,
@@ -4195,7 +3655,7 @@ class Scheduler:
         happened to land, so the pool filled with buffers 1-3% off from each
         other and none could serve the next request.
 
-        Traced over one 20k gemma-4 prefill: of 10,143 requests for the
+        Traced over one 20k-token prefill: of 10,143 requests for the
         chunk-32 buffer, 5,329 missed, and the pool's nearest candidate was
         only 0.9-3% larger in most of them — buffers left by neighbouring
         chunk sizes. Quantizing collapses those onto one size per multiple.
@@ -4267,13 +3727,40 @@ class Scheduler:
             return requested
 
         current = self._current_usage_bytes()
+        # The MLX buffer pool holds FREED buffers the next chunk recycles
+        # (see _mx_pool_bytes). Charging the chunk transient on top of a
+        # pool-inclusive footprint double-counts it: near the top of a
+        # 262K context the resident KV + weights legitimately sit ~1GB
+        # over the sizing target while ~6GB of pool remains, and the
+        # throttle floored every chunk at 32 tokens for the last ~30K
+        # tokens (server log 2026-08-28: current 42.7-45GB vs target
+        # 42.75GB, n_fit=0) even though full 2048 chunks kept fitting
+        # physically by recycling the pool. Size against the pool-net
+        # current; the physical safety net is unchanged — the guard's
+        # abort gate, the chunk-end memcheck, and the enforcer all still
+        # see the raw footprint.
+        pool_bytes = _mx_pool_bytes()
+        sizing_current = max(0, current - pool_bytes)
         min_chunk = max(1, self._prefill_min_chunk_tokens)
 
         # Conservative per-token peak growth (measured-last / EWMA / static, ×
         # safety) — see _predicted_chunk_transient. Anchored on the most recent
         # measurement so it tracks growth with kv_len instead of lagging behind
-        # a long-run average.
-        per_token = self._predicted_chunk_transient(requested, kv_len) / requested
+        # a long-run average. The one-shot reclaim refill is EXCLUDED from
+        # this rate: it is priced below as an absolute headroom deduction,
+        # not divided into a per-token cost (a 5GB ledger over a small
+        # chunk otherwise becomes an 80MB/token "rate" and collapses the
+        # chunk to the floor — the 2026-08-28 262K regression).
+        per_token = (
+            self._predicted_chunk_transient(
+                requested, kv_len, include_reclaim=False
+            )
+            / requested
+        )
+        tracker = self._prefill_transient_tracker
+        one_shot_refill = (
+            tracker.recent_reclaim_bytes if tracker is not None else 0
+        )
         predictor = "measured" if per_token > 0 else "none"
 
         # Keep each chunk's predicted peak under the LOWER of the dynamic
@@ -4290,7 +3777,7 @@ class Scheduler:
         if per_token <= 0:
             # No usable predictor (e.g. model info unavailable). Fall back to
             # the legacy watermark gate so we never run unbounded.
-            if current < soft_watermark:
+            if sizing_current < soft_watermark:
                 return requested
             if self._prefill_speed_priority:
                 return requested
@@ -4302,11 +3789,19 @@ class Scheduler:
             # a single big chunk's transient can blow the cap from a low
             # baseline (MoE prefill at tens of MB/token), the failure this
             # prevents.
-            if current + per_token * requested <= target:
+            if sizing_current + one_shot_refill + per_token * requested <= target:
                 return requested
-            maybe_raise_eviction = getattr(
-                self, "_raise_prefill_eviction_if_available", None
-            )
+            # Escalation to pause/eviction is deliberately NOT taken here.
+            # The pre-chunk guard (_guard_prefill_chunk) still escalates at
+            # the physical safety cap, and this sizing path shrinks the
+            # chunk to the remaining headroom instead. Historically this
+            # site paused mid-prefill to run the eviction ladder, whose
+            # pooled-buffer reclaim refills on the next chunk — and the
+            # requeue resumed from an early boundary, re-prefilling tens of
+            # thousands of tokens in a loop (three restarts measured on one
+            # 131k request; a 262k request looped at the same watermark).
+            # A slower, shrunk chunk is strictly better than a restart.
+            maybe_raise_eviction = None
             if callable(maybe_raise_eviction):
                 maybe_raise_eviction(
                     request_id=request_id,
@@ -4322,7 +3817,7 @@ class Scheduler:
                 # pre-chunk guard and the post-chunk memory check abort
                 # cleanly instead of crawling at floor-size chunks.
                 return requested
-            headroom = max(target - current, 0)
+            headroom = max(target - sizing_current - one_shot_refill, 0)
             n_fit = int(headroom / per_token)
 
         n = max(min_chunk, min(requested, n_fit))
@@ -4332,14 +3827,16 @@ class Scheduler:
         # in deep pressure. Skipped below the watermark so a low-baseline chunk
         # with ample headroom isn't needlessly shrunk. Descending through the
         # tiers instead of dropping to the floor once the target is crossed was
-        # measured and rejected: gemma-4 at a 31.56GB ceiling aborted at both
+        # measured and rejected: at a 31.56GB ceiling a model aborted at both
         # 60k and 70k tokens, because the chunks spent at 512/256/128 while
         # already over the target pushed usage past the abort watermark before
         # the ladder reached the floor.
         band_ratio = -1.0
-        if current >= soft_watermark and hard_cap > soft_watermark:
+        if sizing_current >= soft_watermark and hard_cap > soft_watermark:
             band = hard_cap - soft_watermark
-            band_ratio = max(0.0, min(1.0, (current - soft_watermark) / band))
+            band_ratio = max(
+                0.0, min(1.0, (sizing_current - soft_watermark) / band)
+            )
             if band_ratio < 0.50:
                 bucket = self._PREFILL_STEP_TIERS[0]  # 1024
             else:
@@ -4361,13 +3858,15 @@ class Scheduler:
             )
             logger.info(
                 "Prefill throttled for %s: chunk %d -> %d "
-                "(usage %.2fGB vs sizing target %.2fGB, %s ceiling %.2fGB, "
+                "(usage %.2fGB net of %.2fGB mlx pool vs sizing target "
+                "%.2fGB, %s ceiling %.2fGB, "
                 "per_token=%.1fKB, floor=%d). Prefill runs slower until usage "
                 "drops. %s.",
                 request_id,
                 requested,
                 n,
                 current / 1024**3,
+                pool_bytes / 1024**3,
                 target / 1024**3,
                 binding_str,
                 hard_cap / 1024**3,
@@ -4380,6 +3879,7 @@ class Scheduler:
             logger.debug(
                 "[throttle:%s] shrink rid=%s chunk %d -> %d "
                 "(predictor=%s per_token=%.1fKB current=%.2fGB "
+                "mlx_pool=%.2fGB sizing=%.2fGB "
                 "safe_target=%.2fGB ceiling=%.2fGB kv_len=%d band_ratio=%.2f)",
                 loop_label,
                 request_id,
@@ -4388,6 +3888,8 @@ class Scheduler:
                 predictor,
                 per_token / 1024,
                 current / 1024**3,
+                pool_bytes / 1024**3,
+                sizing_current / 1024**3,
                 safe_target / 1024**3,
                 hard_cap / 1024**3,
                 kv_len,
@@ -4648,6 +4150,7 @@ class Scheduler:
         loop_label: str,
         kv_len: int = 0,
         requested_step: int | None = None,
+        pool_growth: int = 0,
     ) -> None:
         """Feed one chunk's measured transient into the EWMA tracker.
 
@@ -4673,17 +4176,87 @@ class Scheduler:
         scaling its fixed/pool-heavy delta up to ``prefill_step_size`` can turn
         a small residual allocation into a false multi-gigabyte admission
         charge.
+
+        ``pool_growth`` (from ``_mx_pool_bytes`` snapshots around the chunk)
+        is subtracted from the measured delta first: pool growth is reusable
+        caching, not recurring per-token cost, and a pool cycling at its cap
+        would otherwise poison the per-token normalization (measured at 260K
+        context: 7.5GB refill windows on 288-token chunks).
         """
         delta = post_bytes - pre_bytes
+        # Pool-refill separation (see _mx_pool_bytes): growth of the MLX
+        # buffer pool inside the window is one-shot caching that the next
+        # chunk reuses, so it must not feed the per-token cost. Subtract it
+        # from the measured delta; a window that was pure refill then
+        # records ~0 and is skipped by the delta<=0 gates below. Negative
+        # growth (MLX evicting pool buffers at the cap) adds back the
+        # genuinely freed bytes, keeping the cost honest in both directions.
+        if pool_growth > 0:
+            delta -= min(int(pool_growth), max(delta, 0))
+        # Restored-prefix refund (see the prefill-start arming): lazily
+        # restored KV materializes as ACTIVE growth spread over the first
+        # few windows; cover it from the armed estimate until exhausted so
+        # only the genuine per-chunk cost feeds the tracker. Unlike the
+        # pool filter above, this memory is real and permanent — the
+        # admission side prices it via kv_exact/cached_tokens instead.
+        refund = getattr(self, "_restore_refill_pending_bytes", 0)
+        if refund > 0 and delta > 0:
+            covered = min(refund, delta)
+            delta -= covered
+            try:
+                self._restore_refill_pending_bytes = refund - covered
+            except AttributeError:
+                pass
+        # Inter-window release accounting: anything the footprint dropped
+        # since the last window ended was released out-of-band (enforcer
+        # soft-pressure, async SSD writeback, pressure-clear pool drains).
+        # Price it into the reclaim ledger BEFORE evaluating this window's
+        # delta so the refill shows up as "pool reallocation after reclaim"
+        # instead of a fake multi-GB chunk transient.
+        last_post = getattr(self, "_throttle_last_post_bytes", 0)
+        try:
+            self._throttle_last_post_bytes = post_bytes
+        except AttributeError:
+            pass
+        if last_post > 0 and 0 < pre_bytes < last_post:
+            out_of_band = last_post - pre_bytes
+            # REPLACE, not accumulate: steady-state pool trimming books a
+            # few hundred MB per window, and accumulating those inside the
+            # TTL charged GBs of "imminent refill" that never arrives as
+            # one shot (2026-08-28 regression). The latest inter-window
+            # drop alone is the next chunk's expected refill.
+            self._prefill_transient_tracker.set_reclaim(out_of_band)
+            logger.debug(
+                "[throttle:%s] rid=%s out-of-band release %.2fMB since last "
+                "window (pre=%.2fGB < last_post=%.2fGB) -> reclaim ledger "
+                "(replaced)",
+                loop_label,
+                request_id,
+                out_of_band / 1024**2,
+                pre_bytes / 1024**3,
+                last_post / 1024**3,
+            )
         # The reclaim ledger sees every measurement, including samples the
         # EWMA gates below skip: a release on a sub-floor tail must still be
         # priced, and any positive growth confirms the pool reallocation and
         # drops the one-shot charge — leaving it armed after the footprint
         # recovered would double count against the guard's gates.
+        # The clear-on-growth check uses the RAW delta (before the pool and
+        # refund subtractions above): a window whose PHYS footprint grew has
+        # reallocated whatever the ledger priced, even when the adjusted
+        # sample delta is ~0 (pure pool refill). Keying the clear on the
+        # adjusted delta instead let steady-state trims accumulate ~500MB
+        # per window into a phantom multi-GB refill charge (2026-08-28:
+        # fresh 262K rejected at ~25K tokens with a 32GB predicted chunk).
+        raw_delta = post_bytes - pre_bytes
+        pending_reclaim = 0
+        if raw_delta > 0:
+            pending_reclaim = (
+                self._prefill_transient_tracker.recent_reclaim_bytes
+            )
+            self._prefill_transient_tracker.clear_reclaim()
         if delta <= 0:
             self._prefill_transient_tracker.record_reclaim(-delta)
-        else:
-            self._prefill_transient_tracker.clear_reclaim()
         min_chunk = max(1, self._prefill_min_chunk_tokens)
         if n_tokens < min_chunk:
             logger.debug(
@@ -4704,6 +4277,33 @@ class Scheduler:
                 request_id,
                 n_tokens,
                 delta,
+            )
+            return
+        if (
+            pending_reclaim > 0
+            and delta <= pending_reclaim * 2
+            and n_tokens > 0
+            and delta / n_tokens
+            > self._prefill_transient_tracker.bytes_per_token * 2
+        ):
+            # The first chunk after a reclaim (pool clear, eviction)
+            # re-allocates the freed pool: its phys delta measures
+            # the REALLOCATION, not this chunk's per-token cost. Feeding it
+            # in — raw into last_delta even when the EWMA's outlier gate
+            # rejects it — poisons every later prediction (measured: one
+            # ~8GB post-reclaim delta made the gate predict 7.9GB/chunk and
+            # pause/re-prefill a healthy request). The one-shot
+            # reallocation risk stays priced via the reclaim ledger's
+            # clear-on-growth semantics; the per-token signal must come
+            # from chunks not dominated by pool refill.
+            logger.debug(
+                "[throttle:%s] measure rid=%s n=%d delta=%.2fMB "
+                "(skipped: pool reallocation after reclaim=%dB)",
+                loop_label,
+                request_id,
+                n_tokens,
+                delta / 1024**2,
+                pending_reclaim,
             )
             return
         if (
@@ -5009,36 +4609,11 @@ class Scheduler:
     def _base_prefill_step_size(
         self, processed_tokens: int, remaining_tokens: int
     ) -> int:
-        adaptive_prefill = self._glm_dsa_adaptive_prefill
-        if adaptive_prefill is not None:
-            from .patches.glm_moe_dsa.generate_patch import (
-                _prefill_step_size_for_progress,
-            )
-
-            return _prefill_step_size_for_progress(
-                self.config.prefill_step_size,
-                processed_tokens,
-                remaining_tokens,
-                adaptive_prefill,
-            )
-
-        adaptive_prefill = getattr(self, "_minimax_m3_adaptive_prefill", None)
-        if adaptive_prefill is None:
-            size = self.config.prefill_step_size
-            floor = getattr(self, "_qwen35_prefill_floor", 0)
-            if floor and size < floor:
-                size = floor
-            return size
-        from .patches.minimax_m3.generate_patch import (
-            _prefill_step_size_for_progress as _minimax_prefill_step_size,
-        )
-
-        return _minimax_prefill_step_size(
-            self.config.prefill_step_size,
-            processed_tokens,
-            remaining_tokens,
-            adaptive_prefill,
-        )
+        size = self.config.prefill_step_size
+        floor = getattr(self, "_qwen35_prefill_floor", 0)
+        if floor and size < floor:
+            size = floor
+        return size
 
     def _begin_prefill(
         self,
@@ -5166,6 +4741,7 @@ class Scheduler:
             state.request.benchmark_requested_steps.append(int(prefill_step_size))
 
         _throttle_pre = get_phys_footprint()
+        _throttle_pool_pre = _mx_pool_bytes()
         # Chunked prefill also bypasses BatchGenerator and must establish the
         # same per-engine stream context as the regular external prefill path.
         # The chunk views stay inside it for the same reason (single-stream
@@ -5189,6 +4765,7 @@ class Scheduler:
             loop_label="chunked_step",
             kv_len=state.base_size + state.tokens_processed,
             requested_step=prefill_step_size,
+            pool_growth=_mx_pool_bytes() - _throttle_pool_pre,
         )
         self._maybe_record_fixed_state_bytes(state.cache)
         state.tokens_processed += n
@@ -5288,17 +4865,10 @@ class Scheduler:
             _sync_and_clear_cache(self._stream)
         chunk_dt = time.perf_counter() - _t_chunk_start
         if getattr(state.request, "benchmark_trace", False):
-            _ane_sequence = int(
-                getattr(state.request, "benchmark_ane_sequence_length", 0) or 0
-            )
-            _ane_full_tiles, _ane_tail_tokens = (0, n)
-            if _ane_sequence > 0:
-                _ane_full_tiles, _ane_tail_tokens = divmod(n, _ane_sequence)
             logger.info(
                 "[benchmark-prefill] rid=%s path=chunked_step chunk_tokens=%d "
                 "processed=%d->%d kv_before=%d requested_step=%d "
-                "boundary_enabled=%s cache_block_size=%d ane_tile=%d "
-                "ane_full_tiles=%d ane_tail_tokens=%d model_cache_ms=%.3f "
+                "boundary_enabled=%s cache_block_size=%d model_cache_ms=%.3f "
                 "total_ms=%.3f overhead_ms=%.3f",
                 state.request.request_id,
                 n,
@@ -5308,9 +4878,6 @@ class Scheduler:
                 prefill_step_size,
                 state.boundary_enabled,
                 state.block_size if state.boundary_enabled else 0,
-                _ane_sequence,
-                _ane_full_tiles,
-                _ane_tail_tokens,
                 _trace_model_ms,
                 chunk_dt * 1000.0,
                 max(0.0, chunk_dt * 1000.0 - _trace_model_ms),
@@ -5339,21 +4906,6 @@ class Scheduler:
                 state.request, state.cache, total_tokens
             )
 
-    def _finalize_chunked_prefill_cache_for_insert(
-        self, request: "Request", prompt_cache: list[Any] | None
-    ) -> None:
-        """Mirror external prefill's post-prefill cache epilogue."""
-        if not prompt_cache or self._turboquant_kv_bits is None:
-            return
-        if not self._turboquant_eligible(prompt_cache):
-            return
-
-        self._apply_turboquant_kv_convert(prompt_cache)
-        if getattr(request, "cached_tokens", 0) > 0:
-            with mx.stream(self._stream):
-                _materialize_cache_storage(prompt_cache)
-        _sync_and_clear_cache(self._stream)
-
     def _insert_prefilled_request(
         self,
         request: "Request",
@@ -5371,43 +4923,6 @@ class Scheduler:
         """
         if request.sampling_params.seed is not None:
             mx.random.seed(request.sampling_params.seed)
-
-        # #2219: both chunked-completion paths (inline first chunk and
-        # _advance_chunked_prefills) funnel through here, but external VLM MTP
-        # routing only existed on the non-chunked prefill exit -- so any prompt
-        # long enough to be chunk-prefilled silently bypassed VLM MTP. Re-apply
-        # the decision at this shared choke point, BEFORE the TurboQuant convert
-        # below, so the drafter's final forward sees the un-quantized cache. A
-        # declined route (e.g. the single-in-flight drafter is busy) falls
-        # through to BatchGenerator, matching short-prompt behaviour.
-        if self._vlm_mtp_drafter is not None and state.cache is not None:
-            vlm_mtp_uid = self._route_to_vlm_mtp(
-                request,
-                state.cache,
-                state.last_token,
-                state.sampler,
-                state.sm,
-                logits_processors=state.per_row_lps,
-            )
-            if vlm_mtp_uid is not None:
-                self.request_id_to_uid[request.request_id] = vlm_mtp_uid
-                self.uid_to_request_id[vlm_mtp_uid] = request.request_id
-                now = time.monotonic()
-                request.batch_uid = vlm_mtp_uid
-                request.status = RequestStatus.RUNNING
-                request.generation_started_at = now
-                request.last_activity_at = now
-                self.running[request.request_id] = request
-                scheduled.append(request)
-                self.total_prompt_tokens += request.num_prompt_tokens
-                logger.debug(
-                    "Scheduled chunked-prefill request %s via vlm_mtp (uid=%d)",
-                    request.request_id,
-                    vlm_mtp_uid,
-                )
-                return
-
-        self._finalize_chunked_prefill_cache_for_insert(request, state.cache)
 
         per_row_lps = state.per_row_lps if state.per_row_lps is not None else []
         # insert() merges the prompt cache into the batch KV caches with lazy
@@ -6006,10 +5521,7 @@ class Scheduler:
         """Detect leading/trailing tokens around </think> from the chat template.
 
         Different models use different patterns:
-        - Qwen3/3.5, MiniMax: ``\\n</think>\\n\\n``
-        - DeepSeek V3.2, GLM-5: ``</think>`` (no newlines)
-        - GLM-4.6V: ``</think>\\n``
-        - Step-3.5-Flash: ``\\n</think>\\n``
+        - Qwen3/3.5: ``\\n</think>\\n\\n``
 
         Returns (leading_token_ids, trailing_token_ids) or (None, None).
         """
@@ -6530,7 +6042,7 @@ class Scheduler:
                 # run and the whole chain stays resident. Caches that grow in
                 # place (KVCache) hide this because the stranded references
                 # alias the live buffers; caches that reallocate on growth
-                # (TurboQuant) strand a full extra chain per snapshot — measured
+                # strand a full extra chain per snapshot — measured
                 # at 0.74 GiB per turn on a 32k Qwen3.8-27B conversation.
                 leaves: list[Any] = []
                 pending: list[Any] = [
@@ -6666,7 +6178,7 @@ class Scheduler:
                         return None
                     cache_list, _tokens = result[uid]
                     if expected_tokens is not None:
-                        # Walk into CacheList wrappers: DeepSeek-V4/GLM layer
+                        # Walk into CacheList wrappers: per-layer
                         # caches carry their token offset on a sub-cache, and
                         # checking only the wrapper would silently pass a
                         # skewed capture through.
@@ -7225,8 +6737,6 @@ class Scheduler:
         """
         if self.block_aware_cache is None:
             return None
-        if request.specprefill_indices is not None:
-            return None
 
         block_size = self.config.paged_cache_block_size
         if block_size <= 0:
@@ -7704,18 +7214,8 @@ class Scheduler:
                     continue
 
                 if hasattr(layer_cache, "state"):
-                    if handler is not None and class_name in (
-                        "MiniMaxM3KVCache",
-                        "MiniMaxM3BatchKVCache",
-                        "QSAKVCache",
-                        "QSAQuantizedKVCache",
-                        "BatchQSAKVCache",
-                    ):
-                        state = handler.serialize_state(layer_cache)
-                        meta = handler.serialize_meta_state(layer_cache)
-                    else:
-                        state = layer_cache.state
-                        meta = getattr(layer_cache, "meta_state", ())
+                    state = layer_cache.state
+                    meta = getattr(layer_cache, "meta_state", ())
 
                     is_rotating_cache = class_name in (
                         "RotatingKVCache",
@@ -8149,12 +7649,6 @@ class Scheduler:
                     request.remaining_tokens = request.prompt_token_ids[
                         block_table.num_tokens :
                     ]
-                    if self._align_minimax_m3_partial_cache_to_prefill_step(request):
-                        request.cached_tokens = block_table.num_tokens
-                        request.shared_prefix_blocks = len(block_table.block_ids)
-                        request.remaining_tokens = request.prompt_token_ids[
-                            block_table.num_tokens :
-                        ]
                     # For exact prefix hits we need cache state at (N-1) and the
                     # last prompt token as input to produce the first decode logit.
                     # Reusing cache state at N and feeding the last token again
@@ -8267,9 +7761,6 @@ class Scheduler:
         # triage), decoded token context at DEBUG (issue #1003).
         self._log_prefix_divergence(request)
 
-        # SpecPrefill: score remaining tokens with draft model if applicable.
-        # Must run AFTER prefix cache check (scoring applies only to uncached suffix).
-        self._try_specprefill_scoring(request)
         self._prefix_cache_prepared.add(request.request_id)
 
     def add_request(self, request: Request) -> None:
@@ -8332,716 +7823,12 @@ class Scheduler:
             f"Added request {request.request_id} with {request.num_prompt_tokens} prompt tokens"
         )
 
-    def set_specprefill_draft_model(
-        self, draft_model: Any, draft_model_name: str | None = None
-    ) -> None:
-        """Set the draft model for SpecPrefill scoring.
 
-        Creates separate block and SSD cache managers for the draft model so
-        target TurboQuant signatures cannot invalidate draft cache blocks.
-        """
-        if not self._close_specprefill_draft_cache_manager():
-            raise RuntimeError(
-                "Could not close the previous SpecPrefill draft SSD cache manager"
-            )
-        self._specprefill_draft_model = draft_model
-        self._draft_prefix_cache = None
-        if not draft_model_name:
-            logger.info(
-                "SpecPrefill: draft model set without a stable model name "
-                "(no SSD cache)"
-            )
-            return
-
-        if (
-            self.paged_cache_manager is not None
-            and self.paged_ssd_cache_manager is not None
-        ):
-            try:
-                from .cache.paged_cache import PagedCacheManager
-                from .cache.prefix_cache import BlockAwarePrefixCache
-
-                name = draft_model_name
-                draft_cache_list = make_prompt_cache(draft_model)
-                draft_layer_cache_types = None
-                if HAS_CACHE_TYPE_HANDLERS and ModelCacheConfig is not None:
-                    try:
-                        draft_model_cache_config = ModelCacheConfig.from_cache_list(
-                            draft_cache_list,
-                            model_name=name,
-                        )
-                        draft_layer_cache_types = draft_model_cache_config.get_type_names()
-                    except Exception as e:
-                        logger.debug(
-                            "Could not infer SpecPrefill draft cache layout: %s", e
-                        )
-                draft_paged = PagedCacheManager(
-                    block_size=self.config.paged_cache_block_size,
-                    max_blocks=self.paged_cache_manager.max_blocks,
-                    model_name=name,
-                )
-                draft_ssd = PagedSSDCacheManager(
-                    cache_dir=Path(self.config.paged_ssd_cache_dir),
-                    max_size_bytes=self.config.paged_ssd_cache_max_size,
-                    hot_cache_max_bytes=self.config.hot_cache_max_size,
-                    hot_cache_only=self.config.hot_cache_only,
-                    hot_cache_write_through=self.config.hot_cache_write_through,
-                    hot_cache_budget=self.config.hot_cache_budget,
-                    expected_model_name=name,
-                    expected_num_layers=len(draft_cache_list),
-                    expected_block_size=self.config.paged_cache_block_size,
-                    expected_block_size_tokens=self.config.paged_cache_block_size,
-                    expected_kv_bytes_per_token=getattr(
-                        self.paged_ssd_cache_manager,
-                        "_expected_kv_bytes_per_token",
-                        200_000,
-                    ),
-                    expected_layer_cache_types=draft_layer_cache_types,
-                )
-                self._draft_paged_ssd_cache_manager = draft_ssd
-                draft_paged.set_paged_ssd_cache_manager(draft_ssd)
-                self._draft_prefix_cache = BlockAwarePrefixCache(
-                    model=draft_model,
-                    paged_cache_manager=draft_paged,
-                    paged_ssd_cache_manager=draft_ssd,
-                )
-                self._draft_prefix_cache.set_cold_restore_callback(
-                    self._restore_block_from_cold
-                )
-                logger.info(
-                    f"SpecPrefill: draft model set with SSD cache (model_name={name})"
-                )
-            except Exception as e:
-                self._draft_prefix_cache = None
-                self._close_specprefill_draft_cache_manager()
-                logger.warning(f"SpecPrefill: draft SSD cache setup failed: {e}")
-                logger.info("SpecPrefill: draft model set (no SSD cache)")
-        else:
-            logger.info("SpecPrefill: draft model set (no SSD cache)")
-
-    def _close_specprefill_draft_cache_manager(self) -> bool:
-        manager = self._draft_paged_ssd_cache_manager
-        if manager is None:
-            return True
-        try:
-            manager.close()
-        except Exception as e:
-            logger.warning("SpecPrefill draft SSD cache shutdown error: %s", e)
-            return False
-        writer_thread = getattr(manager, "_writer_thread", None)
-        if writer_thread is not None and writer_thread.is_alive():
-            logger.warning(
-                "SpecPrefill draft SSD cache writer remains active after shutdown"
-            )
-            return False
-
-        self._draft_paged_ssd_cache_manager = None
-        return True
-
-    def set_vlm_mtp_drafter(
-        self,
-        drafter: VLMMTPDrafter | None,
-        draft_block_size: int | None = None,
-    ) -> None:
-        """Attach an MTP drafter for VLM MTP speculative decode.
-
-        Called by ``VLMBatchedEngine.set_vlm_mtp_drafter`` once the drafter
-        artifact is loaded.  Supports any drafter that mlx-vlm's
-        ``load_drafter()`` resolves to ``kind="mtp"`` (gemma4_assistant,
-        qwen3_5_mtp, etc.).  ``None`` clears the toggle.
-        """
-        self._vlm_mtp_drafter = drafter
-        self._vlm_mtp_draft_block_size = draft_block_size
-        if drafter is not None:
-            logger.info(
-                "VLM MTP drafter attached to scheduler (block_size=%s)",
-                draft_block_size,
-            )
-
-    def _route_to_vlm_mtp(
-        self,
-        request: Request,
-        prefilled_cache: list[Any],
-        last_tokens: list[int],
-        sampler: Callable[[Any], Any],
-        state_machine: Any,
-        logits_processors: list[Any] | None = None,
-    ) -> int | None:
-        """Bypass BatchGenerator and stand up a vlm_mtp generator instead.
-
-        Runs the final forward on ``last_tokens`` with ``return_hidden=True``
-        and ``return_shared_kv=True`` so the drafter has the targets it
-        needs, samples the first bonus token from the resulting logits, and
-        returns a synthesized uid that ``step()`` will drive.
-
-        Returns ``None`` if the eligibility check fails at the last second
-        (drafter missing, language model lacks rollback hook, etc.) so the
-        caller can fall back to the normal BatchGenerator path.
-        """
-        drafter = self._vlm_mtp_drafter
-        if drafter is None:
-            return None
-
-        # Per-request logits processors that implement the snapshot/restore
-        # protocol (today: ThinkingBudgetProcessor) ARE applied on this
-        # path: MTPProcessingSampler threads them into mlx-vlm's verify
-        # walk through the positioned ``sample_target`` hook, with
-        # position-keyed state checkpoints so draft rejections rewind them
-        # correctly (see omlx/speculative/processing_sampler.py). Model
-        # level suppress tokens are reproduced via _make_suppressing_sampler.
-        # Everything else (grammar constraints, repetition/presence/
-        # frequency penalties) still has no application point here — same
-        # convention as Lightning MTP: fall back to BatchGenerator so every
-        # processor stays enforced (#2399).
-        mtp_processors: list[Any] = []
-        unsupported_processors: list[Any] = []
-        for proc in logits_processors or []:
-            if getattr(proc, "_omlx_suppress_processor", False):
-                continue
-            if supports_vlm_mtp_processing(proc):
-                mtp_processors.append(proc)
-            else:
-                unsupported_processors.append(proc)
-        if unsupported_processors:
-            logger.info(
-                "vlm_mtp routing skipped for %s: request carries per-request "
-                "logits processors without vlm_mtp support (%s); falling "
-                "back to BatchGenerator",
-                request.request_id,
-                ", ".join(
-                    type(proc).__name__ for proc in unsupported_processors
-                ),
-            )
-            return None
-
-        # The drafter stores request-specific state on the module instance, so
-        # only one vlm_mtp generator can own it at a time. A request that
-        # arrives after MTP has started cannot be migrated here; retain the
-        # existing safe BatchGenerator fallback for that late-arrival case.
-        if self._vlm_mtp_active:
-            logger.info(
-                "vlm_mtp routing skipped for %s: drafter is busy with %d "
-                "request(s); falling back to BatchGenerator",
-                request.request_id,
-                len(self._vlm_mtp_active),
-            )
-            return None
-
-        # Prefer ordinary batching when a peer is already ready or admitted.
-        # Starting MTP for the first request and falling its peers back creates
-        # a slower mixed decode group, while also paying this path's extra
-        # final target forward. A chunked-prefill request still appears in
-        # ``prefilling`` while it is finalized, so exclude the request itself.
-        waiting_count = len(getattr(self, "waiting", ()))
-        running_count = len(getattr(self, "running", ()))
-        prefilling_count = sum(
-            getattr(prefill, "request_id", None) != request.request_id
-            for prefill in getattr(self, "prefilling", ())
-        )
-        if waiting_count or running_count or prefilling_count:
-            logger.info(
-                "vlm_mtp routing skipped for %s: scheduler contention "
-                "(running=%d waiting=%d prefilling=%d); falling back to "
-                "BatchGenerator",
-                request.request_id,
-                running_count,
-                waiting_count,
-                prefilling_count,
-            )
-            return None
-
-        lm = getattr(self.model, "_language_model", None)
-        if lm is None or not hasattr(lm, "rollback_speculative_cache"):
-            logger.warning(
-                "vlm_mtp toggle on but model lacks _language_model with "
-                "rollback_speculative_cache (model=%s); falling back to "
-                "standard decode for request %s",
-                type(self.model).__name__,
-                request.request_id,
-            )
-            return None
-
-        if mtp_processors and not vlm_mtp_positioned_sampling_available(self.model):
-            # Without speculative_logits_from_hidden visible to the round
-            # loop, mlx-vlm's verify step samples target tokens from raw
-            # logits in one vectorized call and never consults the
-            # positioned ``sample_target`` hook — processors would be
-            # silently dropped again (#2399). The check must look at what
-            # the round loop will actually see: for mRoPE adapters (Qwen
-            # VLMs) _VLMAdapterMTPProxy hides the inner model's
-            # speculative_* fast paths, so probing the inner model
-            # directly would pass the gate and then silently skip the
-            # budget. Decline instead.
-            logger.info(
-                "vlm_mtp routing skipped for %s: request carries logits "
-                "processors but positioned verify sampling is unavailable "
-                "on %s (speculative_logits_from_hidden hidden or missing "
-                "on the round-loop view, e.g. mRoPE adapters); falling "
-                "back to BatchGenerator",
-                request.request_id,
-                type(self.model).__name__,
-            )
-            return None
-        target_model = self.model
-
-        if not last_tokens:
-            logger.warning(
-                "vlm_mtp routing skipped: last_tokens empty for request %s",
-                request.request_id,
-            )
-            return None
-
-        mtp_sampler = _make_suppressing_sampler(sampler, self._model_suppress_tokens)
-        proc_sampler: MTPProcessingSampler | None = None
-        if mtp_processors:
-            proc_sampler = MTPProcessingSampler(
-                mtp_sampler,
-                mtp_processors,
-                request.prompt_token_ids or [],
-            )
-            mtp_sampler = proc_sampler
-        last_arr = mx.array(last_tokens)[None]  # (1, len_last)
-        try:
-            with mx.stream(self._stream):
-                set_batch_rope = getattr(target_model, "set_batch_rope_deltas", None)
-                if callable(set_batch_rope):
-                    set_batch_rope(mx.array([request.rope_deltas]))
-                out = target_model(
-                    last_arr,
-                    cache=prefilled_cache,
-                    return_hidden=True,
-                    return_shared_kv=True,
-                )
-                mx.eval([c.state for c in prefilled_cache])
-        except Exception as e:
-            logger.warning(
-                "vlm_mtp final-prefill forward failed (%s); falling back "
-                "to standard decode for request %s",
-                e,
-                request.request_id,
-            )
-            return None
-
-        # Handle current LanguageModelOutput and legacy tuple
-        # (logits, hidden, gdn_states) MTP runtime patch returns.
-        if isinstance(out, tuple):
-            logits = out[0][:, -1, :]
-            hidden_raw = out[1]
-        else:
-            logits = out.logits[:, -1, :]
-            hidden_raw = out.hidden_states
-
-        if proc_sampler is not None:
-            # Apply processors to the post-prefill logits (history=prompt)
-            # so the first bonus honours them too, then checkpoint the
-            # round loop's starting position (mlx-vlm bakes in emitted=1).
-            logits = proc_sampler.process_first_logits(logits)
-        first_bonus_arr = mtp_sampler(logits)  # mx.array shape [1]
-        mx.eval(first_bonus_arr)
-        if proc_sampler is not None:
-            proc_sampler.note_first_bonus(int(first_bonus_arr.item()))
-
-        if isinstance(hidden_raw, list):
-            hidden = hidden_raw[-1]
-        else:
-            hidden = hidden_raw
-        # Slice to last position so the drafter sees a [B, 1, H] tensor
-        # regardless of how many tokens this forward processed.
-        if hidden.shape[1] > 1:
-            hidden = hidden[:, -1:, :]
-
-        # Combine base stop tokens (EOS, Harmony, generation_config) with
-        # request-specific stop_token_ids — same shape as _build_state_machine.
-        eos_ids: set[int] = self._get_stop_tokens()
-        if request.sampling_params.stop_token_ids:
-            eos_ids.update(request.sampling_params.stop_token_ids)
-
-        try:
-            generator = run_vlm_mtp_decode(
-                target_language_model=target_model,
-                drafter=drafter,
-                prompt_cache=prefilled_cache,
-                hidden=hidden,
-                shared_kv_states=(
-                    getattr(out, "shared_kv_states", {})
-                    if not isinstance(out, tuple)
-                    else {}
-                ),
-                first_bonus=int(first_bonus_arr.item()),
-                max_tokens=request.sampling_params.max_tokens,
-                sampler=mtp_sampler,
-                draft_block_size=self._vlm_mtp_draft_block_size,
-                token_dtype=mx.int32,
-                eos_token_ids=eos_ids or None,
-            )
-        except Exception as e:
-            logger.warning(
-                "vlm_mtp generator setup failed (%s); falling back for %s",
-                e,
-                request.request_id,
-            )
-            if proc_sampler is not None:
-                # The BatchGenerator fallback reuses these processors —
-                # rewind the state mutated by process_first_logits above.
-                proc_sampler.reset_processors()
-            return None
-
-        uid = self._vlm_mtp_next_uid
-        self._vlm_mtp_next_uid -= 1
-        self._vlm_mtp_active[uid] = _VLMMTPDecodeState(
-            generator=generator,
-            request=request,
-            prompt_cache=prefilled_cache,
-            sampler=mtp_sampler,
-            state_machine=state_machine,
-            max_tokens=request.sampling_params.max_tokens,
-            stop_token_ids=set(eos_ids),
-        )
-        logger.info(
-            "vlm_mtp decode started: request=%s uid=%d block_size=%s",
-            request.request_id,
-            uid,
-            self._vlm_mtp_draft_block_size,
-        )
-        return uid
-
-    def _log_vlm_mtp_stats(
-        self, state: "_VLMMTPDecodeState", finish_reason: str
-    ) -> None:
-        """Emit one INFO line per finished vlm_mtp request with the drafter
-        acceptance rate measured for that request.
-
-        Reads ``Gemma4AssistantDraftModel.accept_lens`` — a list of accepted
-        draft counts per round, populated inside mlx-vlm's ``_mtp_rounds``.
-        The drafter mutates this in place and ``reset()`` (called at the
-        start of every new round-loop entry) clears it, so we have to read
-        before the next eligible request lands. The serialized routing in
-        ``_route_to_vlm_mtp`` guarantees one in-flight vlm_mtp generator
-        at a time, so the value we read here belongs to ``state.request``.
-        """
-        drafter = self._vlm_mtp_drafter
-        if drafter is None:
-            return
-        accept_lens = getattr(drafter.model, "accept_lens", None)
-        if not accept_lens:
-            return
-        try:
-            lens = [int(x) for x in accept_lens]
-        except Exception:
-            return
-        rounds = len(lens)
-        if rounds == 0:
-            return
-        total_accepted = sum(lens)
-        block_size = self._vlm_mtp_draft_block_size or int(
-            getattr(drafter.model.config, "block_size", 4)
-        )
-        max_per_round = max(1, block_size - 1)
-        acceptance_rate = total_accepted / (rounds * max_per_round)
-        avg_tokens_per_round = (total_accepted + rounds) / rounds
-        logger.info(
-            "vlm_mtp stats: request=%s finish=%s rounds=%d "
-            "accepted=%d/%d (%.1f%%) tokens_per_round=%.2f "
-            "emitted=%d block_size=%d",
-            state.request.request_id,
-            finish_reason,
-            rounds,
-            total_accepted,
-            rounds * max_per_round,
-            acceptance_rate * 100,
-            avg_tokens_per_round,
-            state.emitted,
-            block_size,
-        )
-
-    def _step_vlm_mtp(self) -> list[_VLMMTPResponse]:
-        """Advance every active vlm_mtp generator by one yield.
-
-        Returns the synthesized responses for ``_process_batch_responses``.
-        Mirrors mlx-lm BatchGenerator's per-step contract: one
-        ``GenerationBatch.Response``-shaped object per active uid.
-        """
-        if not self._vlm_mtp_active:
-            return []
-
-        responses: list[_VLMMTPResponse] = []
-        for uid, state in list(self._vlm_mtp_active.items()):
-            try:
-                with mx.stream(self._stream):
-                    token_val = next(state.generator)
-            except StopIteration:
-                # Round loop exited naturally — terminate with prompt cache
-                # so the prefix-cache layer can keep using it.
-                self._log_vlm_mtp_stats(state, "length")
-                responses.append(
-                    _VLMMTPResponse(
-                        uid=uid,
-                        token=0,
-                        finish_reason="length",
-                        prompt_cache=state.prompt_cache,
-                    )
-                )
-                state.finished = True
-                continue
-
-            # Single-request mode yields ints; batch mode (not yet routed
-            # by omlx) would yield a list. Guard so the path stays robust
-            # if we widen routing later.
-            if isinstance(token_val, list):
-                # Take the first row (we only route singles for now).
-                tok = next((t for t in token_val if t is not None), None)
-                if tok is None:
-                    responses.append(
-                        _VLMMTPResponse(
-                            uid=uid,
-                            token=0,
-                            finish_reason="length",
-                            prompt_cache=state.prompt_cache,
-                        )
-                    )
-                    state.finished = True
-                    continue
-                token = int(tok)
-            else:
-                token = int(token_val)
-
-            state.emitted += 1
-            finish_reason: str | None = None
-            if state.stop_token_ids and token in state.stop_token_ids:
-                finish_reason = "stop"
-            elif state.emitted >= state.max_tokens:
-                finish_reason = "length"
-
-            if finish_reason is not None:
-                self._log_vlm_mtp_stats(state, finish_reason)
-
-            responses.append(
-                _VLMMTPResponse(
-                    uid=uid,
-                    token=token,
-                    finish_reason=finish_reason,
-                    prompt_cache=(
-                        state.prompt_cache if finish_reason is not None else None
-                    ),
-                )
-            )
-            if finish_reason is not None:
-                state.finished = True
-
-        # Drop finished entries.
-        for uid in [u for u, s in self._vlm_mtp_active.items() if s.finished]:
-            del self._vlm_mtp_active[uid]
-
-        return responses
-
-    def _try_specprefill_scoring(self, request: Request) -> None:
-        """Score tokens with draft model if SpecPrefill is applicable.
-
-        Uses paged SSD cache for the draft model: if the prompt prefix
-        was already scored in a previous turn, the draft cache is restored
-        and only the new suffix is prefilled through the draft model.
-        """
-        if self._specprefill_draft_model is None:
-            return
-
-        specprefill_enabled = getattr(request, "_specprefill_enabled", False)
-        if not specprefill_enabled:
-            return
-
-        if request.vlm_inputs_embeds is not None:
-            return
-
-        remaining = request.remaining_tokens or request.prompt_token_ids
-        if remaining is None:
-            return
-
-        from .patches.specprefill import DEFAULT_KEEP_RATE, DEFAULT_THRESHOLD
-        from .specprefill.policy import plan_specprefill_scoring
-
-        # Apply deterministic admission before the draft workflow.
-        plan = plan_specprefill_scoring(
-            remaining_tokens=remaining,
-            system_prompt_end=request.specprefill_system_end,
-            cached_tokens=request.cached_tokens,
-            requested_threshold=getattr(request, "_specprefill_threshold", None),
-            requested_keep_pct=getattr(request, "_specprefill_keep_pct", None),
-            default_threshold=DEFAULT_THRESHOLD,
-            default_keep_pct=DEFAULT_KEEP_RATE,
-        )
-        if plan is None:
-            return
-
-        from .specprefill.draft import run_specprefill_draft_scoring
-
-        run_specprefill_draft_scoring(
-            request=request,
-            plan=plan,
-            draft_model=self._specprefill_draft_model,
-            draft_prefix_cache=self._draft_prefix_cache,
-            model_id=self.config.model_name,
-            prefill_step_size=self.config.prefill_step_size,
-            stream=self._stream,
-            extract_cache_states=self._extract_cache_states,
-            sync_and_clear_cache=lambda: _sync_and_clear_cache(self._stream),
-            log=logger,
-        )
-
-    def _cleanup_specprefill(self, request_id: str) -> None:
-        """Clean up SpecPrefill RoPE patches when a request finishes."""
-        if self._specprefill_active_request_id == request_id:
-            from .patches.specprefill import cleanup_rope
-
-            cleanup_rope(self.model)
-            self._specprefill_active_request_id = None
-            logger.debug(
-                f"SpecPrefill: RoPE restored for finished request {request_id}"
-            )
-
-    def _trim_prompt_cache_for_generation(self, cache_list: list[Any]) -> bool:
-        """Trim each cache layer by one token for exact-hit generation kickoff."""
-        return self._trim_prompt_cache_by_tokens(cache_list, 1)
-
-    def _trim_prompt_cache_by_tokens(self, cache_list: list[Any], n: int) -> bool:
-        """Trim each cache layer by n tokens."""
-        if not cache_list:
-            return False
-        if n <= 0:
-            return True
-
-        for cache_obj in cache_list:
-            if not self._trim_cache_tree_by_tokens(cache_obj, n):
-                return False
-        return True
-
-    def _trim_cache_tree_by_one(self, cache_obj: Any) -> bool:
-        """Trim one token from cache object (recursively for CacheList)."""
-        return self._trim_cache_tree_by_tokens(cache_obj, 1)
-
-    def _trim_cache_tree_by_tokens(self, cache_obj: Any, n: int) -> bool:
-        """Trim n tokens from cache object (recursively for CacheList)."""
-        sub_caches = getattr(cache_obj, "caches", None)
-        if isinstance(sub_caches, (list, tuple)):
-            return all(
-                self._trim_cache_tree_by_tokens(sub_cache, n)
-                for sub_cache in sub_caches
-            )
-
-        trim_fn = getattr(cache_obj, "trim", None)
-        if not callable(trim_fn):
-            return False
-
-        try:
-            trimmed = trim_fn(n)
-            if trimmed is None:
-                return True
-            return int(trimmed) >= n
-        except Exception:
-            return False
-
-    def _cache_tree_has_class_name(
-        self,
-        cache_obj: Any,
-        class_names: frozenset[str],
-    ) -> bool:
-        """Return True when a cache tree contains one of the named cache classes."""
-        if type(cache_obj).__name__ in class_names:
-            return True
-        sub_caches = getattr(cache_obj, "caches", None)
-        if isinstance(sub_caches, (list, tuple)):
-            return any(
-                self._cache_tree_has_class_name(sub_cache, class_names)
-                for sub_cache in sub_caches
-            )
-        return False
-
-    def _align_minimax_m3_partial_cache_to_prefill_step(
-        self,
-        request: "Request",
-    ) -> bool:
-        """Align MiniMax M3 partial hits to external prefill chunk boundaries."""
-        cache_list = request.prompt_cache
-        block_table = request.block_table
-        prompt_tokens = request.prompt_token_ids or []
-        if not cache_list or block_table is None or not block_table.block_ids:
-            return False
-        if block_table.num_tokens <= 0 or block_table.num_tokens >= len(prompt_tokens):
-            return False
-
-        minimax_m3_names = frozenset({"MiniMaxM3KVCache"})
-        has_minimax_m3 = any(
-            self._cache_tree_has_class_name(cache_obj, minimax_m3_names)
-            for cache_obj in cache_list
-        )
-        if not has_minimax_m3:
-            return False
-
-        block_size = int(getattr(self.config, "paged_cache_block_size", 0) or 0)
-        prefill_step = int(getattr(self.config, "prefill_step_size", 0) or 0)
-        if block_size <= 0 or prefill_step <= block_size:
-            return False
-
-        aligned_tokens = (block_table.num_tokens // prefill_step) * prefill_step
-        aligned_tokens = (aligned_tokens // block_size) * block_size
-        if aligned_tokens <= 0 or aligned_tokens >= block_table.num_tokens:
-            return False
-
-        target_block_count = 0
-        target_tokens = 0
-        for block_id in block_table.block_ids:
-            block = (
-                self.paged_cache_manager.allocated_blocks.get(block_id)
-                if self.paged_cache_manager is not None
-                else None
-            )
-            token_count = int(getattr(block, "token_count", block_size) or block_size)
-            if target_tokens + token_count > aligned_tokens:
-                break
-            target_tokens += token_count
-            target_block_count += 1
-
-        if target_tokens != aligned_tokens:
-            logger.debug(
-                "MiniMax M3 partial cache alignment skipped for %s: cannot align "
-                "block table from %d to %d tokens",
-                request.request_id,
-                block_table.num_tokens,
-                aligned_tokens,
-            )
-            return False
-
-        trim_tokens = block_table.num_tokens - aligned_tokens
-        if not self._trim_prompt_cache_by_tokens(cache_list, trim_tokens):
-            logger.debug(
-                "MiniMax M3 partial cache alignment skipped for %s: cache trim "
-                "by %d tokens failed",
-                request.request_id,
-                trim_tokens,
-            )
-            return False
-
-        dropped_block_ids = block_table.block_ids[target_block_count:]
-        if self.paged_cache_manager is not None:
-            for block_id in dropped_block_ids:
-                self.paged_cache_manager.free_block(block_id)
-        block_table.block_ids = block_table.block_ids[:target_block_count]
-        block_table.num_tokens = aligned_tokens
-
-        logger.info(
-            "MiniMax M3 partial cache aligned to prefill step for %s: "
-            "%d -> %d tokens, dropped %d block(s)",
-            request.request_id,
-            aligned_tokens + trim_tokens,
-            aligned_tokens,
-            len(dropped_block_ids),
-        )
-        return True
 
     def _remove_uid_from_active_batch(self, uid: int) -> None:
         """Remove UID from BatchGenerator safely.
 
-        vlm_mtp uses negative uids that BatchGenerator never sees; the
-        per-uid generator state is owned by ``_vlm_mtp_active`` and gets
-        dropped when ``_step_vlm_mtp`` marks the entry finished.
+        Negative uids never own BatchGenerator rows; ignore them.
         """
         if uid < 0:
             return
@@ -9256,12 +8043,6 @@ class Scheduler:
             self._remove_uid_from_active_batch(uid)
             if hasattr(self.model, "unregister_rope_delta"):
                 self.model.unregister_rope_delta(uid)
-            if uid < 0:
-                mtp_state = self._vlm_mtp_active.pop(uid, None)
-                if mtp_state is not None:
-                    close = getattr(mtp_state.generator, "close", None)
-                    if callable(close):
-                        close()
             _unregister_uid_row(self.model, uid)
             del self.uid_to_request_id[uid]
             del self.request_id_to_uid[request.request_id]
@@ -9269,11 +8050,6 @@ class Scheduler:
         if request_id in self.running:
             del self.running[request_id]
 
-        # Restore RoPE if this was the active specprefill request. Aborted
-        # requests never flow through _cleanup_finished, so without this the
-        # wrapper leaks and the specprefill guard defers all other requests
-        # forever (#766).
-        self._cleanup_specprefill(request_id)
 
         # Release blocks for eviction (same as _cleanup_finished)
         if self.paged_cache_manager is not None:
@@ -9391,7 +8167,7 @@ class Scheduler:
     def _effective_max_num_seqs(self) -> int:
         """Current admission cap, narrowed for models that require serial decode."""
         self._refresh_generation_overflow_recovery_ids()
-        if self._serialize_llama4_requests or self._generation_overflow_recovery_ids:
+        if self._generation_overflow_recovery_ids:
             return 1
         return max(1, self.config.max_num_seqs)
 
@@ -9654,7 +8430,7 @@ class Scheduler:
         Charging the floor chunk instead of ``prefill_step_size`` is
         deliberate: when memory is tight the adaptive throttle runs the same
         prefill at ``prefill_min_chunk_tokens``, so admission must price the
-        peak a throttled prefill actually produces — measured on gemma-4 at
+        peak a throttled prefill actually produces — measured at
         a 31.56GB ceiling, charging the full step rejected 80k tokens while
         60k ran to completion at 32-token chunks.
 
@@ -9689,7 +8465,15 @@ class Scheduler:
         kv_exact = int(
             monitor.estimate_resident_kv_bytes(new_tokens, chunk_tokens=floor_chunk)
         )
-        transient = int(self._admission_transient_bound(floor_chunk, kv_len))
+        # Front-door admission excludes the reclaim ledger (see
+        # _admission_transient_bound): at request start it is normally the
+        # previous request's permanent teardown, not a refill this prefill
+        # will perform. Mid-prefill gates keep the full bound.
+        transient = int(
+            self._admission_transient_bound(
+                floor_chunk, kv_len, include_reclaim=False
+            )
+        )
         if kv_exact <= 0 and transient <= 0:
             return None
         return _AdmissionEstimate(
@@ -9719,7 +8503,7 @@ class Scheduler:
         we fall back to a generic message.
 
         The ladder itself lives in ``exceptions.describe_ceiling_binding``
-        so engine-pool load refusals and DFlash's guard name the same
+        so engine-pool load refusals and the prefill memory guard name the
         binding ceiling and the same knob. ``hard_limit`` here has the
         hot-cache reservation already subtracted while the components are
         raw; that offset shifts every component equally, so it does not
@@ -9973,8 +8757,6 @@ class Scheduler:
         # Track VLM status: VLM and text-only requests cannot be in the same prefill batch
         # None = not determined yet, True = VLM request, False = text-only request
         batch_vlm_status: bool | None = None
-        # Track SpecPrefill: these requests must be alone (RoPE patching affects whole model)
-        batch_specprefill_status: bool | None = None
 
         while (
             self.waiting
@@ -10142,27 +8924,6 @@ class Scheduler:
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
 
-            # SpecPrefill requests must be alone in the batch (RoPE patching
-            # affects the entire model). Also block scheduling if another
-            # specprefill request is already running (offset RoPE active).
-            request_is_specprefill = request.specprefill_indices is not None
-            if self._specprefill_active_request_id is not None:
-                # A specprefill request is decoding with its offset RoPE
-                # installed on the shared model. Defer everything, including
-                # other specprefill requests: admitting a second one here
-                # would replace the live wrapper and corrupt the remaining
-                # decode of the active request (#766).
-                self.waiting.appendleft(request)
-                break
-            if batch_specprefill_status is None:
-                batch_specprefill_status = request_is_specprefill
-            elif batch_specprefill_status != request_is_specprefill:
-                self.waiting.appendleft(request)
-                break
-            if request_is_specprefill and len(scheduled) > 0:
-                # SpecPrefill request must be alone
-                self.waiting.appendleft(request)
-                break
 
             # Check VLM status homogeneity: VLM and text-only requests use
             # different prefill paths (embeddings vs token IDs)
@@ -10235,187 +8996,7 @@ class Scheduler:
                 )
                 continue
 
-            # SpecPrefill: replace tokens with selected subset and pre-fill
-            # cache via sparse_prefill before inserting into BatchGenerator.
-            #
-            # Key design: sparse_prefill processes selected tokens (excluding
-            # the last prompt token). BatchGenerator then processes the last
-            # prompt token to produce generation logits. This avoids:
-            #   - Double-processing the last token (Bug #2)
-            #   - Off-by-one RoPE positions (Bug #1)
-            #
-            # Position math:
-            #   sparse_prefill: N' tokens, adjustment = M - N'
-            #   We subtract 1: adjustment = M - N' - 1
-            #   BatchGenerator last token: pos = N' + (M - N' - 1) = M - 1
-            #   First gen token: pos = (N'+1) + (M - N' - 1) = M
-            if request.specprefill_indices is not None:
-                tracker = get_prefill_tracker()
-                model_id = self.config.model_name
-                total_pp = 0
-                try:
-                    sys_count = getattr(request, "_specprefill_system_tokens", 0)
-                    all_tokens = tokens_to_process
-
-                    from .specprefill.planning import plan_specprefill_target
-
-                    target_plan = plan_specprefill_target(
-                        all_tokens=all_tokens,
-                        system_token_count=sys_count,
-                        selected_indices=request.specprefill_indices.tolist(),
-                        position_offset=request.specprefill_position_offset,
-                    )
-                    m_pre = target_plan.conversation_token_count
-                    n_eff = target_plan.sparse_selected_token_count
-                    total_pp = target_plan.total_tracker_prefill_count
-                    tracker.update(request.request_id, 0, total_pp, model_id)
-
-                    spec_sparse_extra = {
-                        "prompt_tokens": request.num_prompt_tokens,
-                        "system_tokens": request.specprefill_system_end,
-                        "conversation_tokens": request.num_prompt_tokens
-                        - request.specprefill_system_end,
-                        "cached_tokens": request.cached_tokens,
-                        "scored_tokens": m_pre,
-                        "selected_tokens": n_eff,
-                        "keep_percent": (
-                            round(n_eff / m_pre * 100) if m_pre > 0 else 0
-                        ),
-                    }
-
-                    def _check_specprefill_abort(processed: int) -> None:
-                        if request.request_id in self._pending_abort_ids:
-                            logger.info(
-                                f"SpecPrefill interrupted at {processed}/{total_pp} "
-                                f"tokens: request aborted"
-                            )
-                            tracker.remove(request.request_id)
-                            self.waiting.appendleft(request)
-                            raise _PrefillAbortedError([], processed)
-
-                    def _report_system_progress(processed: int, total: int) -> None:
-                        tracker.update(
-                            request.request_id,
-                            min(processed, total_pp - 1),
-                            total_pp,
-                            model_id,
-                            phase="specprefill_system",
-                            detail="system prompt prefill",
-                            extra=spec_sparse_extra,
-                        )
-
-                    def _report_sparse_progress(processed: int, total: int) -> None:
-                        _check_specprefill_abort(sys_count + processed)
-                        tracker.update(
-                            request.request_id,
-                            min(sys_count + processed, total_pp - 1),
-                            total_pp,
-                            model_id,
-                            phase="specprefill_sparse",
-                            detail="sparse target prefill",
-                            extra={
-                                "scored_tokens": m_pre,
-                                "selected_tokens": n_eff,
-                                "keep_percent": (
-                                    round(n_eff / m_pre * 100) if m_pre > 0 else 0
-                                ),
-                                "prompt_tokens": request.num_prompt_tokens,
-                                "system_tokens": request.specprefill_system_end,
-                                "conversation_tokens": request.num_prompt_tokens
-                                - request.specprefill_system_end,
-                                "cached_tokens": request.cached_tokens,
-                            },
-                        )
-
-                    from .specprefill.target import run_specprefill_target_prefill
-
-                    # all_tokens may start after an ordinary cache hit; exact
-                    # matching needs the complete static prefix from the prompt.
-                    prompt_token_ids = request.prompt_token_ids or []
-                    static_prefix_tokens = list(
-                        prompt_token_ids[: request.specprefill_system_end]
-                    )
-
-                    target_result = run_specprefill_target_prefill(
-                        target_model=self.model,
-                        request=request,
-                        plan=target_plan,
-                        all_tokens=all_tokens,
-                        selected_indices=request.specprefill_indices,
-                        prefill_step_size=self.config.prefill_step_size,
-                        stream=self._stream,
-                        check_abort=_check_specprefill_abort,
-                        report_system_progress=_report_system_progress,
-                        report_sparse_progress=_report_sparse_progress,
-                        sync_and_clear_cache=lambda: _sync_and_clear_cache(self._stream),
-                        log=logger,
-                        extract_cache_states=self._extract_cache_states,
-                        # Preserve an ordinary cache hit that already extends
-                        # beyond the static boundary; exact restoration is only
-                        # useful while some system/tool tokens remain.
-                        exact_prefix_cache=(
-                            self.block_aware_cache
-                            if target_plan.system_token_count > 0
-                            else None
-                        ),
-                        static_prefix_tokens=static_prefix_tokens,
-                        promote_static_prefix_to_hot_cache=(
-                            not self._bypass_hot_cache_under_pressure()
-                        ),
-                    )
-
-                    # An exact static-prefix restore can supersede a shorter
-                    # ordinary prefix cache. Transfer the successful target
-                    # result to the request so the old target KV is released
-                    # before decode.
-                    request.prompt_cache = target_result.prompt_cache
-                    cache_to_use = request.prompt_cache
-                    tokens_to_process = target_result.tokens_to_process
-                    self._specprefill_active_request_id = request.request_id
-
-                    # Mark spec-prefill complete (auto-removes tracker entry).
-                    tracker.update(request.request_id, total_pp, total_pp, model_id)
-
-                except _PrefillAbortedError:
-                    from .patches.specprefill import cleanup_rope
-
-                    cleanup_rope(self.model)
-                    request.specprefill_indices = None
-                    tracker.remove(request.request_id)
-                    _sync_and_clear_cache(self._stream)
-                    self._cleanup_prefill_abort_request(request)
-                    continue
-                except Exception as e:
-                    from .patches.specprefill import cleanup_rope
-
-                    logger.error(f"SpecPrefill sparse prefill failed: {e}")
-                    cleanup_rope(self.model)
-                    request.specprefill_indices = None
-                    tracker.remove(request.request_id)
-                    if cache_to_use is not None:
-                        # run_specprefill_target_prefill bases its prefill on
-                        # the restored prefix cache when the request had a
-                        # cache hit (#2443), and may have appended partial KV
-                        # to it in place before failing. Re-prefilling the
-                        # post-hit remainder on top would double-write those
-                        # positions, so drop the hit and prefill the full
-                        # prompt from scratch.
-                        logger.info(
-                            f"Request {request.request_id}: dropping "
-                            f"{request.cached_tokens}-token prefix-cache hit "
-                            "after sparse-prefill failure, re-prefilling the "
-                            "full prompt"
-                        )
-                        cache_to_use = None
-                        request.prompt_cache = None
-                        request.cached_tokens = 0
-                        request.remaining_tokens = request.prompt_token_ids
-                        tokens_to_process = request.prompt_token_ids
-                    # Fall through to normal prefill
-            # External prefill: process tokens[0:N-1] outside BatchGenerator.
-            # Only the last token goes to insert() for the first decode step.
-            # SpecPrefill already handled its own prefill above, so skip for those.
-            if request.specprefill_indices is None and len(tokens_to_process) > 1:
+            if len(tokens_to_process) > 1:
                 vlm_embeds = None
                 if request.vlm_inputs_embeds is not None:
                     vlm_embeds = (
@@ -10640,40 +9221,6 @@ class Scheduler:
             if request.sampling_params.seed is not None:
                 mx.random.seed(request.sampling_params.seed)
 
-            # TurboQuant KV is quantized at the end of _do_external_prefill
-            # (fp16 prefill → quantize once); _merge_caches() turns the per
-            # request TQ cache into a BatchTurboQuantKVCache on insert.
-
-            # VLM MTP routing: if a gemma4_assistant drafter is attached, run
-            # an extra last-token forward to capture hidden + shared_kv_states,
-            # sample the first bonus, and hand the request to a vlm_mtp
-            # generator instead of BatchGenerator. Falls through on any
-            # eligibility issue so other speculative paths stay intact.
-            if self._vlm_mtp_drafter is not None and cache_to_use is not None:
-                vlm_mtp_uid = self._route_to_vlm_mtp(
-                    request,
-                    cache_to_use,
-                    tokens_to_process,
-                    sampler,
-                    sm,
-                    logits_processors=logits_processors,
-                )
-                if vlm_mtp_uid is not None:
-                    self.request_id_to_uid[request.request_id] = vlm_mtp_uid
-                    self.uid_to_request_id[vlm_mtp_uid] = request.request_id
-                    now = time.monotonic()
-                    request.batch_uid = vlm_mtp_uid
-                    request.status = RequestStatus.RUNNING
-                    request.generation_started_at = now
-                    request.last_activity_at = now
-                    self.running[request.request_id] = request
-                    scheduled.append(request)
-                    self.total_prompt_tokens += request.num_prompt_tokens
-                    logger.debug(
-                        f"Scheduled request {request.request_id} via vlm_mtp "
-                        f"(uid={vlm_mtp_uid}, {request.num_prompt_tokens} prompt tokens)"
-                    )
-                    continue
 
             # Insert into BatchGenerator with pre-filled cache + last token.
             # BatchGenerator only handles decode from here.
@@ -10840,7 +9387,7 @@ class Scheduler:
 
             # Prepend <think> tag for first chunk if this is a reasoning model.
             # Protocol parsers may expose a normalized prefix when their prompt
-            # uses a model-specific open-think marker (e.g. MiniMax <mm:think>).
+# uses a model-specific open-think marker.
             if getattr(request, "needs_think_prefix", False):
                 if not getattr(request, "think_prefix_sent", False):
                     if parser_session is None:
@@ -10961,14 +9508,9 @@ class Scheduler:
                 raw_cache = getattr(response, "prompt_cache", None)
                 if raw_cache is not None:
                     try:
-                        # SpecPrefill: sparse KV data can't be stored in
-                        # paged cache (hash mismatch with full token IDs).
-                        if request.specprefill_indices is not None:
-                            raw_cache = None
-
                         # For paged cache, extract actual tensor states
                         # This allows cache to survive BatchGenerator recreation
-                        elif self.block_aware_cache is not None:
+                        if self.block_aware_cache is not None:
                             extracted_cache, model_cache_config = (
                                 self._extract_cache_states(raw_cache)
                             )
@@ -11019,22 +9561,6 @@ class Scheduler:
         elif self.paged_cache_manager is not None:
             self.paged_cache_manager.delete_block_table(request_id)
 
-        # SpecPrefill primes an independent ``_draft_prefix_cache`` in
-        # ``_try_specprefill_scoring`` whose block refs are tracked
-        # separately from the target ``block_aware_cache``. Without
-        # releasing it on the rejection path a rejected SpecPrefill
-        # request leaks every draft-block ref symmetric to the
-        # target-cache leak the main branch above guards against.
-        draft_cache = getattr(self, "_draft_prefix_cache", None)
-        if draft_cache is not None:
-            try:
-                draft_cache.release_cache(request_id)
-            except Exception:  # noqa: BLE001
-                logger.debug(
-                    "Draft prefix cache release_cache(%s) raised; ignoring",
-                    request_id,
-                    exc_info=True,
-                )
 
     def _cleanup_finished(self, finished_ids: set[str]) -> None:
         """Clean up finished requests and store caches for reuse."""
@@ -11045,9 +9571,6 @@ class Scheduler:
             with self._phase_timer("cleanup_finished_sync"):
                 _safe_sync_stream(self._stream)
 
-        # SpecPrefill: restore original RoPE if active request finished
-        for rid in finished_ids:
-            self._cleanup_specprefill(rid)
 
         # Remove finished requests from prefill progress tracker.
         tracker = get_prefill_tracker()
@@ -11538,10 +10061,6 @@ class Scheduler:
         self._current_sampler_params = None
         self._boundary_snapshot_required = None
 
-        active_specprefill = self._specprefill_active_request_id
-        if active_specprefill is not None:
-            self._cleanup_specprefill(active_specprefill)
-
         if hasattr(self.model, "clear_vlm_position_state"):
             self.model.clear_vlm_position_state()
         if hasattr(self.model, "clear_pending_embeddings"):
@@ -11799,11 +10318,6 @@ class Scheduler:
         # Reclaim before requeue so the retry starts from a lower baseline.
         self._reclaim_prefill_headroom()
 
-        # Clear any SpecPrefill RoPE patch tied to this request so the retry
-        # re-scores cleanly.
-        if self._specprefill_active_request_id == request.request_id:
-            self._specprefill_active_request_id = None
-
         # Restore mRoPE deltas if an external VLM prefill was interrupted before
         # its own restore ran (value stashed on the request in
         # _do_external_prefill). Benign for non-VLM requests (stash is None).
@@ -11955,19 +10469,9 @@ class Scheduler:
             # Run generation step if we have running requests.
             # Use next_generated() which returns only GenerationBatch.Response
             # objects (prefill is handled externally before insert).
-            if (
-                self.batch_generator is not None or self._vlm_mtp_active
-            ) and self.running:
+            if self.batch_generator is not None and self.running:
                 _t_decode_start = time.perf_counter()
-                if self.batch_generator is not None:
-                    responses = list(self.batch_generator.next_generated())
-                else:
-                    responses = []
-                # Drive vlm_mtp generators alongside BatchGenerator. Order
-                # matters only for log determinism; _process_batch_responses
-                # is per-uid.
-                if self._vlm_mtp_active:
-                    responses.extend(self._step_vlm_mtp())
+                responses = list(self.batch_generator.next_generated())
                 _decode_dt = time.perf_counter() - _t_decode_start
                 self._repay_decode_debt(_decode_dt)
                 self._sample_decode_rate(len(responses), _decode_dt)
@@ -11980,7 +10484,7 @@ class Scheduler:
 
                     # Periodic decode cache materialization for models whose
                     # KV cache update graph can otherwise grow for thousands of
-                    # tokens. MiniMax-M3 has one lazy cache-update chain per
+# tokens. Some models build one lazy cache-update chain per
                     # layer; evaluating the cache state periodically cuts those
                     # references before Metal's resource-count limit is hit.
                     self._tokens_since_kv_cache_eval = getattr(
@@ -12324,10 +10828,7 @@ class Scheduler:
                 self._boundary_snapshot_store.shutdown()
             except Exception as e:
                 logger.warning("Boundary snapshot store shutdown error: %s", e)
-        self._close_specprefill_draft_cache_manager()
         self.paged_cache_manager = None
-        self._draft_prefix_cache = None
-        self._specprefill_draft_model = None
         self.block_aware_cache = None
         self.memory_monitor = None
         self._boundary_snapshot_store = None
@@ -12397,9 +10898,6 @@ class Scheduler:
             except Exception as e:
                 logger.warning("Boundary snapshot store shutdown error: %s", e)
             self._boundary_snapshot_store = None
-        self._close_specprefill_draft_cache_manager()
-        self._draft_prefix_cache = None
-        self._specprefill_draft_model = None
         if self.paged_ssd_cache_manager is not None:
             self.paged_ssd_cache_manager.close()
             self.paged_ssd_cache_manager = None
@@ -12530,7 +11028,7 @@ class Scheduler:
             )
 
             # Classify layer cache types for hybrid models
-            cache_list_for_tq = None
+            cache_list = None
             actual_kv_cache_layers = None
             num_kv_cache_layers = num_layers
             rotating_layer_specs: list[tuple[int, int]] = []
@@ -12540,7 +11038,6 @@ class Scheduler:
             elif collect_kv_layer_specs is not None:
                 try:
                     cache_list = self.model.make_cache()
-                    cache_list_for_tq = cache_list
                     full_layers, rotating_layer_specs, arrays_cache_layers = (
                         collect_kv_layer_specs(cache_list)
                     )
@@ -12560,58 +11057,16 @@ class Scheduler:
                 except Exception:
                     pass
 
-            if (
-                self._turboquant_kv_bits is not None
-                and isinstance(head_dim, int)
-                and not isinstance(head_dim, bool)
-                and head_dim > 0
-                and isinstance(actual_kv_cache_layers, int)
-                and actual_kv_cache_layers > 0
-                and (
-                    self._turboquant_eligible(cache_list_for_tq)
-                    if cache_list_for_tq is not None
-                    else not (
-                        self._model_uses_mla() or self._model_uses_attention_sinks()
-                    )
-                )
-            ):
-                tq_dtype_size = float(self._turboquant_kv_bits) / 8.0 + (2.0 / head_dim)
-                if (
-                    self._turboquant_skip_last
-                    and not isinstance(actual_kv_cache_layers, bool)
-                    and actual_kv_cache_layers > 1
-                ):
-                    dtype_size = (
-                        (actual_kv_cache_layers - 1) * tq_dtype_size + base_dtype_size
-                    ) / actual_kv_cache_layers
-                else:
-                    dtype_size = tq_dtype_size
-
             kv_bytes_per_token = None
-            if estimate_qwen4_exp_kv_bytes_per_token is not None:
-                kv_bytes_per_token = estimate_qwen4_exp_kv_bytes_per_token(
-                    config,
-                    cache_list_for_tq,
-                    base_dtype_size,
-                )
             if (
                 kv_bytes_per_token is None
                 and estimate_mla_kv_bytes_per_token is not None
             ):
                 kv_bytes_per_token = estimate_mla_kv_bytes_per_token(
                     config,
-                    cache_list_for_tq,
+                    cache_list,
                     base_dtype_size,
                 )
-            prefill_memory_profile = (
-                make_prefill_memory_profile(
-                    config,
-                    compute_dtype_size=base_dtype_size,
-                    wsdpa_dtype_supported=_dtype_matches(model_dtype, mx.bfloat16),
-                )
-                if make_prefill_memory_profile is not None
-                else None
-            )
 
             # Truthiness alone isn't enough — MagicMock proxies leaking
             # through the descent (test scaffolds that don't fully spec
@@ -12622,8 +11077,6 @@ class Scheduler:
                 return isinstance(v, int) and not isinstance(v, bool) and v > 0
 
             if _pos_int(num_layers) and _pos_int(num_kv_heads) and _pos_int(head_dim):
-                from .memory_monitor import _ane_prefill_transient_bytes
-
                 self.memory_monitor.set_model_info(
                     num_layers=num_layers,
                     num_kv_heads=num_kv_heads,
@@ -12632,16 +11085,10 @@ class Scheduler:
                     num_attention_heads=num_attention_heads,
                     num_kv_cache_layers=num_kv_cache_layers,
                     # SDPA scores are materialized at the compute/activation
-                    # dtype, not the (possibly fractional TurboQuant) KV width.
+                    # dtype, not the KV storage width.
                     compute_dtype_size=base_dtype_size,
                     kv_bytes_per_token=kv_bytes_per_token,
                     rotating_layer_specs=rotating_layer_specs,
-                    prefill_memory_profile=prefill_memory_profile,
-                    # ANE prefill holds fixed-shape I/O surfaces the first
-                    # long prompt dirties on top of KV+SDPA (issue #2841).
-                    ane_prefill_transient_bytes=_ane_prefill_transient_bytes(
-                        self.model
-                    ),
                 )
                 # Fixed recurrent state (GDN/Mamba) can only be measured from
                 # a live cache after the first forward; arm a one-shot probe.
@@ -12651,20 +11098,6 @@ class Scheduler:
                 # [H, LQ, S] tensor before SDPA; register the transient so
                 # prefill admission prices it (cleared for other models —
                 # the registry is process-wide across model swaps).
-                try:
-                    from .memory_monitor import register_attention_bias_transient
-
-                    model_type = str(getattr(self.model, "model_type", "") or "")
-                    register_attention_bias_transient(
-                        base_dtype_size
-                        if model_type in ("inkling", "inkling_mm_model")
-                        else None
-                    )
-                except Exception:
-                    logger.debug(
-                        "attention-bias transient registration failed",
-                        exc_info=True,
-                    )
                 logger.debug(
                     f"Model info for memory estimation: "
                     f"layers={num_layers} ({num_kv_cache_layers} KVCache, "
@@ -12684,15 +11117,13 @@ class Scheduler:
 
     def _infer_live_layer_cache_types(
         self,
-    ) -> tuple[list[str], float | None, dict[str, list[str]] | None] | None:
+    ) -> tuple[list[str], dict[str, list[str]] | None] | None:
         """Infer the layer-cache signature that future SSD saves will use.
 
-        Returns ``(layer_cache_types, turboquant_kv_bits,
-        cachelist_subtypes)`` — the predicted per-layer type names, the
-        depth requests will quantize at (None when TurboQuant is inactive
-        or ineligible), and the sub composition of mixed CacheList layers
-        (None when the model has none) — or None when no signature can be
-        inferred.
+        Returns ``(layer_cache_types, cachelist_subtypes)`` — the predicted
+        per-layer type names and the sub composition of mixed CacheList
+        layers (None when the model has none) — or None when no signature
+        can be inferred.
         """
         if not HAS_CACHE_TYPE_HANDLERS or ModelCacheConfig is None:
             return None
@@ -12702,7 +11133,7 @@ class Scheduler:
         # defines one, and falls back to plain per-layer KVCache otherwise).
         # Requiring model.make_cache here made the refresh a silent no-op
         # for every plain dense model, so the manager never learned the
-        # TurboQuant layout or bit depth (#2045).
+        # layout (#2045).
         try:
             cache_list = make_prompt_cache(self.model)
         except Exception as e:
@@ -12734,35 +11165,7 @@ class Scheduler:
             logger.debug("Failed to infer CacheList sub composition: %s", e)
             cachelist_subtypes = None
 
-        if self._turboquant_kv_bits is None:
-            return layer_cache_types, None, cachelist_subtypes
-
-        try:
-            eligible = self._turboquant_eligible(cache_list)
-        except Exception as e:
-            # Fail safe: committing an un-rewritten (plain-KV) layout here
-            # would make the stale-signature sweep evict every valid
-            # TurboQuant block, so refuse to infer rather than guess.
-            logger.debug("Failed to evaluate TurboQuant SSD signature: %s", e)
-            return None
-        if not eligible:
-            return layer_cache_types, None, cachelist_subtypes
-
-        kv_indices = [
-            i for i, c in enumerate(cache_list) if _is_turboquant_kv_family_cache(c)
-        ]
-        skip_last = self._turboquant_skip_last and len(kv_indices) > 1
-        last_kv_idx = kv_indices[-1] if skip_last else -1
-        for idx in kv_indices:
-            if idx != last_kv_idx and idx < len(layer_cache_types):
-                layer_cache_types[idx] = "TurboQuantKVCache"
-
-        # The depth is keyed off the same eligibility gate the request path
-        # uses, not the rewritten names: models whose convertible caches sit
-        # inside CacheList layers report bare "CacheList" names at every
-        # depth, so the bits field is the only signature discriminator for
-        # them (#2045).
-        return layer_cache_types, float(self._turboquant_kv_bits), cachelist_subtypes
+        return layer_cache_types, cachelist_subtypes
 
     def refresh_ssd_layer_signature(self) -> list[str] | None:
         """Set the SSD manager's live layer signature before prefix lookup."""
@@ -12772,21 +11175,14 @@ class Scheduler:
 
         inferred = self._infer_live_layer_cache_types()
         if inferred is None:
-            if self._turboquant_kv_bits is not None:
-                logger.warning(
-                    "Could not infer the SSD cache layer signature; "
-                    "TurboQuant bit-depth compatibility checks stay disabled "
-                    "for this session (stale-depth blocks are not swept)."
-                )
             return None
-        layer_cache_types, turboquant_kv_bits, cachelist_subtypes = inferred
+        layer_cache_types, cachelist_subtypes = inferred
 
         try:
             set_signature = getattr(manager, "set_expected_layer_signature", None)
             if callable(set_signature):
                 set_signature(
                     layer_cache_types,
-                    turboquant_kv_bits=turboquant_kv_bits,
                     cachelist_subtypes=cachelist_subtypes,
                 )
             else:
@@ -13174,19 +11570,6 @@ class Scheduler:
             ),
         }
 
-        # Target exact-prefix and draft ordinary-prefix reuse are separate
-        # model-specific caches, so expose their counters independently.
-        draft_prefix_cache = self._draft_prefix_cache
-        if draft_prefix_cache is not None:
-            draft_stats = draft_prefix_cache.get_stats()
-            counters.update(
-                {
-                    "draft_prefix_hits": draft_stats.hits,
-                    "draft_prefix_misses": draft_stats.misses,
-                    "draft_prefix_tokens_saved": draft_stats.tokens_saved,
-                }
-            )
-
         if self.paged_ssd_cache_manager is not None:
             ssd = self.paged_ssd_cache_manager.get_stats()
             hot_hits = ssd.hot_cache_hits
@@ -13264,27 +11647,6 @@ class Scheduler:
                 stats["last_prefix_lookup"] = dict(
                     self._last_prefix_cache_lookup
                 )
-            specprefill_cache_stats = {
-                "target_static_hits": prefix_stats["exact_prefix_hits"],
-                "target_static_misses": prefix_stats["exact_prefix_misses"],
-                "target_static_tokens_restored": prefix_stats[
-                    "exact_prefix_tokens_restored"
-                ],
-                "target_static_stores": prefix_stats["exact_prefix_stores"],
-                "target_static_store_failures": prefix_stats[
-                    "exact_prefix_store_failures"
-                ],
-            }
-            if self._draft_prefix_cache is not None:
-                draft_stats = self._draft_prefix_cache.get_stats()
-                specprefill_cache_stats.update(
-                    {
-                        "draft_prefix_hits": draft_stats.hits,
-                        "draft_prefix_misses": draft_stats.misses,
-                        "draft_prefix_tokens_saved": draft_stats.tokens_saved,
-                    }
-                )
-            stats["specprefill_cache"] = specprefill_cache_stats
 
         counters = self._collect_cache_counters()
         if counters:

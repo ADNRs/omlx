@@ -420,33 +420,6 @@ def _server_arguments(
     )
 
 
-def _distributed_model_type(model_path: str | Path) -> str:
-    """Read the family discriminator used by cluster-only protocol patches."""
-
-    try:
-        config = json.loads((Path(model_path) / "config.json").read_text())
-    except (OSError, TypeError, ValueError):
-        return ""
-    model_type = config.get("model_type") if isinstance(config, dict) else None
-    return str(model_type or "").strip().lower()
-
-
-def _install_distributed_model_protocol(tokenizer: Any, model_path: str | Path) -> str:
-    """Install the normal oMLX model protocol on this distributed rank."""
-
-    model_type = _distributed_model_type(model_path)
-    from omlx.adapter.output_parser import (
-        install_minimax_m3_tokenizer_protocol,
-    )
-
-    installed = install_minimax_m3_tokenizer_protocol(
-        tokenizer,
-        str(model_path),
-        {"model_type": model_type} if model_type else None,
-    )
-    return "minimax_m3" if installed else ""
-
-
 def _execution_settings(args: argparse.Namespace) -> ExecutionSettings:
     return ExecutionSettings(
         profile=args.execution_profile,
@@ -778,7 +751,7 @@ def _unpinned_stage(layer_count: int, rank: int, world_size: int) -> tuple[int, 
     this is called from.
     """
 
-    from omlx.patches.minimax_m3_mlx_lm.pipeline_patch import (
+    from .pipeline_compat import (
         assigned_stage,
         clear_assigned_stage,
         effective_stage,
@@ -1003,13 +976,7 @@ def run_worker(args: argparse.Namespace) -> int:
     preserve_failure_marker = False
     try:
         # Register oMLX's model classes before MLX-LM resolves the
-        # architecture. Several types oMLX serves — glm_moe_dsa, deepseek_v4,
-        # minimax_m3, step3p7, llama4 — do not exist in stock MLX-LM; oMLX
-        # injects them here on its single-node path. Without this a rank fails
-        # with "Pipeline loading is only supported for MLX converted models" or
-        # a wall of missing indexer weights, after the model has been staged
-        # and partly loaded. Same call the LLM engine makes.
-        # Refuse a stage this Mac cannot hold, using the same admission
+        # architecture. Some types oMLX serves do not exist in stock MLX-LM;        # oMLX injects them here on its single-node path. Without this a rank        # fails with "Pipeline loading is only supported for MLX converted        # models", after the model has been staged and partly loaded. Same        # call the LLM engine makes.        # Refuse a stage this Mac cannot hold, using the same admission
         # ceiling the single-node engine pool admits against. Checked *before*
         # any weights are read: without it a rank loads until the OS gives up,
         # taking the machine with it.
@@ -1061,17 +1028,14 @@ def run_worker(args: argparse.Namespace) -> int:
         maybe_apply_pre_load_patches(args.model)
         # MLX-LM's pipeline shard selection rejects any parameter absent
         # from the safetensors index, though it loads with strict=False
-        # moments later. Architectures oMLX patches in (glm_moe_dsa's
-        # indexer weights) legitimately have such parameters.
-        apply_mlx_lm_pipeline_index_patch()
+        # moments later. Architectures oMLX patches in legitimately have such        # parameters.        apply_mlx_lm_pipeline_index_patch()
 
         # Pin this rank's stage so the loader honours the plan instead of an
         # even split. Must precede load: mlx-lm builds the model and calls
         # pipeline() inside load_default().
-        from omlx.patches.minimax_m3_mlx_lm.pipeline_patch import (
+        from .pipeline_compat import (
             set_assigned_stage,
         )
-
         with install_pipeline_compatibility(assignments):
             # Compatibility hooks are installed before asking about support,
             # so the answer describes the exact methods load_default() will
@@ -1125,16 +1089,11 @@ def run_worker(args: argparse.Namespace) -> int:
                 ),
             ):
                 provider.load_default()
-            protocol = _install_distributed_model_protocol(
-                provider.tokenizer,
-                args.model,
-            )
             # Recorded before validation, so a marker read after a stage
             # mismatch still says which layers were built.
             marker.update(
                 "loading",
                 load_stage="validating",
-                output_protocol=protocol or None,
                 **_loaded_stage(provider.model),
             )
             # Validate the loaded pipeline stage before any TP mutation
@@ -1167,7 +1126,6 @@ def run_worker(args: argparse.Namespace) -> int:
                         profile.to_dict() for profile in performance_profiles
                     ],
                     optimizations=optimizations,
-                    output_protocol=protocol or None,
                 )
                 _emit_event(
                     {

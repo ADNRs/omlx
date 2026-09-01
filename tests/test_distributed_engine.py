@@ -808,21 +808,6 @@ async def test_experimental_token_only_output_rejects_seeded_single_request():
         await engine._client.aclose()
 
 
-@pytest.mark.asyncio
-async def test_distributed_preflight_rejects_features_before_stream_starts():
-    engine = _ready_engine(lambda request: httpx.Response(500))
-    try:
-        # thinking_budget is now supported: it is forwarded to the rank inside
-        # chat_template_kwargs instead of being rejected.
-        with pytest.raises(ValueError, match="SpecPrefill"):
-            await engine.preflight_chat(
-                [{"role": "user", "content": "hello"}],
-                specprefill=True,
-            )
-    finally:
-        await engine._client.aclose()
-
-
 # ---------------------------------------------------------------------------
 # reasoning_effort fallback: the distributed engine cannot render the chat
 # template itself (only rank-zero can), so an unsupported value must be

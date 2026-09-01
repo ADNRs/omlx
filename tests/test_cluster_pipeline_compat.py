@@ -62,10 +62,3 @@ def test_a_custom_unmarked_pipeline_remains_fail_closed(tmp_path):
         assert not pipeline_assignment_is_honored(model)
 
 
-def test_minimax_declares_its_wrapped_assigned_stage_contract(tmp_path):
-    from omlx.utils.model_loading import maybe_apply_pre_load_patches
-
-    model = _model_config(tmp_path, "minimax_m3_vl")
-    maybe_apply_pre_load_patches(str(model))
-
-    assert pipeline_assignment_is_honored(model)

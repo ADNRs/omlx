@@ -100,21 +100,6 @@ def _set_verify_qmm_armed(flag: bool) -> None:
         pass
 
 
-def _set_dspark_target_verify(model: Any, flag: bool) -> None:
-    try:
-        import sys
-
-        host = _dspark_host(model)
-        if host is None:
-            return
-        module = sys.modules.get(type(host).__module__)
-        setter = getattr(module, "set_dspark_verify_armed", None)
-        if setter is not None:
-            setter(flag)
-    except Exception:
-        pass
-
-
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -125,7 +110,7 @@ def apply() -> bool:
 
     One-shot by design: the wraps capture ``original_*`` in closures so
     re-applying would chain wraps and double-init. ``GenerationBatch`` is
-    not touched by dflash so the leftover-class-patch risk that motivates
+    not touched by external hooks so the leftover-class-patch risk that motivates
     self-healing elsewhere doesn't apply here.
     """
     try:
@@ -305,8 +290,8 @@ def _model_has_mtp_module(model: Any) -> bool:
 
     The ``mtp_forward`` method is added to the class unconditionally by
     the patch, but the per-instance ``mtp`` module is only attached when
-    ``mtp_enabled`` was True at load time (see qwen35_model._patch_model
-    and deepseek_v4_model._patch_model). Without the inner module the
+    ``mtp_enabled`` was True at load time (see qwen35_model._patch_model).
+    Without the inner module the
     ``mtp_forward`` call would AttributeError, so we gate eligibility on
     the actual module's presence.
     """
@@ -1347,9 +1332,9 @@ def _snap_snapshotable(procs):
     """Checkpoint state of processors exposing ``snapshot_state`` (budget).
 
     Returns ``None`` when no processor supports position-keyed rewind, so
-    callers can skip the restore unconditionally (the DSpark path applies
-    processors to speculative draft positions; only the budget processor
-    tracks position-sensitive mutable state today).
+    callers can skip the restore unconditionally (speculative draft
+    positions do get processors applied; only the budget processor tracks
+    position-sensitive mutable state today).
     """
     if not procs:
         return None
@@ -1525,17 +1510,13 @@ def _call_backbone(
     kwargs = {"cache": cache, "return_hidden": True}
     if n_confirmed:
         kwargs["n_confirmed"] = n_confirmed
-    dspark_verify = bool(n_confirmed and _dspark_host(model) is not None)
     _rollback_mod.set_undo_armed(True)
-    # The affine verify qmm kernel is a Qwen-specific optimization. Keep the
-    # DeepSeek target on its architecture-native quantized linear path.
-    _set_verify_qmm_armed(not dspark_verify)
-    _set_dspark_target_verify(model, dspark_verify)
+    # The affine verify qmm kernel is a Qwen-specific optimization; arm it
+    # for every MTP target forward.
+    _set_verify_qmm_armed(True)
     try:
         result = model(inputs, **kwargs)
     finally:
-        if dspark_verify:
-            _set_dspark_target_verify(model, False)
         _set_verify_qmm_armed(False)
         _rollback_mod.set_undo_armed(False)
 
@@ -1837,11 +1818,9 @@ class _DepthController:
 
     Depth 0 — the escape hatch: speculation is only profitable while the
     multi-token verify forward is cheap relative to a plain decode step.
-    On models with a large L=1 -> L=2 forward-cost jump (gemma4 head_dim
-    256/512 leaves the single-token attention kernel; MoE expert loads
+    On models with a large L=1 -> L=2 forward-cost jump (MoE expert loads
     scale with verify tokens) the whole depth menu can be worse than
-    standard decoding — measured 0.67x on gemma4 26B story/16k with the
-    best depth choice. Depth 0 runs the cycle as a plain 1-token step
+    standard decoding with the best depth choice. Depth 0 runs the cycle as a plain 1-token step
     ([next_main] only, no drafts, no rollback) whose cost is tracked as
     ``t[0]`` through the same EMA/probe machinery, so the controller
     parks at 0 when every speculative depth loses and re-enters through
@@ -2192,95 +2171,6 @@ def _resolve_draft_sampler(gen_batch: Any, state: _MtpState):
     return state.draft_sampler
 
 
-def _dspark_host(model: Any) -> Optional[Any]:
-    """Return the model object that owns an active embedded DSpark head."""
-    candidates = [model]
-    for attr in ("language_model", "_language_model"):
-        inner = getattr(model, attr, None)
-        if inner is not None and inner is not model:
-            candidates.append(inner)
-    for candidate in candidates:
-        if getattr(candidate, "_omlx_dspark_decode_enabled", False):
-            return candidate
-    return None
-
-
-def _dspark_next_drafts(
-    gen_batch: Any,
-    state: _MtpState,
-    hidden_rows: Any,
-    committed: Any,
-    prev_buf: Optional[Any],
-) -> None:
-    """Append committed target taps and sample one DSpark block.
-
-    The expensive three-stage decoder runs once over anchor+noise positions.
-    A rank-R Markov head then samples left-to-right, preserving DSpark's
-    intra-block dependency without another decoder pass.
-    """
-    import mlx.core as mx
-
-    host = _dspark_host(gen_batch.model)
-    if host is None:
-        raise _MtpStepFallback("embedded DSpark host is unavailable")
-
-    depth = state.controller.cur if state.controller is not None else state.depth
-    depth = min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
-    n = int(committed.shape[0])
-    if depth <= 0:
-        host.dspark_append_context(hidden_rows, state.mtp_cache)
-        state.hist_offset += n
-        state.drafts = mx.zeros((0,), dtype=mx.uint32)
-        state.draft_lps = []
-        state.draft_accept_lps = []
-        return
-
-    anchor = committed[-1:].reshape(1, 1)
-    logits, _ = host.dspark_forward(
-        hidden_rows,
-        anchor,
-        state.mtp_cache,
-        draft_length=depth,
-    )
-    state.hist_offset += n
-
-    sampler = _resolve_sampler(gen_batch)
-    procs = _proc_list(gen_batch)
-    draft_toks: List[Any] = []
-    draft_lps: List[Any] = []
-    draft_accept_lps: List[Any] = []
-    previous = anchor.reshape(1)
-
-    # Drafts are speculative — processor calls shape the draft
-    # distribution but must not advance the thinking budget (they would
-    # count tokens that are only emitted if verified later). Checkpoint
-    # before the loop and rewind after.
-    snap = _snap_snapshotable(procs)
-
-    for idx in range(depth):
-        bias, _ = host.dspark_markov(previous)
-        logits_2d = logits[:, idx, :] + bias
-        if procs is not None and prev_buf is not None:
-            prefix = mx.concatenate(
-                [prev_buf.astype(mx.int32), anchor.reshape(1).astype(mx.int32)]
-                + [token.reshape(1).astype(mx.int32) for token in draft_toks]
-            )
-            logits_2d = _apply_processors(procs, prefix, logits_2d)
-        lp_2d = _logprobs(logits_2d)
-        token = _ensure_uint32(sampler(lp_2d))
-        draft_toks.append(token)
-        draft_lps.append(lp_2d.squeeze(0))
-        draft_accept_lps.append(_accept_lp_for(sampler, lp_2d).squeeze(0))
-        previous = token.reshape(1)
-
-    _restore_snapshotable(procs, snap)
-
-    state.drafts = mx.concatenate(draft_toks)
-    state.draft_lps = draft_lps
-    state.draft_accept_lps = draft_accept_lps
-    mx.async_eval(state.drafts)
-
-
 def _chain_next_drafts(
     gen_batch: Any,
     state: _MtpState,
@@ -2292,8 +2182,7 @@ def _chain_next_drafts(
 
     ``hidden_rows`` is the trunk hidden at the positions of the n tokens
     *preceding* each committed token — (1, n, H) pre-norm for Qwen (the
-    final trunk norm is applied here), or the model's native 4D raw hidden
-    for DeepSeek-V4 (passed through untouched); ``committed`` is the (n,)
+    final trunk norm is applied here); ``committed`` is the (n,)
     uint32 committed tokens. One batched head forward appends n committed
     history entries and yields the next cycle's first draft logits for free
     (its last entry pairs the newest committed token with the hidden of its
@@ -2310,25 +2199,16 @@ def _chain_next_drafts(
     import mlx.core as mx
 
     model = gen_batch.model
-    if _dspark_host(model) is not None:
-        return _dspark_next_drafts(
-            gen_batch,
-            state,
-            hidden_rows,
-            committed,
-            prev_buf,
-        )
     sampler = _resolve_draft_sampler(gen_batch, state)
     procs = _proc_list(gen_batch)
 
     depth = state.controller.cur if state.controller is not None else state.depth
     if depth == 0 and not state.mtp_cache:
-        # Depth-0 with a stateless head (no cache to keep warm, e.g. the
-        # gemma4 assistant): skip the fold entirely — on fast backbones its
-        # head forward + trunk norm is a measurable per-step tax (~15% of a
-        # plain step on gemma4 26B) that would keep the parked throughput
-        # below baseline. Head-history models keep folding below so their
-        # cache stays consistent for re-entry.
+        # Depth-0 with a stateless head (no cache to keep warm): skip the
+        # fold entirely — on fast backbones the head forward + trunk norm
+        # is a measurable per-step tax that would keep the parked
+        # throughput below baseline. Head-history models keep folding below
+        # so their cache stays consistent for re-entry.
         state.drafts = mx.zeros((0,), dtype=mx.uint32)
         state.draft_lps = []
         state.draft_accept_lps = []
@@ -2372,7 +2252,7 @@ def _chain_next_drafts(
     if state.head_clone and depth > 1:
         chain_cache = _clone_mtp_head_cache(state.mtp_cache)
 
-    # Speculative draft shaping — see _dspark_next_drafts.
+    # Speculative draft shaping.
     snap = _snap_snapshotable(procs)
 
     for j in range(depth):
@@ -3046,7 +2926,7 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
     # bonus/verify correction); rows m+1..k predicted rejected drafts that
     # are re-verified next cycle, so their processor calls must be undone
     # (they would over-count the thinking budget / corrupt state). Mirrors
-    # MTPProcessingSampler's position-keyed snapshot/restore on vlm_mtp.
+    # speculative paths' position-keyed snapshot/restore semantics.
     # Uses the FINAL m (after the model clamp and boundary alignment above).
     if m < k and row_snaps[m] is not None:
         _restore_snapshotable(procs, row_snaps[m])

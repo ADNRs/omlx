@@ -417,17 +417,22 @@ def _gated_delta_chunked_metal_seg(
 #   - k/q/v are staged into threadgroup memory in TB-token blocks with
 #     coalesced cooperative loads. The stock kernel re-reads k/q from device
 #     once per (Dv/4)-slice threadgroup => 32x redundant traffic (~13 GB per
-#     16k-token layer). Here each v-head is split into Dv/16 blocks => 8x
-#     fewer threadgroups touching the same k/q rows, and each row is read
-#     from device exactly once per threadgroup.
-#   - State stays in registers: thread owns (dv, 16-wide d-range) fragments;
-#     the k.state and q.state contractions reduce across the 8 threads of a
+#     16k-token layer). Here each v-head is split into DB-row blocks => fewer
+#     threadgroups touching the same k/q rows, and each row is read from
+#     device exactly once per threadgroup.
+#   - State stays in registers: a thread owns (dv, SEG-wide d-range) fragments;
+#     the k.state and q.state contractions reduce across the SEGS threads of a
 #     dv row via simd_shuffle_down (no threadgroup barriers in the hot loop).
+#
+# Thread mapping (SEGS x SEG): SEGS threads cooperate per dv row, each owning
+# a SEG-wide d-slice of the state. SEGS=8/SEG=16 was the original mapping;
+# SEGS=4/SEG=32 (wider per-thread fragments, shorter reduction tree, same
+# threadgroup count of 96 for the 128/128 layout) measures ~10% faster at
+# prefill shapes and is the default for Dk=128 models.
 # ---------------------------------------------------------------------------
 
 _KERNEL_S_SRC = """
     constexpr int TB = 32;                             // time block
-    constexpr int DB = 32;                             // dv rows per threadgroup
     const int tid = thread_position_in_threadgroup.x;  // 0..255
     const int blk = threadgroup_position_in_grid.x;    // Dv/DB block
     const int hv  = threadgroup_position_in_grid.y;
@@ -435,11 +440,11 @@ _KERNEL_S_SRC = """
     const int hk  = hv / (Hv / Hk);
     const int dv0 = blk * DB;
 
-    // thread -> (dv row, 16-wide d segment); 8 threads per dv row, all in
-    // the same simdgroup (lane = (dv%4)*8 + seg).
-    const int dv  = tid / 8;            // 0..31
-    const int seg = tid % 8;            // 0..7
-    const int d0  = seg * 16;
+    // thread -> (dv row, SEG-wide d segment); SEGS threads per dv row, all in
+    // the same simdgroup.
+    const int dv  = tid / SEGS;         // DB rows per threadgroup
+    const int seg = tid % SEGS;         // SEGS segments x SEG
+    const int d0  = seg * SEG;
 
     threadgroup InT k_s[TB][Dk + 8];
     threadgroup InT q_s[TB][Dk + 8];
@@ -452,12 +457,12 @@ _KERNEL_S_SRC = """
     const device InT* v_base = v + ((size_t)b * T * Hv + hv) * Dv + dv0;
     const size_t krow = (size_t)Hk * Dk;
 
-    // state fragment in registers: [dv0+dv][d0..d0+16]
-    float4 st[4];
+    // state fragment in registers: [dv0+dv][d0..d0+SEG]
+    float4 st[SEG / 4];
     {
         const device float4* S_in = (const device float4*)(
             state_in + (((size_t)b * Hv + hv) * Dv + dv0 + dv) * Dk + d0);
-        for (int i = 0; i < 4; ++i) st[i] = S_in[i];
+        for (int i = 0; i < SEG / 4; ++i) st[i] = S_in[i];
     }
 
     device InT* y_base = y + ((size_t)b * T * Hv + hv) * Dv + dv0;
@@ -487,31 +492,27 @@ _KERNEL_S_SRC = """
                 (const threadgroup vec<InT,4>*)&k_s[t][d0];
             const threadgroup vec<InT,4>* q4 =
                 (const threadgroup vec<InT,4>*)&q_s[t][d0];
-            float4 kf[4];
-            for (int i = 0; i < 4; ++i) kf[i] = float4(k4[i]);
+            float4 kf[SEG / 4];
+            for (int i = 0; i < SEG / 4; ++i) kf[i] = float4(k4[i]);
             // kv_mem = (g*state) . k ; decay applied to state first
             float4 p4 = 0.0f;
-            for (int i = 0; i < 4; ++i) {
+            for (int i = 0; i < SEG / 4; ++i) {
                 st[i] *= gt;
                 p4 += st[i] * kf[i];
             }
             float part = p4.x + p4.y + p4.z + p4.w;
-            // reduce across the 8 segment-threads of this dv row
-            part += simd_shuffle_down(part, 4);
-            part += simd_shuffle_down(part, 2);
-            part += simd_shuffle_down(part, 1);
-            const float kv_mem = simd_shuffle(part, (tid % 32) / 8 * 8);
+            // reduce across the SEGS segment-threads of this dv row
+{REDUCE_PART}
+            const float kv_mem = simd_shuffle(part, (tid % 32) / SEGS * SEGS);
             const float delta = ((float)v_s[t][dv] - kv_mem) * bt;
 
             float4 o4 = 0.0f;
-            for (int i = 0; i < 4; ++i) {
+            for (int i = 0; i < SEG / 4; ++i) {
                 st[i] += kf[i] * delta;
                 o4 += st[i] * float4(q4[i]);
             }
             float out = o4.x + o4.y + o4.z + o4.w;
-            out += simd_shuffle_down(out, 4);
-            out += simd_shuffle_down(out, 2);
-            out += simd_shuffle_down(out, 1);
+{REDUCE_OUT}
             if (seg == 0) {
                 y_base[(size_t)(t0 + t) * Hv * Dv + dv] = (InT)out;
             }
@@ -522,12 +523,36 @@ _KERNEL_S_SRC = """
     {
         device float4* S_out = (device float4*)(
             state_out + (((size_t)b * Hv + hv) * Dv + dv0 + dv) * Dk + d0);
-        for (int i = 0; i < 4; ++i) S_out[i] = st[i];
+        for (int i = 0; i < SEG / 4; ++i) S_out[i] = st[i];
     }
 """
 
 _SUPPORTED_BLOCK_T = (16, 32, 48)
-_kernel_s_by_tb = {}
+_SUPPORTED_SEG_TREES = (2, 4, 8, 16)
+_threadgroup = 256
+_kernel_s_by_cfg = {}
+
+
+def _reduce_tree(segs: int) -> str:
+    offs = []
+    o = segs // 2
+    while o >= 1:
+        offs.append(o)
+        o //= 2
+    return "\n".join(
+        f"            part += simd_shuffle_down(part, {o});" for o in offs
+    )
+
+
+def _out_reduce_tree(segs: int) -> str:
+    offs = []
+    o = segs // 2
+    while o >= 1:
+        offs.append(o)
+        o //= 2
+    return "\n".join(
+        f"            out += simd_shuffle_down(out, {o});" for o in offs
+    )
 
 
 def _normalize_block_t(block_t: int | str | None, input_dtype=None) -> int:
@@ -548,21 +573,69 @@ def _normalize_block_t(block_t: int | str | None, input_dtype=None) -> int:
     return block_t
 
 
-def _get_kernel_s(block_t: int | str | None = None, input_dtype=None):
-    block_t = _normalize_block_t(block_t, input_dtype)
-    kernel = _kernel_s_by_tb.get(block_t)
-    if kernel is None:
-        source = _KERNEL_S_SRC.replace(
-            "constexpr int TB = 32;", f"constexpr int TB = {block_t};"
+def _normalize_segs(segs: int | str | None, dk: int, dv: int) -> int:
+    """Pick the d-segment cooperation width for Kernel S.
+
+    Default SEGS=4 (32-wide fragments at Dk=128): wider register fragments and
+    a shorter shuffle-reduction tree, ~10% faster at prefill shapes. Falls
+    back to the legacy SEGS=8 mapping when the wide-fragment geometry does not
+    fit (Dk not divisible by 32, or the derived DB-row block does not divide
+    Dv), and raises only when no mapping can address the layout.
+    """
+    if segs is None:
+        configured_segs = os.environ.get("OMLX_GDN_SEGS")
+        if configured_segs is not None:
+            segs = configured_segs
+        else:
+            # Heuristic default; may fall back to the legacy mapping below.
+            segs = 4 if dk % 32 == 0 and dv % 64 == 0 else 8
+            if _segs_fits(segs, dk, dv):
+                return segs
+            if _segs_fits(8, dk, dv):
+                return 8
+            raise ValueError(
+                f"No valid d-segment mapping for Dk={dk}, Dv={dv}"
+            )
+    segs = int(segs)
+    if not _segs_fits(segs, dk, dv):
+        raise ValueError(
+            f"OMLX_GDN_SEGS={segs} does not fit Dk={dk}, Dv={dv}"
         )
+    return segs
+
+
+def _segs_fits(segs: int, dk: int, dv: int) -> bool:
+    db = _threadgroup // segs
+    return (
+        segs in _SUPPORTED_SEG_TREES
+        and dk % segs == 0
+        and (dk // segs) % 4 == 0
+        and dv % db == 0
+    )
+
+
+def _get_kernel_s(
+    block_t: int | str | None = None,
+    input_dtype=None,
+    segs: int = 4,
+    seg: int = 32,
+):
+    block_t = _normalize_block_t(block_t, input_dtype)
+    cache_key = (block_t, segs, seg)
+    kernel = _kernel_s_by_cfg.get(cache_key)
+    if kernel is None:
+        source = _KERNEL_S_SRC.replace("constexpr int TB = 32;",
+                                       f"constexpr int TB = {block_t};")
+        source = source.replace("{REDUCE_PART}", _reduce_tree(segs))
+        source = source.replace("{REDUCE_OUT}", _out_reduce_tree(segs))
         kernel = mx.fast.metal_kernel(
-            name=f"omlx_gdn_blocked_seq_tb{block_t}",
+            name=f"omlx_gdn_blocked_seq_tb{block_t}_segs{segs}_seg{seg}",
             input_names=["q", "k", "v", "g", "beta", "state_in", "T"],
             output_names=["y", "state_out"],
             source=source,
             header=_HEADER,
         )
-        _kernel_s_by_tb[block_t] = kernel
+        _kernel_s_by_cfg[cache_key] = kernel
     return kernel
 
 
@@ -587,12 +660,24 @@ def gated_delta_blocked_seq(
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
     g = g.astype(mx.float32)
     beta = beta.astype(mx.float32)
-    ks = _get_kernel_s(block_t, in_dtype)
+    segs = _normalize_segs(None, Dk, Dv)
+    seg = Dk // segs
+    db = _threadgroup // segs
+    ks = _get_kernel_s(block_t, in_dtype, segs, seg)
     y, state_out = ks(
         inputs=[q, k, v, g, beta, state, T],
-        template=[("InT", in_dtype), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv)],
-        grid=(256 * (Dv // 32), Hv, B),
-        threadgroup=(256, 1, 1),
+        template=[
+            ("InT", in_dtype),
+            ("Dk", Dk),
+            ("Dv", Dv),
+            ("Hk", Hk),
+            ("Hv", Hv),
+            ("DB", db),
+            ("SEGS", segs),
+            ("SEG", seg),
+        ],
+        grid=(_threadgroup * (Dv // db), Hv, B),
+        threadgroup=(_threadgroup, 1, 1),
         output_shapes=[(B, T, Hv, Dv), state.shape],
         output_dtypes=[in_dtype, mx.float32],
     )

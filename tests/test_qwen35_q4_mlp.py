@@ -446,10 +446,10 @@ def test_qwen35_q4_prefill_linear_patch_routes_supported_only(monkeypatch):
 def test_qwen35_q4_lm_attention_uses_sdpa_installed_after_the_patch(monkeypatch):
     """The patch must not freeze the SDPA it saw at install time (issue #2372).
 
-    TurboQuant installs its own dispatcher when a TQ-enabled model loads, which
-    happens after this patch whenever any earlier load ran without TurboQuant.
-    A frozen reference kept routing TurboQuant caches into the plain mlx-lm SDPA,
-    which raised 'TurboQuantKVCache' object has no attribute 'group_size'.
+    Another patch installs its own dispatcher when a model loads, which happens
+    after this patch whenever any earlier load ran without it. A frozen
+    reference kept routing foreign caches into the plain mlx-lm SDPA, which
+    raised "object has no attribute 'group_size'".
     """
     _require_q4_kernel()
     import importlib
@@ -513,7 +513,7 @@ def test_qwen35_q4_lm_attention_uses_sdpa_installed_after_the_patch(monkeypatch)
         assert q4patch.apply_qwen35_q4_lm_prefill_linear_patch() is True
 
         # Install the replacement dispatcher only after the patch is in place,
-        # the way a later TurboQuant-enabled model load does.
+        # the way a later patched model load does.
         attn_module = importlib.import_module(qwen35.Attention.__module__)
         monkeypatch.setattr(attn_module, "scaled_dot_product_attention", sentinel_sdpa)
 
@@ -757,52 +757,6 @@ def _quantize_module_linears(module, names, bits=4):
         )
 
 
-def test_muse_glimmer_q4_attention_wrapper_matches_bf16_reference(monkeypatch):
-    from omlx.patches.mlx_vlm_muse_glimmer_compat import (
-        apply_mlx_vlm_muse_glimmer_compat_patch,
-    )
-
-    apply_mlx_vlm_muse_glimmer_compat_patch()
-    from mlx_vlm.models.muse_glimmer.language import Attention
-
-    import omlx.patches.qwen35_q4_mlp as q4patch
-
-    monkeypatch.setattr(
-        q4patch, "_can_route_affine_linear", lambda *args, **kwargs: True
-    )
-    monkeypatch.setattr(
-        q4patch, "_can_route_affine_linear_shape", lambda *args, **kwargs: True
-    )
-    monkeypatch.setattr(
-        q4patch,
-        "_linear_qmm",
-        lambda linear, inputs, variant: linear(inputs),
-    )
-
-    mx.random.seed(0)
-    attn = Attention(_tiny_muse_text_config(), 1)
-    attn.set_dtype(mx.bfloat16)
-    _quantize_module_linears(
-        attn, ("q_proj", "k_proj", "v_proj", "gate_proj", "o_proj")
-    )
-    original_call = getattr(
-        Attention,
-        "_omlx_q4_muse_attn_original_call",
-        Attention.__call__,
-    )
-    patched_call = q4patch._make_patched_muse_attention(
-        original_call,
-        variant=8,
-        min_tokens=1,
-        q8_min_tokens=1,
-    )
-
-    inputs = mx.random.normal((1, 64, 128)).astype(mx.bfloat16)
-    patched = patched_call(attn, inputs, mask=None, cache=None)
-    reference = original_call(attn, inputs, mask=None, cache=None)
-    mx.eval(patched, reference)
-
-    assert bool(mx.array_equal(patched, reference))
 
 
 def _assert_muse_qmm_close(actual, expected):
@@ -828,94 +782,7 @@ def _install_muse_qmm_spy(monkeypatch):
     return calls
 
 
-def test_muse_glimmer_q4_mlp_patch_matches_bf16_reference(monkeypatch):
-    _muse_applied()
-    from mlx_vlm.models.muse_glimmer.language import MLP
-
-    calls = _install_muse_qmm_spy(monkeypatch)
-
-    mx.random.seed(0)
-    mlp = MLP(_tiny_muse_text_config())
-    mlp.set_dtype(mx.bfloat16)
-    _quantize_module_linears(mlp, ("gate_proj", "up_proj", "down_proj"))
-    orig_call = type(mlp)._omlx_q4_mlp_original_call
-
-    prefill = mx.random.normal((1, 2048, 128)).astype(mx.bfloat16)
-    decode = mx.random.normal((1, 1, 128)).astype(mx.bfloat16)
-
-    patched_out = mlp(prefill)
-    orig_out = orig_call(mlp, prefill)
-    mx.eval(patched_out, orig_out)
-    assert calls["count"] == 3
-    _assert_muse_qmm_close(patched_out, orig_out)
-
-    calls["count"] = 0
-    patched_out = mlp(decode)
-    orig_out = orig_call(mlp, decode)
-    mx.eval(patched_out, orig_out)
-    assert calls["count"] == 0
-    assert bool(mx.array_equal(patched_out, orig_out))
 
 
-def test_muse_glimmer_q4_attention_patch_matches_bf16_reference(monkeypatch):
-    _muse_applied()
-    from mlx_vlm.models.muse_glimmer.language import Attention
-
-    calls = _install_muse_qmm_spy(monkeypatch)
-
-    mx.random.seed(0)
-    config = _tiny_muse_text_config()
-    for layer_idx in (0, 1):  # sliding+rope and full+NoPE
-        attn = Attention(config, layer_idx)
-        attn.set_dtype(mx.bfloat16)
-        _quantize_module_linears(
-            attn, ("q_proj", "k_proj", "v_proj", "gate_proj", "o_proj")
-        )
-        orig_call = type(attn)._omlx_q4_muse_attn_original_call
-
-        prefill = mx.random.normal((1, 2048, 128)).astype(mx.bfloat16)
-        decode = mx.random.normal((1, 1, 128)).astype(mx.bfloat16)
-
-        calls["count"] = 0
-        patched_out = attn(prefill, mask=None, cache=None)
-        orig_out = orig_call(attn, prefill, mask=None, cache=None)
-        mx.eval(patched_out, orig_out)
-        assert calls["count"] == 5
-        _assert_muse_qmm_close(patched_out, orig_out)
-
-        calls["count"] = 0
-        patched_out = attn(decode, mask=None, cache=None)
-        orig_out = orig_call(attn, decode, mask=None, cache=None)
-        mx.eval(patched_out, orig_out)
-        assert calls["count"] == 0
-        assert bool(mx.array_equal(patched_out, orig_out))
 
 
-def test_muse_glimmer_q4_attention_patch_with_cache_and_mask(monkeypatch):
-    _muse_applied()
-    from mlx_lm.models.base import create_attention_mask
-    from mlx_vlm.models.cache import RotatingKVCache
-    from mlx_vlm.models.muse_glimmer.language import Attention
-
-    calls = _install_muse_qmm_spy(monkeypatch)
-
-    mx.random.seed(0)
-    config = _tiny_muse_text_config()
-    attn = Attention(config, 0)  # sliding layer
-    attn.set_dtype(mx.bfloat16)
-    _quantize_module_linears(
-        attn, ("q_proj", "k_proj", "v_proj", "gate_proj", "o_proj")
-    )
-    orig_call = type(attn)._omlx_q4_muse_attn_original_call
-
-    x = mx.random.normal((1, 2048, 128)).astype(mx.bfloat16)
-    cache_a = RotatingKVCache(max_size=64)
-    cache_b = RotatingKVCache(max_size=64)
-    mask = create_attention_mask(x, cache_a, window_size=64)
-
-    patched_out = attn(x, mask=mask, cache=cache_a)
-    orig_out = orig_call(attn, x, mask=mask, cache=cache_b)
-    mx.eval(patched_out, orig_out)
-    assert calls["count"] == 5
-    _assert_muse_qmm_close(patched_out, orig_out)
-    assert cache_a.offset == cache_b.offset

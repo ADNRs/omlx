@@ -14,7 +14,6 @@ from omlx.cluster.inference_worker import (
     _bind_generation_thread_stream,
     _cross_thread_generation_stream,
     _execution_settings,
-    _install_distributed_model_protocol,
     _server_arguments,
     _validate_loaded_stage,
     _validate_measured_weight_bytes,
@@ -24,77 +23,6 @@ from omlx.cluster.inference_worker import (
 from omlx.cluster.planner import PipelineAssignment
 
 GiB = 1024**3
-
-
-def test_distributed_minimax_protocol_replaces_generic_tool_and_thinking_markers(
-    tmp_path,
-):
-    model = tmp_path / "MiniMax-M3-4bit"
-    model.mkdir()
-    (model / "config.json").write_text(json.dumps({"model_type": "minimax_m3_vl"}))
-
-    class Tokenizer:
-        @staticmethod
-        def _tool_parser(*_args):
-            return None
-
-        _tool_call_start = "<tool_call>"
-        _tool_call_end = "</tool_call>"
-        _tool_call_start_tokens = (52,)
-        _tool_call_end_tokens = (53,)
-        _think_start = "<think>"
-        _think_end = "</think>"
-        _think_start_tokens = (54,)
-        _think_end_tokens = (55,)
-
-        @staticmethod
-        def encode(text, add_special_tokens=False):
-            assert add_special_tokens is False
-            return {
-                "]<]minimax[>[<tool_call>": [58, 52],
-                "]<]minimax[>[</tool_call>": [58, 53],
-                "<mm:think>": [59],
-                "</mm:think>": [60],
-            }[text]
-
-    tokenizer = Tokenizer()
-    assert _install_distributed_model_protocol(tokenizer, model) == "minimax_m3"
-    assert tokenizer._tool_call_start == "]<]minimax[>[<tool_call>"
-    assert tokenizer._tool_call_end == "]<]minimax[>[</tool_call>"
-    assert tokenizer._tool_call_start_tokens == (58, 52)
-    assert tokenizer._tool_call_end_tokens == (58, 53)
-    assert tokenizer._think_start == "<mm:think>"
-    assert tokenizer._think_end == "</mm:think>"
-    assert tokenizer._think_start_tokens == (59,)
-    assert tokenizer._think_end_tokens == (60,)
-
-    ns = "]<]minimax[>["
-    parsed = tokenizer._tool_parser(
-        (f'{ns}<invoke name="get_weather">{ns}<city>Paris{ns}</city>{ns}</invoke>'),
-        [
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_weather",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"city": {"type": "string"}},
-                    },
-                },
-            }
-        ],
-    )
-    assert parsed == {"name": "get_weather", "arguments": {"city": "Paris"}}
-
-
-def test_distributed_protocol_leaves_other_model_families_untouched(tmp_path):
-    model = tmp_path / "llama"
-    model.mkdir()
-    (model / "config.json").write_text(json.dumps({"model_type": "llama"}))
-    tokenizer = SimpleNamespace(_tool_call_start="<tool_call>")
-
-    assert _install_distributed_model_protocol(tokenizer, model) == ""
-    assert tokenizer._tool_call_start == "<tool_call>"
 
 
 def test_eager_load_graph_is_visible_to_mlx_lm_generation_thread():
@@ -556,7 +484,7 @@ def _run_rank(
     import omlx.patches.mlx_lm_pipeline_index as pipeline_index
     import omlx.process_memory_enforcer as enforcer
     import omlx.utils.model_loading as model_loading
-    from omlx.patches.minimax_m3_mlx_lm import pipeline_patch
+    from omlx.cluster import pipeline_compat as pipeline_patch
 
     assignments = assignments or _uneven_plan()
     assignment = assignments[rank]
@@ -878,7 +806,7 @@ def test_the_stage_guard_answers_the_same_question_from_either_side_of_the_pin(
     the one state a real launch guarantees is impossible.
     """
 
-    from omlx.patches.minimax_m3_mlx_lm import pipeline_patch
+    from omlx.cluster import pipeline_compat as pipeline_patch
 
     assignments = _uneven_plan()
     calls: list[int] = []

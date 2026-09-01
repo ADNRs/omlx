@@ -440,11 +440,9 @@ def test_public_and_manager_signatures_stamp_expected_layout_settings(tmp_path):
         num_layers=2,
         block_size=2048,
         layer_cache_types=layer_types,
-        turboquant_kv_bits=6,
         cachelist_subtypes={"1": ["ArraysCache:1"]},
     )
     stateless_payload = json.loads(stateless)
-    assert stateless_payload["turboquant_kv_bits"] == 6.0
     assert "payload_layout" not in stateless_payload
 
     manager = _make_manager(
@@ -455,7 +453,6 @@ def test_public_and_manager_signatures_stamp_expected_layout_settings(tmp_path):
     try:
         manager.set_expected_layer_signature(
             layer_types,
-            turboquant_kv_bits=6,
             cachelist_subtypes={"1": ["ArraysCache:1"]},
         )
         split_signature = manager.cache_signature_for(
@@ -466,7 +463,6 @@ def test_public_and_manager_signatures_stamp_expected_layout_settings(tmp_path):
         )
         split_payload = json.loads(split_signature)
         assert split_payload["payload_layout"] == "split_recurrent_v1"
-        assert split_payload["turboquant_kv_bits"] == 6.0
         assert split_payload["cachelist_subtypes"] == {"1": ["ArraysCache:1"]}
 
         embedded = _make_manager(

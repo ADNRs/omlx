@@ -557,9 +557,9 @@ class ThinkingBudgetProcessor:
         forced[..., target_id] = 0.0
         return forced
 
-    # -- Speculative-decoding (vlm_mtp) support -----------------------------
+    # -- Speculative-decoding support ---------------------------------------
     #
-    # The vlm_mtp decode path applies this processor inside mlx-vlm's
+    # Speculative decode paths apply this processor at verify time (mlx-vlm's
     # speculative verify walk, where positions past the first draft
     # rejection are discarded and re-sampled on the next round.
     # ``snapshot_state()`` / ``restore_state()`` let the caller checkpoint
@@ -582,7 +582,7 @@ class ThinkingBudgetProcessor:
     )
 
     def snapshot_state(self) -> dict:
-        """Checkpoint mutable state for position-keyed rewind (vlm_mtp)."""
+        """Checkpoint mutable state for position-keyed rewind (spec decode)."""
         state: dict = {}
         for name in self._SNAPSHOT_ATTRS:
             if not hasattr(self, name):

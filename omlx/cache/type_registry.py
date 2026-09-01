@@ -16,11 +16,6 @@ from .type_handlers import (
     CacheTypeHandler,
     DefaultCacheHandler,
     KVCacheHandler,
-    MiniMaxM3BatchKVCacheHandler,
-    MiniMaxM3KVCacheHandler,
-    Qwen4BatchQSAKVCacheHandler,
-    Qwen4QSAKVCacheHandler,
-    Qwen4QSAQuantizedKVCacheHandler,
     RotatingKVCacheHandler,
     SizedArraysCache,
 )
@@ -65,20 +60,10 @@ class CacheTypeRegistry:
         "ArraysCache": CacheType.ARRAYS_CACHE,
         "QuantizedKVCache": CacheType.QUANTIZED_KVCACHE,
         "CacheList": CacheType.CACHE_LIST,
-        # TurboQuant: handled specially in prefix_cache/paged_ssd_cache,
-        # mapped to KVCACHE so supports_block_slicing = True (but prefix_cache
-        # checks the class name first and routes to TQ-specific handling)
-        "TurboQuantKVCache": CacheType.KVCACHE,
-        "BatchTurboQuantKVCache": CacheType.KVCACHE,
         # DeepSeek V4 compressed-attention pool. Handlers live in
-        # patches/deepseek_v4/cache_handlers.py and register on patch apply.
+        # their own handler modules and register on patch apply.
         "PoolingCache": CacheType.POOLING_CACHE,
         "BatchPoolingCache": CacheType.BATCH_POOLING_CACHE,
-        "MiniMaxM3KVCache": CacheType.MINIMAX_M3_KVCACHE,
-        "MiniMaxM3BatchKVCache": CacheType.MINIMAX_M3_BATCH_KVCACHE,
-        "QSAKVCache": CacheType.QWEN4_QSA_KVCACHE,
-        "QSAQuantizedKVCache": CacheType.QWEN4_QSA_QUANTIZED_KVCACHE,
-        "BatchQSAKVCache": CacheType.QWEN4_BATCH_QSA_KVCACHE,
     }
 
     # Default handler instance
@@ -267,11 +252,6 @@ def _initialize_default_handlers() -> None:
     CacheTypeRegistry.register(RotatingKVCacheHandler())
     CacheTypeRegistry.register(ArraysCacheHandler())
     CacheTypeRegistry.register(CacheListHandler())
-    CacheTypeRegistry.register(MiniMaxM3KVCacheHandler())
-    CacheTypeRegistry.register(MiniMaxM3BatchKVCacheHandler())
-    CacheTypeRegistry.register(Qwen4QSAKVCacheHandler())
-    CacheTypeRegistry.register(Qwen4QSAQuantizedKVCacheHandler())
-    CacheTypeRegistry.register(Qwen4BatchQSAKVCacheHandler())
 
 
 # Initialize handlers when module is imported

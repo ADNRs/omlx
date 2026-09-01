@@ -78,9 +78,6 @@ class TestIsHelperModelConfig:
         config = {"model_type": "qwen3", "architectures": ["DFlashDraftModel"]}
         assert is_helper_model_config(config) is True
 
-    def test_dflash_draft_via_config_block(self):
-        config = {"model_type": "qwen3", "dflash_config": {"block_size": 16}}
-        assert is_helper_model_config(config) is True
 
     def test_assistant_via_model_type(self):
         config = {
@@ -335,23 +332,7 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
-    def test_detect_diffusion_gemma_as_vlm(self, tmp_path):
-        """DiffusionGemma is served by mlx-vlm even without vision_config."""
-        config = {
-            "model_type": "diffusion_gemma",
-            "canvas_length": 256,
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "vlm"
 
-    def test_detect_cohere2_moe_as_vlm_without_vision_config(self, tmp_path):
-        """Cohere2 MoE is text-only but implemented by mlx-vlm."""
-        config = {
-            "model_type": "cohere2_moe",
-            "architectures": ["Cohere2MoeForCausalLM"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "vlm"
 
     def test_detect_unlimited_ocr_as_vlm(self, tmp_path):
         """baidu/Unlimited-OCR is served by mlx-vlm (dashed model_type)."""
@@ -399,23 +380,7 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
-    def test_detect_minimax_m3_text_as_vlm_native_text(self, tmp_path):
-        """MiniMax M3 text-only checkpoints are implemented by mlx-vlm."""
-        config = {
-            "model_type": "minimax_m3",
-            "architectures": ["MiniMaxM3ForCausalLM"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "vlm"
 
-    def test_detect_vlm_by_architecture(self, tmp_path):
-        """Test detection of VLM model by architecture name."""
-        config = {
-            "model_type": "unknown_vlm",
-            "architectures": ["LlavaForConditionalGeneration"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "vlm"
 
     def test_detect_vlm_by_vision_config(self, tmp_path):
         """Test detection of VLM model by vision_config + text_config."""
@@ -476,14 +441,6 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "llm"
 
-    def test_detect_gemma4_unified_without_vision_config_as_vlm(self, tmp_path):
-        """Gemma4 unified is always VLM even without vision_config."""
-        config = {
-            "model_type": "gemma4_unified",
-            "architectures": ["Gemma4UnifiedForConditionalGeneration"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "vlm"
 
     def test_detect_vlm_qwen3_5_moe(self, tmp_path):
         """Test detection of Qwen3.5 MoE as VLM."""

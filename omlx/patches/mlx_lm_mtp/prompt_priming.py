@@ -15,8 +15,8 @@ across chunks.
 Transport: the context lives in a single slot on the patched language-model
 instance (the ``host``). Cache-entry attributes cannot carry it — mlx-lm's
 insert merge rebuilds every layer cache that lacks filter/extract support
-(all of DeepSeek-V4's and GLM-5.2's CacheList entries, and TurboQuant
-replaces KVCache entries at end of prefill) — while the model instance is
+(such as DeepSeek-V4's and GLM-5.2's CacheList entries) — while the model
+instance is
 the one object every forward and the activation both see. The engine thread
 serializes forwards, and the offset-contiguity invariant below makes the
 single slot safe across interleaved requests: a chunk from a different
@@ -36,15 +36,6 @@ Capture sites (each calls :func:`maybe_capture` after the backbone forward):
 
 - mlx-lm qwen3_5 text path: the patched ``TextModel.__call__``
   (``qwen35_model``), which computes the trunk-normed hidden inline.
-- mlx-vlm qwen3_5 path: a wrap on the inner ``Qwen3_5Model.__call__``
-  (``qwen35_vlm_runtime``), whose return value *is* the trunk-normed
-  hidden; the MoE inner model inherits it. The outer ``LanguageModel`` is
-  reached via a weakref stamped at init.
-- DeepSeek-V4 (``deepseek_v4_model``): the patched ``Model.__call__``
-  requests ``return_raw_hidden`` and passes the raw 4D Hyper-stream hidden
-  (the head input variant; no trunk norm).
-- GLM-5.2 (``glm_moe_dsa_model``): the patched ``Model.__call__`` passes
-  the post-final-norm hidden it already computes.
 
 All sites skip ``return_hidden=True`` forwards (MTP verify cycles and the
 activation forward in ``_post_init_mtp``); the final (hidden[prompt[-1]],
@@ -773,25 +764,23 @@ def take_primed(
     ``(mtp_cache, hist_offset)`` — or None, in which case the caller keeps
     the current unprimed behaviour.
     """
-    # Hosts with their own priming shape (inkling's sliding-window
-    # multi-block fold) own the whole activation seam.
+    # Hosts with their own priming shape (e.g. sliding-window
+    # multi-block folds) own the whole activation seam.
     for host in _host_candidates(model):
         hook = getattr(host, "mtp_take_primed", None)
         if callable(hook):
             primed = hook(cache, main_tok)
             if primed is not None:
                 return primed
-            # None means the hook declined ownership, not "no priming": the
-            # DeepSeek-V4 patch registers ``mtp_take_primed`` on the class
-            # but only DSpark builds answer it, so legacy single-head MTP
-            # models could never reach the generic seam below and priming
-            # was structurally dead for them (#3079). Every hook pops its
-            # own context before declining, so the fallthrough cannot adopt
-            # a foreign timeline.
+            # None means the hook declined ownership, not "no priming":
+            # legacy single-head MTP models could otherwise never reach the
+            # generic seam below and priming was structurally dead for them
+            # (#3079). Every hook pops its own context before declining, so
+            # the fallthrough cannot adopt a foreign timeline.
             break
     ctx = _find_ctx(model)
     if not isinstance(ctx, _PrimeCtx):
-        # No context, or a host-owned one sharing the slot (inkling's) whose
+        # No context, or a host-owned one sharing the slot whose
         # hook declined without popping it — not ours to consume.
         return None
     drop_ctx(model)

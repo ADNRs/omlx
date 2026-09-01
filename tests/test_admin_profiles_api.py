@@ -231,59 +231,6 @@ class TestProfileRoutes:
         assert r.status_code == 200
         assert r.json()["settings"]["active_profile_name"] == "coding"
 
-    def test_apply_profile_resolves_vlm_mtp_processor_conflict(self, client):
-        c, mgr = client
-        mgr.set_settings(
-            "model-a",
-            ModelSettings(
-                vlm_mtp_enabled=True,
-                vlm_mtp_draft_model="qwen-mtp-drafter",
-            ),
-        )
-        c.post(
-            "/admin/api/models/model-a/profiles",
-            json={
-                "name": "penalty",
-                "display_name": "Penalty",
-                "settings": {"presence_penalty": 1.5},
-            },
-        )
-
-        r = c.post("/admin/api/models/model-a/profiles/penalty/apply")
-
-        assert r.status_code == 200, r.text
-        settings = r.json()["settings"]
-        assert settings["presence_penalty"] == 1.5
-        assert settings["vlm_mtp_enabled"] is False
-        assert settings["active_profile_name"] == "penalty"
-        assert mgr.get_settings("model-a").vlm_mtp_enabled is False
-
-    def test_apply_profile_validation_error_is_400_without_partial_write(self, client):
-        c, mgr = client
-        mgr.set_settings(
-            "model-a",
-            ModelSettings(
-                vlm_mtp_enabled=True,
-                vlm_mtp_draft_model="qwen-mtp-drafter",
-            ),
-        )
-        c.post(
-            "/admin/api/models/model-a/profiles",
-            json={
-                "name": "dflash",
-                "display_name": "DFlash",
-                "settings": {"dflash_enabled": True},
-            },
-        )
-
-        r = c.post("/admin/api/models/model-a/profiles/dflash/apply")
-
-        assert r.status_code == 400
-        assert "vlm_mtp_enabled and dflash_enabled" in r.json()["detail"]
-        persisted = mgr.get_settings("model-a")
-        assert persisted.vlm_mtp_enabled is True
-        assert persisted.dflash_enabled is False
-        assert persisted.active_profile_name is None
 
     def test_apply_profile_sanitizes_diffusion_unsupported_settings(self, client):
         c, mgr = client
@@ -305,11 +252,7 @@ class TestProfileRoutes:
                     "guided_grammar_enabled": True,
                     "guided_grammar": 'root ::= "YES"',
                     "max_tool_result_tokens": 4096,
-                    "turboquant_kv_enabled": True,
-                    "specprefill_enabled": True,
-                    "dflash_enabled": True,
                     "mtp_enabled": True,
-                    "vlm_mtp_enabled": True,
                     "chat_template_kwargs": {
                         "enable_thinking": True,
                         "custom_key": "ok",
@@ -329,11 +272,7 @@ class TestProfileRoutes:
         # Tool calling works on the diffusion lane (prompt-driven +
         # output parsing), so its settings are preserved.
         assert settings["max_tool_result_tokens"] == 4096
-        assert settings["turboquant_kv_enabled"] is False
-        assert settings["specprefill_enabled"] is False
-        assert settings["dflash_enabled"] is False
         assert settings["mtp_enabled"] is False
-        assert settings["vlm_mtp_enabled"] is False
         assert settings["chat_template_kwargs"] == {"custom_key": "ok"}
         assert settings["forced_ct_kwargs"] == ["custom_key"]
 
@@ -350,7 +289,7 @@ class TestProfileRoutes:
         assert "universal" in data
         assert "model_specific" in data
         assert "temperature" in data["universal"]
-        assert "turboquant_kv_enabled" in data["model_specific"]
+        assert "mtp_enabled" in data["model_specific"]
 
     def test_also_save_as_template(self, client):
         c, mgr = client
@@ -359,7 +298,7 @@ class TestProfileRoutes:
             json={
                 "name": "coding",
                 "display_name": "Coding",
-                "settings": {"temperature": 0.0, "turboquant_kv_enabled": True},
+                "settings": {"temperature": 0.0, "mtp_enabled": True},
                 "also_save_as_template": True,
             },
         )
@@ -451,7 +390,7 @@ class TestApplySnapshotSemantics:
         c, mgr = client
         mgr.set_settings(
             "model-a",
-            ModelSettings(ttl_seconds=300, model_alias="keep-me", dflash_enabled=True),
+            ModelSettings(ttl_seconds=300, model_alias="keep-me", mtp_enabled=True),
         )
         c.post(
             "/admin/api/models/model-a/profiles",
@@ -465,7 +404,7 @@ class TestApplySnapshotSemantics:
         settings = r.json()["settings"]
         assert settings["ttl_seconds"] == 300
         assert settings["model_alias"] == "keep-me"
-        assert settings["dflash_enabled"] is True
+        assert settings["mtp_enabled"] is True
 
 
 def test_all_model_settings_fields_classified():
@@ -519,7 +458,7 @@ class TestTemplateRoutes:
             json={
                 "name": "coding",
                 "display_name": "Coding",
-                "settings": {"temperature": 0.0, "turboquant_kv_enabled": True},
+                "settings": {"temperature": 0.0, "mtp_enabled": True},
             },
         )
         assert r.status_code == 200
@@ -639,13 +578,7 @@ class TestModelsResponseActiveProfile:
                 "guided_grammar_enabled": True,
                 "guided_grammar": 'root ::= "YES"',
                 "max_tool_result_tokens": 4096,
-                "turboquant_kv_enabled": True,
-                "specprefill_enabled": True,
-                "dflash_enabled": True,
-                "dflash_in_memory_cache": False,
-                "dflash_ssd_cache": True,
                 "mtp_enabled": True,
-                "vlm_mtp_enabled": True,
             },
         )
 
@@ -659,13 +592,7 @@ class TestModelsResponseActiveProfile:
         assert "guided_grammar" not in settings
         # Tool calling works on the diffusion lane; setting preserved.
         assert settings["max_tool_result_tokens"] == 4096
-        assert settings["turboquant_kv_enabled"] is False
-        assert settings["specprefill_enabled"] is False
-        assert settings["dflash_enabled"] is False
-        assert settings["dflash_in_memory_cache"] is True
-        assert settings["dflash_ssd_cache"] is False
         assert settings["mtp_enabled"] is False
-        assert settings["vlm_mtp_enabled"] is False
 
 
 class TestActiveProfileDriftClearing:
@@ -776,7 +703,7 @@ class TestExposeAsModelAPI:
             json={
                 "name": "thinking",
                 "display_name": "thinking",
-                "settings": {"temperature": 0.6, "dflash_enabled": True},
+                "settings": {"temperature": 0.6, "mtp_enabled": True},
                 "expose_as_model": True,
             },
         )

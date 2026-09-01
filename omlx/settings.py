@@ -337,11 +337,19 @@ class CacheSettings:
     # RAM AND persisted to SSD immediately — RAM-speed resume for recent
     # sessions without losing SSD durability for old ones.
     hot_cache_write_through: bool = False
-    # Reuse Apple's AOT-compiled ANE programs across server restarts
-    # (OMLX_QWEN35_ANE_COMPILE_CACHE=1). The native gate reads the env var
-    # once, at the first ANE compile, so a change applies on restart.
-    ane_compile_cache: bool = False
     initial_cache_blocks: int = 256  # Starting blocks (grows dynamically)
+    # Cap on MLX's wired buffer-cache pool, in GB. 0 = disabled (pool may
+    # grow to total GPU memory). With the pool uncapped, long-context
+    # prefill grows it by ~13GB, the enforcer's soft-pressure reclaim then
+    # clears it, and the next chunk re-allocates it — a thrash loop that
+    # flaps the footprint ±13GB per chunk, poisons the transient estimator
+    # with refill deltas, and collapses chunk sizes to the 32-token floor
+    # (measured: 262K bench dropped to ~50 tok/s at 170K+ with the pool
+    # unbounded; a 8GB cap keeps prefill at full-speed chunks). The
+    # OMLX_MX_CACHE_LIMIT_GB env var overrides this for testing.
+    # Default is the production-tuned M5 Pro/Max value for 27B-class
+    # long-context serving (this build targets that configuration).
+    mx_cache_limit_gb: float = 8.0
     # None selects the policy automatically: use an SSD sidecar when the SSD
     # cache is enabled, otherwise keep GDN state embedded with the main cache.
     # True/False preserve the legacy explicit split/embedded choices.
@@ -437,8 +445,8 @@ class CacheSettings:
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
             "hot_cache_write_through": self.hot_cache_write_through,
-            "ane_compile_cache": self.ane_compile_cache,
             "initial_cache_blocks": self.initial_cache_blocks,
+            "mx_cache_limit_gb": self.mx_cache_limit_gb,
         }
 
     @classmethod
@@ -487,8 +495,8 @@ class CacheSettings:
             hot_cache_write_through=bool(
                 data.get("hot_cache_write_through", False)
             ),
-            ane_compile_cache=bool(data.get("ane_compile_cache", False)),
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
+            mx_cache_limit_gb=float(data.get("mx_cache_limit_gb", 0) or 0),
         )
 
 
@@ -506,9 +514,10 @@ class MemorySettings:
     # Tier selects the active-memory reclaim ratio (safe/balanced/aggressive)
     # or, for "custom", lets the user pin the dynamic ceiling to a fixed
     # GB number. See ProcessMemoryEnforcer._get_dynamic_ceiling for the math.
-    memory_guard_tier: MemoryGuardTier = "balanced"
+    # Defaults below are the production-tuned M5 Pro/Max long-context values.
+    memory_guard_tier: MemoryGuardTier = "custom"
     # Only consulted when memory_guard_tier == "custom". GB. 0 = unset.
-    memory_guard_custom_ceiling_gb: float = 0.0
+    memory_guard_custom_ceiling_gb: float = 48.0
     # Two-stage watermark on the ceiling. soft triggers admission pause + LRU eviction,
     # hard triggers in-flight abort. Gap >= 10% absorbs macOS compressed-memory oscillation.
     soft_threshold: float = 0.85
@@ -535,14 +544,14 @@ class MemorySettings:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MemorySettings:
         """Create from dictionary."""
-        tier = str(data.get("memory_guard_tier", "balanced")).lower()
+        tier = str(data.get("memory_guard_tier", "custom")).lower()
         if tier not in VALID_MEMORY_GUARD_TIERS:
-            tier = "balanced"
+            tier = "custom"
         return cls(
             prefill_memory_guard=data.get("prefill_memory_guard", True),
             memory_guard_tier=tier,  # type: ignore[arg-type]
             memory_guard_custom_ceiling_gb=float(
-                data.get("memory_guard_custom_ceiling_gb", 0.0)
+                data.get("memory_guard_custom_ceiling_gb", 48.0)
             ),
             soft_threshold=float(data.get("soft_threshold", 0.85)),
             hard_threshold=float(data.get("hard_threshold", 0.95)),
@@ -1376,6 +1385,12 @@ class GlobalSettings:
 
     def save(self) -> None:
         """Save current settings to the settings file."""
+        # Tuner probe servers boot with throwaway CLI overrides (e.g. a
+        # dedicated port); persisting them would poison the real server's
+        # next boot. Opt out via env.
+        if os.environ.get("OMLX_TUNER_NO_SAVE"):
+            logger.debug("Skipping settings save (OMLX_TUNER_NO_SAVE set)")
+            return
         self.ensure_directories()
 
         settings_file = self.base_path / "settings.json"
@@ -1426,6 +1441,9 @@ class GlobalSettings:
 
     def save_cli_overrides(self, args: Any) -> None:
         """Persist explicit non-secret CLI configuration without freezing env state."""
+        if os.environ.get("OMLX_TUNER_NO_SAVE"):
+            logger.debug("Skipping CLI-override save (OMLX_TUNER_NO_SAVE set)")
+            return
         persisted = type(self)(base_path=self.base_path)
         settings_file = self.base_path / "settings.json"
         if settings_file.exists():

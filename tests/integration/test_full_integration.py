@@ -2,14 +2,13 @@
 """
 Full integration test for oMLX with real models.
 
-Tests cache consistency, concurrent batching, TurboQuant, VLM image caching,
+Tests cache consistency, concurrent batching, VLM image caching,
 and multi-turn VLM conversations across 7 models using both LLM and VLM engines.
 
 Test categories:
   1. 9K context cache consistency (boundary cache, SSD cache hit/miss)
   2. 4-request concurrent batching (simultaneous + sequential)
-  3. TurboQuant 3-bit with cache and batching
-  4. VLM engine basics (tests 1-3 on VLMModelAdapter)
+  4. VLM engine basics (tests 1-2 on VLMModelAdapter)
   5. VLM image caching (5K text + image per turn, 3 turns)
   6. VLM multi-turn image quality (coherent responses across turns)
   7. VLM image caching with 4-request batching
@@ -232,7 +231,6 @@ def _generate_tokens(
     max_tokens: int = 100,
     ssd_cache_dir: Optional[str] = None,
     block_size: int = 2048,
-    turboquant_bits: Optional[float] = None,
     vlm_inputs_embeds: Optional[Any] = None,
     vlm_extra_kwargs: Optional[Dict[str, Any]] = None,
     vlm_image_hash: Optional[str] = None,
@@ -255,11 +253,6 @@ def _generate_tokens(
 
     config = SchedulerConfig(**config_kwargs)
     scheduler = Scheduler(config=config, model=model, tokenizer=tokenizer)
-
-    if turboquant_bits is not None:
-        from omlx.patches.turboquant_attention import apply_turboquant_attention_patch
-        apply_turboquant_attention_patch()
-        scheduler._turboquant_kv_bits = turboquant_bits
 
     # Use repetition_penalty for VLM requests to prevent degeneration
     # on synthetic test images with greedy decoding.
@@ -314,7 +307,6 @@ def _generate_batch(
     max_tokens: int = 100,
     ssd_cache_dir: Optional[str] = None,
     block_size: int = 2048,
-    turboquant_bits: Optional[float] = None,
     vlm_embeds_list: Optional[List[Tuple[Any, Optional[Dict], Optional[str]]]] = None,
 ) -> List[Tuple[str, List[int], int]]:
     """
@@ -346,11 +338,6 @@ def _generate_batch(
 
     config = SchedulerConfig(**config_kwargs)
     scheduler = Scheduler(config=config, model=model, tokenizer=tokenizer)
-
-    if turboquant_bits is not None:
-        from omlx.patches.turboquant_attention import apply_turboquant_attention_patch
-        apply_turboquant_attention_patch()
-        scheduler._turboquant_kv_bits = turboquant_bits
 
     # Build requests
     # Use repetition_penalty for VLM batch requests to prevent
@@ -674,110 +661,11 @@ def _test_concurrent_batching(model, tokenizer, label: str = "LLM"):
 
 
 # ---------------------------------------------------------------------------
-# Test 3: TurboQuant 3-bit
-# ---------------------------------------------------------------------------
-
-def _test_turboquant(model, tokenizer, label: str = "LLM"):
-    """Test TurboQuant 3-bit with cache consistency and batching."""
-    print(f"\n  [Test 3/{label}] TurboQuant 3-bit...")
-
-    prompt_token_ids = _build_9k_prompt(tokenizer)
-
-    # --- TQ cache ON vs OFF (quality-only, TQ is lossy) ---
-    print("    [3a] TQ boundary cache ON vs OFF (quality check)...")
-    tmp_dir = tempfile.mkdtemp(prefix="omlx_test_tq_")
-    try:
-        tokens_tq_on, _ = _generate_tokens(
-            model, tokenizer, prompt_token_ids,
-            ssd_cache_dir=tmp_dir, block_size=2048,
-            turboquant_bits=3.0,
-        )
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    tokens_tq_off, _ = _generate_tokens(
-        model, tokenizer, prompt_token_ids,
-        ssd_cache_dir=None,
-        turboquant_bits=3.0,
-    )
-
-    text_tq_on = tokenizer.decode(tokens_tq_on)
-    text_tq_off = tokenizer.decode(tokens_tq_off)
-    print(f"    TQ ON  ({len(tokens_tq_on)} tokens): {text_tq_on[:100]}...")
-    print(f"    TQ OFF ({len(tokens_tq_off)} tokens): {text_tq_off[:100]}...")
-    _check_output_quality(text_tq_on, f"{label} TQ boundary-ON")
-    _check_output_quality(text_tq_off, f"{label} TQ boundary-OFF")
-    print("    TQ boundary quality check: PASSED")
-
-    # --- TQ SSD cache hit vs fresh ---
-    print("    [3b] TQ SSD cache hit vs fresh...")
-    tmp_dir = tempfile.mkdtemp(prefix="omlx_test_tq_ssd_")
-    try:
-        tokens_tq_fresh, _ = _generate_tokens(
-            model, tokenizer, prompt_token_ids,
-            ssd_cache_dir=tmp_dir, block_size=2048,
-            turboquant_bits=3.0,
-        )
-        text_tq_fresh = tokenizer.decode(tokens_tq_fresh)
-        print(f"    TQ Fresh  ({len(tokens_tq_fresh)} tokens): {text_tq_fresh[:100]}...")
-
-        tokens_tq_cached, cached_count = _generate_tokens(
-            model, tokenizer, prompt_token_ids,
-            ssd_cache_dir=tmp_dir, block_size=2048,
-            turboquant_bits=3.0,
-        )
-        text_tq_cached = tokenizer.decode(tokens_tq_cached)
-        print(f"    TQ Cached ({len(tokens_tq_cached)} tokens, cached={cached_count}): {text_tq_cached[:100]}...")
-
-        _check_output_quality(text_tq_cached, f"{label} TQ cached")
-
-        match_tq_ssd = tokens_tq_fresh == tokens_tq_cached
-        if match_tq_ssd:
-            print("    TQ SSD token match: IDENTICAL")
-        else:
-            min_len = min(len(tokens_tq_fresh), len(tokens_tq_cached))
-            diff_idx = next(
-                (i for i in range(min_len) if tokens_tq_fresh[i] != tokens_tq_cached[i]),
-                min_len,
-            )
-            print(f"    TQ SSD token match: DIFFER at position {diff_idx}")
-
-        if cached_count > 0:
-            print(f"    TQ cache hit confirmed: {cached_count} tokens from SSD")
-
-        assert match_tq_ssd, f"[{label}] TQ SSD cache hit/fresh tokens differ"
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-    print("    TQ SSD cache: PASSED")
-
-    # --- TQ batching ---
-    print("    [3c] TQ batching (4 concurrent requests)...")
-    prompts = _build_short_prompts(tokenizer, 4)
-    tmp_dir = tempfile.mkdtemp(prefix="omlx_test_tq_batch_")
-    try:
-        results = _generate_batch(
-            model, tokenizer, prompts,
-            mode="concurrent",
-            ssd_cache_dir=tmp_dir,
-            turboquant_bits=3.0,
-        )
-        for rid, tokens, cached in results:
-            text = tokenizer.decode(tokens)
-            print(f"    {rid}: {len(tokens)} tokens - {text[:80]}...")
-            _check_output_quality(text, f"{label} TQ batch {rid}")
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-    print("    TQ batching: PASSED")
-
-    print(f"    [Test 3/{label}] PASSED")
-
-
-# ---------------------------------------------------------------------------
-# Test 4: VLM engine basics (re-run tests 1-3 on VLMModelAdapter)
+# Test 4: VLM engine basics (re-run tests 1-2 on VLMModelAdapter)
 # ---------------------------------------------------------------------------
 
 def _test_vlm_engine_basics(adapter, tokenizer):
-    """Re-run cache consistency, batching, and TurboQuant on VLM adapter with text-only."""
+    """Re-run cache consistency and batching on VLM adapter with text-only."""
     print("\n  [Test 4] VLM engine basics (text-only on VLMModelAdapter)...")
 
     # Test 1 on VLM adapter
@@ -785,9 +673,6 @@ def _test_vlm_engine_basics(adapter, tokenizer):
 
     # Test 2 on VLM adapter
     _test_concurrent_batching(adapter, tokenizer, label="VLM")
-
-    # Test 3 on VLM adapter
-    _test_turboquant(adapter, tokenizer, label="VLM")
 
     print("    [Test 4] PASSED")
 
@@ -1049,8 +934,6 @@ def test_full_integration(model_path):
             _test_9k_cache_consistency(model, tokenizer)
         with _track_peak_memory("Test 2 - concurrent batching"):
             _test_concurrent_batching(model, tokenizer)
-        with _track_peak_memory("Test 3 - TurboQuant"):
-            _test_turboquant(model, tokenizer)
     finally:
         del model, tokenizer
         gc.collect()

@@ -13,6 +13,7 @@ from the global PrefillProgressTracker which feeds the admin dashboard.
 from __future__ import annotations
 
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,17 @@ class PrefillTransientTracker:
     # above the largest observed legitimate fluctuation and below the
     # observed outlier.
     _EWMA_OUTLIER_RATIO = 8.0
+    # Absolute per-token sanity bound: no legitimate chunk transient
+    # approaches this (Qwen3.8-27B worst legitimate sample ~2MB/token at
+    # 200k context; the largest legitimate model observed to date is a
+    # Qwen3.6 MoE prefill at ~18MB/token).
+    # A window whose per-token rate exceeds it is measuring allocator
+    # churn (pool refill cycles flapping the footprint ±GBs within
+    # seconds), not chunk cost. The 8x ratio gate alone cannot stop a
+    # geometric ramp of such samples (measured 5.3 -> 86 -> 188 -> 376
+    # MB/token, each under 8x its predecessor, all blended in), so these
+    # are rejected from the EWMA AND the raw last-delta anchor.
+    _ABS_MAX_PER_TOKEN_BYTES = 32 * 1024 * 1024
 
     def __init__(self, model_id: str = "") -> None:
         self._model_id = model_id
@@ -57,15 +69,52 @@ class PrefillTransientTracker:
         # gates, matching the floor-chunk charge they price. Never used
         # for chunk sizing.
         self._observed_max_bytes: int = 0
-        # Net process footprint released by negative post-chunk deltas. MLX may
-        # need to allocate that pool again on the next chunk, so the scheduler
-        # prices it once until a positive measurement confirms reallocation.
+        # Net process footprint released by negative post-chunk deltas. MLX
+        # may need to allocate that pool again on the next chunk, so the
+        # scheduler prices it once until a positive measurement confirms
+        # reallocation.
         self._recent_reclaim_bytes: int = 0
+        # The refill risk the ledger prices only exists for the chunks
+        # IMMEDIATELY following the release (one long-context chunk is
+        # ~20s). A release on a dying request's tail (snapshot writeback
+        # draining as the prefill ends) must not leak into an unrelated
+        # request admitted minutes later: by then the footprint has
+        # already settled low, and pricing a refill on top of the reduced
+        # current double-counts (measured: a 160k prime's tail ledger of
+        # ~10GB inflated the next request's front-door estimate from
+        # ~28GB to 35.4GB KV+SDPA and rejected it outright).
+        self._recent_reclaim_at: float = 0.0
+
+    # Ledger freshness window; see __init__.
+    _RECLAIM_TTL_S: float = 20.0
 
     def record_reclaim(self, reclaimed_bytes: int) -> None:
         """Accumulate footprint released since the last positive sample."""
         if reclaimed_bytes > 0:
+            now = time.monotonic()
+            # A release after the TTL expired starts a fresh ledger: the
+            # stale entries belonged to a finished refill cycle (or a dead
+            # request) and the property already stopped pricing them.
+            if now - self._recent_reclaim_at > self._RECLAIM_TTL_S:
+                self._recent_reclaim_bytes = 0
             self._recent_reclaim_bytes += int(reclaimed_bytes)
+            self._recent_reclaim_at = now
+
+    def set_reclaim(self, reclaimed_bytes: int) -> None:
+        """REPLACE the ledger with the given release (see record_reclaim).
+
+        Used for inter-window (out-of-band) releases: the most recent
+        inter-window drop is the best estimate of the refill the NEXT
+        chunk needs, and repeated small pool trims must not ACCUMULATE —
+        steady-state MLX pool trimming books ~500MB per window, and
+        accumulating them inside the TTL charged ~10GB of "imminent
+        refill" that never arrives as one shot, tripling admission
+        estimates (2026-08-28: fresh 262K rejected with a 49GB KV+SDPA
+        charge at ~25K tokens)."""
+        if reclaimed_bytes > 0:
+            now = time.monotonic()
+            self._recent_reclaim_bytes = int(reclaimed_bytes)
+            self._recent_reclaim_at = now
 
     def clear_reclaim(self) -> None:
         """Drop the charge once any positive measurement confirms realloc.
@@ -125,6 +174,20 @@ class PrefillTransientTracker:
                 )
 
         per_token = transient_bytes / n_tokens
+        if per_token > self._ABS_MAX_PER_TOKEN_BYTES:
+            # Absolute sanity gate (see _ABS_MAX_PER_TOKEN_BYTES): sample
+            # measures allocator churn, not chunk cost. Not recorded into
+            # the EWMA or the raw last-delta anchor — but it IS a positive
+            # footprint observation, so the reclaim ledger still clears.
+            logger.debug(
+                "PrefillTransientTracker(%s): rejected %.1f-byte/token "
+                "sample outright (absolute cap %d)",
+                self._model_id,
+                per_token,
+                self._ABS_MAX_PER_TOKEN_BYTES,
+            )
+            self._samples += 1
+            return
         if self._samples == 0:
             self._ewma_per_token = per_token
         elif per_token > self._ewma_per_token * self._EWMA_OUTLIER_RATIO:
@@ -188,7 +251,16 @@ class PrefillTransientTracker:
 
     @property
     def recent_reclaim_bytes(self) -> int:
-        """Footprint released since the last positive chunk measurement."""
+        """Footprint released since the last positive chunk measurement.
+
+        Entries older than ``_RECLAIM_TTL_S`` report 0: the refill risk
+        they priced has either already materialized (a positive sample
+        cleared the ledger) or the release belonged to a finished request
+        whose memory stayed released."""
+        if self._recent_reclaim_bytes <= 0:
+            return 0
+        if time.monotonic() - self._recent_reclaim_at > self._RECLAIM_TTL_S:
+            return 0
         return self._recent_reclaim_bytes
 
     def reset(self) -> None:
@@ -199,3 +271,4 @@ class PrefillTransientTracker:
         self._last_n_tokens = 0
         self._observed_max_bytes = 0
         self._recent_reclaim_bytes = 0
+        self._recent_reclaim_at = 0.0

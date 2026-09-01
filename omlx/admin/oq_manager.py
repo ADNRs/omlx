@@ -303,11 +303,10 @@ class OQManager:
             oq_level: oQ level from OQ_LEVELS.
             dtype: Target fp dtype for non-quantized weights and quant
                 scales/biases. "bfloat16" (default) or "float16".
-            mtp_assistant_model_path: Optional checkpoint whose MTP head is
-                merged into the output. A gemma4_assistant donor uses the
-                assistant merge; any other donor grafts its native
-                Qwen3.5/3.6 mtp.* head (same-geometry, same-tokenizer
-                pairs only). Validated at submission.
+            mtp_assistant_model_path: Optional checkpoint whose native
+                Qwen3.5/3.6 mtp.* head is merged into the output
+                (same-geometry, same-tokenizer pairs only). Validated at
+                submission.
 
         Returns:
             The created QuantTask.
@@ -318,9 +317,7 @@ class OQManager:
         from ..oq import (
             OQ_DTYPES,
             OQ_LEVELS,
-            _validate_oq_dtype_for_model,
             resolve_output_name,
-            validate_gemma4_assistant_pair,
             validate_mtp_donor_pair,
         )
         from ..utils.model_loading import _checkpoint_has_mtp_weights
@@ -338,8 +335,6 @@ class OQManager:
 
         with open(source / "config.json") as f:
             config = json.load(f)
-        _validate_oq_dtype_for_model(config, dtype)
-
         source_size = _safetensors_size(source)
         if source_size == 0:
             raise ValueError(f"No .safetensors files found in {model_path}")
@@ -365,19 +360,14 @@ class OQManager:
                 raise ValueError(
                     f"Assistant model not found: {mtp_assistant_model_path}"
                 )
-            with open(assistant / "config.json") as f:
-                assistant_config = json.load(f)
-            if assistant_config.get("model_type") == "gemma4_assistant":
-                validate_gemma4_assistant_pair(config, assistant_config)
-            else:
-                validate_mtp_donor_pair(source, assistant)
-                if _checkpoint_has_mtp_weights(source):
-                    logger.warning(
-                        "Recipient %s ships its own MTP head; it will be "
-                        "stripped and replaced by the donor head from %s",
-                        model_name,
-                        assistant.name,
-                    )
+            validate_mtp_donor_pair(source, assistant)
+            if _checkpoint_has_mtp_weights(source):
+                logger.warning(
+                    "Recipient %s ships its own MTP head; it will be "
+                    "stripped and replaced by the donor head from %s",
+                    model_name,
+                    assistant.name,
+                )
 
         output_name = resolve_output_name(
             output_base_name,

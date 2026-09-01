@@ -34,7 +34,7 @@ def pipeline_assignment_is_honored(model_path: str | Path) -> bool:
     of a ``pipeline`` method. DeepSeek-V3.2 has such a method but implements its
     own even split, which is the failure the pre-load memory guard must survive.
     Compatible hooks carry a marker at the point they call
-    ``apply_pipeline_assignment`` (or, for MiniMax, the assigned-stage seam).
+    ``apply_pipeline_assignment`` or the assigned-stage seam in this module).
     Anything unmarked remains fail-closed.
     """
 
@@ -269,6 +269,47 @@ def _install_nemotron_h_pipeline(
                 delattr(model_class, name)
             else:
                 setattr(model_class, name, original)
+
+
+# ---------------------------------------------------------------------------
+# Generic stage pinning. mlx-lm constructs the model inside ``load()`` and
+# calls ``pipeline(group)`` itself — there is no instance to configure first,
+# so the assignment rides on a process global. ``effective_stage`` mirrors
+# PipelineMixin's reverse split when nothing is pinned, so a memory guard can
+# check what will really be loaded rather than what was planned.
+# ---------------------------------------------------------------------------
+_ASSIGNED_STAGE: tuple[int, int] | None = None
+
+
+def set_assigned_stage(start_layer: int, end_layer: int) -> None:
+    """Pin the layer range this rank must hold, overriding the even split."""
+
+    global _ASSIGNED_STAGE
+    _ASSIGNED_STAGE = (int(start_layer), int(end_layer))
+
+
+def clear_assigned_stage() -> None:
+    global _ASSIGNED_STAGE
+    _ASSIGNED_STAGE = None
+
+
+def assigned_stage() -> tuple[int, int] | None:
+    return _ASSIGNED_STAGE
+
+
+def effective_stage(
+    layer_count: int, rank: int, world_size: int
+) -> tuple[int, int]:
+    """The range a rank will actually hold, assignment or not."""
+
+    if _ASSIGNED_STAGE is not None:
+        return _ASSIGNED_STAGE
+    per_rank = layer_count // max(1, world_size)
+    extra = layer_count - per_rank * max(1, world_size)
+    if rank < extra:
+        per_rank += 1
+    start = (world_size - rank - 1) * per_rank
+    return start, start + per_rank
 
 
 @contextmanager

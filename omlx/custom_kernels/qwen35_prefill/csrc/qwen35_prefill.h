@@ -21,6 +21,29 @@ bool nax_qmm_kernels_built();
 // kernels for the rest of the process (diagnostics for the M5 sweep).
 bool nax_qmm_runtime_active();
 
+// True when the NAX metallib ships the head-dim-256 dsplit attention
+// pipeline (metallibs rebuilt before qwen35_attn_nax.metal only carry the
+// qmm kernels).
+bool nax_attn_kernels_built();
+
+// False once loading the NAX attention pipeline failed for the process.
+bool nax_attn_runtime_active();
+
+// Fused NAX (M5 tensor-unit) flash attention for head_dim 256: backport of
+// mlx-main's attention_nax_dsplit (bq64/bk32/bd256/wm4/wn2). Layout q
+// [B, H, qL, 256], k/v [B, Hkv, kL, 256], H % Hkv == 0, causal aligns
+// queries to the END of the key axis. dispatch_budget bounds per-dispatch
+// work (B * H * qL * kL) by splitting the query-block grid into separately
+// dispatched slices; 0 keeps the single-dispatch behavior.
+mx::array qwen35_attn256_nax(
+    const mx::array& q,
+    const mx::array& k,
+    const mx::array& v,
+    float scale,
+    bool causal = true,
+    int64_t dispatch_budget = 0,
+    mx::StreamOrDevice s = {});
+
 // dispatch_budget bounds the per-dispatch work (B * H * qL * keys) by
 // splitting the key axis into separately dispatched chunks combined with
 // logsumexp weights; 0 keeps the single-dispatch behavior (issue #2225).

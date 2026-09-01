@@ -3,7 +3,6 @@
 
 import asyncio
 import json
-import logging
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,7 +23,6 @@ from omlx.admin.benchmark import (
     _filter_uploaded_settings,
     _generate_prompt,
     _load_bench_corpus,
-    _log_ane_benchmark_trace,
     _run_batch_test,
     _run_single_test,
     _upload_model_name,
@@ -120,25 +118,6 @@ class TestBenchmarkRequest:
     def test_warmup_mode_defaults_to_quick(self):
         req = BenchmarkRequest(model_id="test-model", prompt_lengths=[1024])
         assert req.warmup_mode is BenchmarkWarmupMode.QUICK
-
-    def test_ane_warmup_mode_is_accepted(self):
-        req = BenchmarkRequest(
-            model_id="test-model",
-            prompt_lengths=[1024],
-            warmup_mode="ane_2048",
-        )
-        assert req.warmup_mode is BenchmarkWarmupMode.ANE_2048
-
-    def test_ane_aligned_prompt_adds_one_to_single_trials(self):
-        from omlx.admin.benchmark import _single_prompt_lengths
-
-        req = BenchmarkRequest(
-            model_id="test-model",
-            prompt_lengths=[4096, 8192],
-            align_prompt_to_ane=True,
-        )
-
-        assert _single_prompt_lengths(req) == [4097, 8193]
 
     def test_standard_prompt_lengths_remain_unchanged(self):
         from omlx.admin.benchmark import _single_prompt_lengths
@@ -762,41 +741,6 @@ class TestBenchmarkEngineSelection:
             await run_benchmark(run, pool)
         return run, pool
 
-    @pytest.mark.asyncio
-    async def test_auto_uses_vlm_engine_for_vlm_mtp_with_drafter(self):
-        settings = SimpleNamespace(
-            vlm_mtp_enabled=True,
-            vlm_mtp_draft_model="draft-model",
-        )
-
-        run, pool = await self._run(settings=settings)
-
-        assert pool.force_lm_values == [False]
-        assert run.experimental_features == ["vlm_mtp"]
-        assert run.status == "completed"
-
-    @pytest.mark.asyncio
-    async def test_auto_uses_vlm_engine_for_lightning_mtp(self):
-        settings = SimpleNamespace(mtp_enabled=True)
-
-        run, pool = await self._run(settings=settings)
-
-        assert pool.force_lm_values == [False]
-        assert run.experimental_features == ["mtp"]
-        assert run.status == "completed"
-
-    @pytest.mark.asyncio
-    async def test_force_lm_engine_overrides_vlm_mtp_auto(self):
-        settings = SimpleNamespace(
-            vlm_mtp_enabled=True,
-            vlm_mtp_draft_model="draft-model",
-        )
-
-        run, pool = await self._run(settings=settings, force_lm_engine=True)
-
-        assert pool.force_lm_values == [True]
-        assert run.experimental_features == ["vlm_mtp"]
-        assert run.status == "completed"
 
     @pytest.mark.asyncio
     async def test_force_lm_engine_overrides_lightning_mtp_auto(self):
@@ -808,18 +752,6 @@ class TestBenchmarkEngineSelection:
         assert run.experimental_features == ["mtp"]
         assert run.status == "completed"
 
-    @pytest.mark.asyncio
-    async def test_auto_keeps_lm_engine_without_vlm_mtp_drafter(self):
-        settings = SimpleNamespace(
-            vlm_mtp_enabled=True,
-            vlm_mtp_draft_model=None,
-        )
-
-        run, pool = await self._run(settings=settings)
-
-        assert pool.force_lm_values == [True]
-        assert run.experimental_features == ["vlm_mtp"]
-        assert run.status == "completed"
 
     @pytest.mark.asyncio
     async def test_run_benchmark_pins_speed_priority_and_restores(self):
@@ -914,50 +846,6 @@ class TestBenchmarkEngineSelection:
         assert run.status == "completed"
         assert engine.calls[0]["max_tokens"] == 128
 
-    @pytest.mark.asyncio
-    async def test_ane_warmup_executes_a_full_2048_token_prefill(self):
-        class LongTokenizer:
-            def encode(self, text):
-                return list(range(10000))
-
-        class RecordingEngine(_FakeBenchEngine):
-            tokenizer = LongTokenizer()
-
-            def __init__(self):
-                self.calls = []
-
-            async def stream_generate(self, **kwargs):
-                self.calls.append(kwargs)
-                yield SimpleNamespace(
-                    completion_tokens=1,
-                    prompt_tokens=len(kwargs["prompt"]),
-                    cached_tokens=0,
-                    new_text="x",
-                    finished=True,
-                    finish_reason="length",
-                )
-
-        engine = RecordingEngine()
-        run = BenchmarkRun(
-            bench_id="bench-ane-warmup",
-            request=BenchmarkRequest(
-                model_id="test-model",
-                prompt_lengths=[1024],
-                generation_length=1,
-                warmup_mode="ane_2048",
-            ),
-        )
-
-        with patch("omlx.admin.benchmark._upload_to_omlx_ai", AsyncMock()):
-            await run_benchmark(run, _FakeBenchEnginePool(engine=engine))
-
-        assert run.status == "completed"
-        # stream_generate reserves the final token for first decode, leaving
-        # exactly 2,048 tokens for the ANE-eligible prefill invocation.
-        assert len(engine.calls[0]["prompt"]) == 2049
-        assert len(engine.calls[1]["prompt"]) == 1024
-
-
 # =============================================================================
 # Experimental feature detection tests
 # =============================================================================
@@ -966,22 +854,11 @@ class TestBenchmarkEngineSelection:
 class TestExperimentalFeatureDetection:
     def test_detects_all_upload_skipping_features(self):
         settings = SimpleNamespace(
-            dflash_enabled=True,
-            specprefill_enabled=True,
-            turboquant_kv_enabled=True,
             mtp_enabled=True,
-            vlm_mtp_enabled=True,
-            qwen35_ane_prefill_enabled=True,
+            dflash_enabled=False,
         )
 
-        assert _detect_experimental_features(settings) == [
-            "dflash",
-            "specprefill",
-            "turboquant",
-            "mtp",
-            "vlm_mtp",
-            "qwen35_ane_prefill",
-        ]
+        assert _detect_experimental_features(settings) == ["mtp"]
 
     def test_missing_flags_are_treated_as_disabled(self):
         assert _detect_experimental_features(SimpleNamespace()) == []
@@ -1000,35 +877,6 @@ class TestDeriveFeatureFlags:
         settings = SimpleNamespace(mtp_enabled=True, dflash_enabled=False)
         keys = [f["key"] for f in _derive_feature_flags(settings)]
         assert keys == ["lightning_mtp"]
-
-    def test_turboquant_carries_its_bit_width(self):
-        settings = SimpleNamespace(turboquant_kv_enabled=True, turboquant_kv_bits=4)
-        assert _derive_feature_flags(settings) == [
-            {"key": "turboquant_kv_4bit", "label": "TurboQuant KV 4-bit"}
-        ]
-
-    def test_qwen_ane_prefill_is_reported_as_acceleration(self):
-        settings = SimpleNamespace(qwen35_ane_prefill_enabled=True)
-        assert _derive_feature_flags(settings) == [
-            {"key": "qwen35_ane_prefill", "label": "Qwen ANE Prefill"}
-        ]
-
-    def test_fractional_bit_width_stays_key_safe(self):
-        # Keys must match [a-z0-9_] for the leaderboard, so 2.5 becomes 2_5.
-        settings = SimpleNamespace(turboquant_kv_enabled=True, turboquant_kv_bits=2.5)
-        flag = _derive_feature_flags(settings)[0]
-        assert flag["key"] == "turboquant_kv_2_5bit"
-        assert flag["label"] == "TurboQuant KV 2.5-bit"
-
-    def test_float_valued_whole_bits_do_not_render_a_decimal(self):
-        settings = SimpleNamespace(turboquant_kv_enabled=True, turboquant_kv_bits=4.0)
-        assert _derive_feature_flags(settings)[0]["key"] == "turboquant_kv_4bit"
-
-    def test_turboquant_without_a_bit_width_falls_back_to_the_bare_key(self):
-        settings = SimpleNamespace(turboquant_kv_enabled=True, turboquant_kv_bits=None)
-        assert _derive_feature_flags(settings) == [
-            {"key": "turboquant_kv", "label": "TurboQuant KV"}
-        ]
 
     def test_index_cache_freq_is_not_a_flag(self):
         # It is a layer stride, not an on/off accelerator — tagging a run
@@ -1051,34 +899,15 @@ class TestFilterUploadedSettings:
     def test_performance_fields_are_kept(self):
         out = _filter_uploaded_settings(
             self._settings(
-                turboquant_kv_enabled=True,
-                turboquant_kv_bits=4,
                 mtp_enabled=True,
                 mtp_num_draft_tokens=3,
-                index_cache_freq=4,
+                thinking_budget_tokens=2048,
                 guided_grammar_enabled=True,
-                qwen35_ane_prefill_enabled=True,
-                qwen35_ane_prefill_sequence_length=2048,
-                qwen35_ane_prefill_fraction=0.53,
-                qwen35_ane_prefill_max_layers=64,
-                qwen35_ane_prefill_dual_ane=True,
-                qwen35_ane_prefill_gdn=True,
-                qwen35_ane_prefill_gdn_fraction=0.5,
-                qwen35_ane_prefill_gdn_max_layers=48,
             )
         )
-        assert out["turboquant_kv_bits"] == 4
         assert out["mtp_num_draft_tokens"] == 3
-        assert out["index_cache_freq"] == 4
+        assert out["thinking_budget_tokens"] == 2048
         assert out["guided_grammar_enabled"] is True
-        assert out["qwen35_ane_prefill_enabled"] is True
-        assert out["qwen35_ane_prefill_sequence_length"] == 2048
-        assert out["qwen35_ane_prefill_fraction"] == 0.53
-        assert out["qwen35_ane_prefill_max_layers"] == 64
-        assert out["qwen35_ane_prefill_dual_ane"] is True
-        assert out["qwen35_ane_prefill_gdn"] is True
-        assert out["qwen35_ane_prefill_gdn_fraction"] == 0.5
-        assert out["qwen35_ane_prefill_gdn_max_layers"] == 48
 
     def test_free_text_and_organization_fields_are_dropped(self):
         out = _filter_uploaded_settings(
@@ -1119,25 +948,6 @@ class TestFilterUploadedSettings:
         assert "guided_grammar" not in out
         assert out["guided_grammar_enabled"] is True
 
-    def test_draft_model_paths_are_reduced_to_a_basename(self):
-        # The drafter's identity explains an MTP/DFlash result; the full path
-        # would leak the local filesystem layout and the OS username.
-        out = _filter_uploaded_settings(
-            self._settings(
-                dflash_enabled=True,
-                dflash_draft_model="/Users/someone/Workspace/models/Qwen3-0.6B-4bit",
-            )
-        )
-        assert out["dflash_draft_model"] == "Qwen3-0.6B-4bit"
-
-    def test_bare_draft_model_name_is_unchanged(self):
-        out = _filter_uploaded_settings(
-            self._settings(
-                dflash_enabled=True,
-                dflash_draft_model="Qwen3-0.6B-4bit",
-            )
-        )
-        assert out["dflash_draft_model"] == "Qwen3-0.6B-4bit"
 
     def test_non_settings_object_returns_none(self):
         assert _filter_uploaded_settings(SimpleNamespace()) is None
@@ -1145,16 +955,11 @@ class TestFilterUploadedSettings:
     def test_oversized_snapshot_falls_back_to_accelerator_flags(self):
         # The fallback keeps every accelerator toggle, disabled ones included:
         # knowing a feature was off is as useful as knowing it was on.
-        settings = self._settings(mtp_enabled=True, turboquant_kv_enabled=True)
+        settings = self._settings(mtp_enabled=True)
         with patch("omlx.admin.benchmark._MAX_UPLOADED_SETTINGS_BYTES", 10):
             out = _filter_uploaded_settings(settings)
         assert out == {
-            "dflash_enabled": False,
-            "specprefill_enabled": False,
-            "turboquant_kv_enabled": True,
             "mtp_enabled": True,
-            "vlm_mtp_enabled": False,
-            "qwen35_ane_prefill_enabled": False,
         }
         # Everything else is gone.
         assert "temperature" not in out
@@ -1538,10 +1343,9 @@ class TestUploadToOmlxAi:
                 model_id="Qwen3-30B-4bit",
                 prompt_lengths=[1024],
             ),
-            experimental_features=["dflash", "turboquant"],
+            experimental_features=["dflash"],
             feature_flags=[
                 {"key": "dflash", "label": "DFlash"},
-                {"key": "turboquant_kv_4bit", "label": "TurboQuant KV 4-bit"},
             ],
             model_settings_snapshot={"dflash_enabled": True},
         )
@@ -1576,7 +1380,6 @@ class TestUploadToOmlxAi:
         payload = mock_to_thread.await_args.kwargs["json"]
         assert payload["feature_flags"] == [
             {"key": "dflash", "label": "DFlash"},
-            {"key": "turboquant_kv_4bit", "label": "TurboQuant KV 4-bit"},
         ]
         assert payload["context_profile"] == "code_python"
         assert payload["model_settings"] == {
@@ -2127,104 +1930,3 @@ class TestRunExternalBenchmark:
         assert "cancelled" in run.events[-1]["message"].lower()
         client.aclose.assert_awaited()
 
-
-# =============================================================================
-# ANE benchmark trace tests
-# =============================================================================
-
-
-class TestAneBenchmarkTrace:
-    def test_summary_reports_observed_scheduler_calls_not_implied_prompt_width(
-        self, caplog
-    ):
-        with caplog.at_level(logging.INFO):
-            _log_ane_benchmark_trace(
-                pp_len=4097,
-                prefill_duration_s=1.0,
-                config={"sequence_length": 2048, "mlp_layers": 2},
-                profile={"mlp": {"operations": 4}},
-                scheduler_trace={
-                    "chunk_tokens": [2048, 2048],
-                    "requested_steps": [4096, 4096],
-                    "boundary_enabled": True,
-                    "cache_block_size": 2048,
-                },
-            )
-
-        messages = [record.getMessage() for record in caplog.records]
-        summary = next(m for m in messages if "[benchmark-ane-summary]" in m)
-        assert "model_calls=2" in summary
-        assert "model_call_widths=2048x2" in summary
-        assert "requested_steps=4096x2" in summary
-        assert "boundary_enabled=True" in summary
-        assert "cache_block_size=2048" in summary
-        assert "accounting=observed" in summary
-        assert "full_ane_tiles=2" in summary
-        assert "gpu_tail_tokens=0" in summary
-
-    def test_summary_distinguishes_one_wide_call_from_two_tiles(self, caplog):
-        with caplog.at_level(logging.INFO):
-            _log_ane_benchmark_trace(
-                pp_len=4097,
-                prefill_duration_s=1.0,
-                config={"sequence_length": 2048, "mlp_layers": 2},
-                profile={"mlp": {"operations": 4}},
-                scheduler_trace={
-                    "chunk_tokens": [4096],
-                    "requested_steps": [4096],
-                    "boundary_enabled": False,
-                    "cache_block_size": 0,
-                },
-            )
-
-        summary = next(
-            record.getMessage()
-            for record in caplog.records
-            if "[benchmark-ane-summary]" in record.getMessage()
-        )
-        assert "model_calls=1" in summary
-        assert "model_call_widths=4096x1" in summary
-        assert "full_ane_tiles=2" in summary
-
-    def test_expectations_follow_compiled_layers(self, caplog):
-        with caplog.at_level(logging.INFO):
-            _log_ane_benchmark_trace(
-                pp_len=16385,
-                prefill_duration_s=1.0,
-                config={
-                    "sequence_length": 2048,
-                    "mlp_layers": 64,
-                    "gdn_layers": 48,
-                    "compiled_mlp_layers": 60,
-                    "compiled_gdn_layers": 0,
-                    "active": True,
-                },
-                profile={"mlp": {"operations": 480}, "gdn": {}},
-            )
-
-        messages = [record.getMessage() for record in caplog.records]
-        mlp_line = next(m for m in messages if "category=mlp" in m)
-        assert "configured_layers=64" in mlp_line
-        assert "compiled_layers=60" in mlp_line
-        assert "expected_operations=480" in mlp_line
-        gdn_line = next(m for m in messages if "category=gdn" in m)
-        assert "compiled_layers=0" in gdn_line
-        assert "expected_operations=0" in gdn_line
-
-    def test_settings_layers_remain_the_fallback_when_unknown(self, caplog):
-        with caplog.at_level(logging.INFO):
-            _log_ane_benchmark_trace(
-                pp_len=4096,
-                prefill_duration_s=None,
-                config={"sequence_length": 2048, "mlp_layers": 64},
-                profile={},
-            )
-
-        mlp_line = next(
-            record.getMessage()
-            for record in caplog.records
-            if "category=mlp" in record.getMessage()
-        )
-        assert "configured_layers=64" in mlp_line
-        assert "compiled_layers=unknown" in mlp_line
-        assert "expected_operations=64" in mlp_line

@@ -52,12 +52,7 @@ def _is_undo_armed() -> bool:
 
 
 def _is_decode_consistent_armed() -> bool:
-    try:
-        from omlx.patches.deepseek_v4.decode_consistency import is_armed
-
-        return is_armed()
-    except Exception:
-        return False
+    return False
 
 
 def stage_functional_rotating_update(self, keys, values) -> None:
@@ -93,7 +88,7 @@ def _wrap_rotating(cls, fields) -> None:
     orig_trim = cls.trim
 
     def update_and_fetch(self, keys, values):
-        # DSpark's decode-consistent verify advances the cache with several
+        # Chain-verify drafts advance the cache with several
         # M=1 updates; a depth-k Lightning verify uses one update containing the
         # confirmed token plus every draft token (currently up to M=9 for
         # depth-8 drafting). Preserve one pre-block snapshot for both forms

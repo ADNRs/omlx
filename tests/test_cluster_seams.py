@@ -214,9 +214,6 @@ def test_no_unreachable_functions_in_the_cluster_package():
 
     allowed_uncalled = {
         ("deployment.py", "decode_worker_plan"),
-        # Maintainer-only real-collective regression gate. It deliberately is
-        # not exposed in the GUI or production route surface.
-        ("collective.py", "_run_local_minimax_decode_smoke"),
         # known_hosts helpers, not yet wired into the pairing flow.
         ("ssh_keys.py", "add_host_key"),
         ("ssh_keys.py", "_ssh_executable"),

@@ -94,8 +94,8 @@ def test_should_route_gate():
     # decode (qL==1) -> fused vector kernel handles 256
     qd, kd, _ = _qkv(1, 16384)
     assert sdpa256._should_route(qd, kd, None, "causal", None) is False
-    # decode-shaped multi-row (MTP verify, qL = 1 + depth <= 9) -> stock path;
-    # the per-tile eval sync collapses long-context MTP tok/s (issue #2127)
+    # decode-shaped multi-row (MTP verify, qL = 1 + depth <= 9) -> stock
+    # path: the tiled kernel's GEMM shapes lose to stock unfused at tiny M
     for q_len in (2, 4, 9, 15):
         qv, kv, _ = _qkv(q_len, 16384)
         assert sdpa256._should_route(qv, kv, None, "causal", None) is False
@@ -250,9 +250,50 @@ def _sdpa256_provider_reset(monkeypatch):
     from omlx.patches import sdpa256_attention as sdpa256
 
     monkeypatch.setattr(sdpa256, "_HEADROOM_PROVIDER", None, raising=False)
+    monkeypatch.setattr(
+        sdpa256, "_PHYS_HEADROOM_PROVIDER", None, raising=False
+    )
     monkeypatch.setattr(sdpa256, "_FORCE_TILED", None, raising=False)
     monkeypatch.setattr(sdpa256, "_TILED_ROUTE_LOGGED", set(), raising=False)
+    monkeypatch.setattr(sdpa256, "_STICKY_TILED_KV_LEN", None, raising=False)
     return sdpa256
+
+
+def test_q_tile_uses_physical_headroom_for_productive_tiles(
+    _sdpa256_provider_reset,
+):
+    """Regression (2026-08-27, 262K bench analysis): the sizing-target
+    headroom at 200k context is ~2.75GB, which under the old 10 B/elem
+    constant capped the Q tile at 64 rows — M=64 GEMMs run at ~1/3 of
+    tensor-core peak (measured 1440ms/layer at kv=200k; tile 256 runs
+    870ms, 1.66x). The physical-headroom budget grows the tile to the
+    measured sweet spot while bounding the transient under the hard
+    ceiling."""
+    sdpa256 = _sdpa256_provider_reset
+
+    # No providers: standalone default budget (4GB / (24*200k*5.5B)) -> 151
+    # -> 128 rows.
+    assert sdpa256._pick_q_tile(24, 200_000) == 128
+
+    # The physical-headroom provider no longer grows the tile (2026-08-28
+    # postmortem: large tiles cycle the capped pool against the enforcer
+    # and spiral the estimator into requeue rejections; see _pick_q_tile).
+    # The sizing budget governs alone.
+    sizing_owner = _HeadroomOwner(int(2.75 * 1024**3))
+    phys_owner = _HeadroomOwner(int(7.5 * 1024**3))
+    sdpa256.set_unfused_headroom_provider(sizing_owner.headroom)
+    sdpa256.set_physical_headroom_provider(phys_owner.headroom)
+    assert sdpa256._pick_q_tile(24, 200_000) == 64
+
+    # Physical headroom tight (3GB): still the 64-row floor.
+    phys_owner.value = int(3 * 1024**3)
+    assert sdpa256._pick_q_tile(24, 200_000) == 64
+
+    # The tile never exceeds the measured sweet-spot cap even with huge
+    # physical headroom.
+    phys_owner.value = 1 << 42
+    assert sdpa256._pick_q_tile(24, 200_000) <= sdpa256._Q_TILE
+    assert sdpa256._Q_TILE <= 256
 
 
 def test_route_prefers_stock_when_unfused_fits(_sdpa256_provider_reset):
@@ -264,12 +305,15 @@ def test_route_prefers_stock_when_unfused_fits(_sdpa256_provider_reset):
     sdpa256.set_unfused_headroom_provider(owner.headroom)
     assert sdpa256._should_route(q, k, None, "causal", None) is False
 
-    # Exactly at the estimated transient the unfused path still fits...
+    # The gate prices the unfused transient with a safety multiplier: the
+    # raw estimate under-counts softmax temporaries and async-graph
+    # liveness, so the boundary is safety x raw estimate.
+    safety = sdpa256._UNFUSED_TRANSIENT_SAFETY
     need = estimate_unfused_sdpa_call_bytes(24, 2048, 16384, 256, q.dtype.size)
-    owner.value = need
+    owner.value = int(need * safety)
     assert sdpa256._should_route(q, k, None, "causal", None) is False
-    # ...one byte short -> tiled.
-    owner.value = need - 1
+    # ...one byte short -> tiled (and sticky from here on at this kv_len).
+    owner.value = int(need * safety) - 1
     assert sdpa256._should_route(q, k, None, "causal", None) is True
 
     # Negative headroom = no active ceiling -> memory-safe default.
@@ -288,6 +332,41 @@ def test_route_defaults_to_tiled_when_provider_owner_dies(_sdpa256_provider_rese
     del owner
     gc.collect()
     assert sdpa256._should_route(q, k, None, "causal", None) is True
+
+
+def test_route_sticky_after_headroom_engagement(_sdpa256_provider_reset):
+    """Once the unfused path proved not to fit at some kv_len, a reclaim
+    that re-opens headroom must not flip the route back — that flip-flop
+    was the prefill-LRU-eviction thrash loop (overshoot -> evict -> reclaim
+    -> unfused -> overshoot). A shorter context still gets the fast path."""
+    sdpa256 = _sdpa256_provider_reset
+    q8, k8, _ = _qkv(2048, 8192)
+    q16, k16, _ = _qkv(2048, 16384)
+    owner = _HeadroomOwner(1 << 40)
+    sdpa256.set_unfused_headroom_provider(owner.headroom)
+    # At 8k the unfused transient fits even with the safety multiplier.
+    assert sdpa256._should_route(q8, k8, None, "causal", None) is False
+    # Tight headroom at 16k -> tiled; the ratchet latches at 16384.
+    owner.value = 1
+    assert sdpa256._should_route(q16, k16, None, "causal", None) is True
+    # Headroom re-opens (an eviction just reclaimed the buffer pool): the
+    # route must stay tiled at >= 16384...
+    owner.value = 1 << 40
+    assert sdpa256._should_route(q16, k16, None, "causal", None) is True
+    # ...while a shorter context keeps the fast unfused path.
+    assert sdpa256._should_route(q8, k8, None, "causal", None) is False
+
+
+def test_route_sticky_env_disable(_sdpa256_provider_reset, monkeypatch):
+    """OMLX_SDPA256_STICKY=0 restores the pure headroom-probe behavior."""
+    sdpa256 = _sdpa256_provider_reset
+    monkeypatch.setenv("OMLX_SDPA256_STICKY", "0")
+    q, k, _ = _qkv(2048, 16384)
+    owner = _HeadroomOwner(1)
+    sdpa256.set_unfused_headroom_provider(owner.headroom)
+    assert sdpa256._should_route(q, k, None, "causal", None) is True
+    owner.value = 1 << 40
+    assert sdpa256._should_route(q, k, None, "causal", None) is False
 
 
 def test_route_defaults_to_tiled_when_provider_raises(_sdpa256_provider_reset):

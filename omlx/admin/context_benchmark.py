@@ -351,6 +351,10 @@ def _reset_transient_tracker(scheduler: Any) -> None:
             tracker.reset()
         except Exception as exc:
             logger.debug("Context bench: tracker reset failed: %s", exc)
+    try:
+        scheduler._throttle_last_post_bytes = 0
+    except Exception:
+        pass
 
 
 async def _relay_prefill_progress(
@@ -433,7 +437,7 @@ async def run_context_benchmark(run: ContextBenchmarkRun, engine_pool: Any) -> N
             raise RuntimeError(
                 "This model's engine does not expose a scheduler, so the "
                 "context benchmark cannot probe its admission boundary. "
-                "Disable speculative engine features (e.g. DFlash) for this "
+                "Disable speculative engine features (e.g. MTP) for this "
                 "model and retry."
             )
         if not _guard_ready(scheduler):

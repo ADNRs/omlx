@@ -16,7 +16,7 @@ import pytest
 
 import omlx.custom_kernels as custom_kernels
 
-KERNELS = ["glm_moe_dsa", "minimax_m3", "qwen35_prefill"]
+KERNELS = ["qwen35_prefill"]
 
 
 def _import_fast_copy(tmp_path, kernel, name, with_broken_ext):

@@ -131,23 +131,6 @@ class TestSchedulerStreamIsolation:
         request.prompt_token_ids = [1, 2, 3]
         request.num_prompt_tokens = 3
         cache = [SimpleNamespace(state=mx.array([0]))]
-        spec_request = Request(
-            request_id="specprefill-stream",
-            prompt=[1, 2, 3, 4],
-            sampling_params=SamplingParams(),
-        )
-        spec_request.prompt_token_ids = [1, 2, 3, 4]
-        spec_request.remaining_tokens = [1, 2, 3, 4]
-        spec_request.num_prompt_tokens = 4
-        spec_request._specprefill_enabled = True
-        spec_request._specprefill_threshold = 1
-        spec_request._specprefill_keep_pct = 0.5
-        scheduler._specprefill_draft_model = object()
-        scheduler._draft_prefix_cache = None
-
-        def record_specprefill_stream(*args, **kwargs):
-            observed_streams.append(mx.default_stream(mx.gpu))
-            return mx.ones(4), []
 
         def run_prefill():
             worker_default = mx.default_stream(mx.gpu)
@@ -164,22 +147,14 @@ class TestSchedulerStreamIsolation:
                 cache,
             )
             scheduler._step_prefill_chunk(state)
-            scheduler._try_specprefill_scoring(spec_request)
             return worker_default, expected_engine_stream, mx.default_stream(mx.gpu)
 
-        with (
-            patch(
-                "omlx.patches.specprefill.score_tokens",
-                side_effect=record_specprefill_stream,
-            ),
-            concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor,
-        ):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             worker_default, expected_engine_stream, restored_default = executor.submit(
                 run_prefill
             ).result()
 
         assert observed_streams == [
-            expected_engine_stream,
             expected_engine_stream,
             expected_engine_stream,
         ]

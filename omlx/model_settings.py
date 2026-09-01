@@ -34,51 +34,6 @@ SETTINGS_VERSION = 1
 MAX_LIGHTNING_MTP_DRAFT_TOKENS = 8
 
 
-def vlm_mtp_processor_conflicts(data: dict) -> list:
-    """Names of settings that need per-request logits processors and
-    therefore cannot combine with ``vlm_mtp_enabled``.
-
-    The vlm_mtp decode path bypasses mlx-lm BatchGenerator, where logits
-    processors are applied; with any of these set, every request would fall
-    back to BatchGenerator and the toggle would never engage (#2399).
-    Neutral values (repetition 1.0, presence 0.0) build no processor and do
-    not conflict.
-
-    ``thinking_budget_enabled`` is intentionally absent: the vlm_mtp path
-    applies ``ThinkingBudgetProcessor`` at verify time via
-    ``MTPProcessingSampler`` (see omlx/speculative/processing_sampler.py),
-    so a thinking-budget default no longer forces the BatchGenerator
-    fallback.
-    """
-    conflicts = []
-    rep = data.get("repetition_penalty")
-    if rep is not None and rep != 1.0:
-        conflicts.append("repetition_penalty")
-    pres = data.get("presence_penalty")
-    if pres is not None and pres != 0.0:
-        conflicts.append("presence_penalty")
-    if data.get("guided_grammar_enabled"):
-        conflicts.append("guided_grammar_enabled")
-    return conflicts
-
-
-def resolve_vlm_mtp_conflicts(data: dict) -> tuple:
-    """Clear ``vlm_mtp_enabled`` from ``data`` when it conflicts with
-    processor-backed settings; returns ``(data, conflict_names)``.
-
-    The sampling / grammar side wins because those settings shape output
-    content while vlm_mtp only affects speed. Used for settings dicts that
-    predate the exclusivity rule (persisted files, profile merges) so
-    ``ModelSettings.__post_init__`` does not reject the whole blob.
-    """
-    if not data.get("vlm_mtp_enabled"):
-        return data, []
-    conflicts = vlm_mtp_processor_conflicts(data)
-    if not conflicts:
-        return data, []
-    resolved = dict(data)
-    resolved["vlm_mtp_enabled"] = False
-    return resolved, conflicts
 PROFILES_VERSION = 1
 TEMPLATES_VERSION = 1
 
@@ -103,84 +58,17 @@ class ModelSettings:
         ttl_seconds: Auto-unload after idle seconds (None = no TTL).
         model_type_override: "llm", "vlm", "embedding", "reranker", or None (auto-detect).
         model_alias: API-visible alternative to the directory name.
-        index_cache_freq: IndexCache: every Nth layer keeps indexer (DeepSeek DSA
-            only; GLM-5.2 uses its native checkpoint schedule).
         enable_thinking: Explicit toggle for thinking/reasoning mode (None = auto).
         thinking_budget_enabled: Whether a thinking token budget is active.
         thinking_budget_tokens: Max tokens for thinking/reasoning.
         reasoning_parser: xgrammar builtin name: "qwen", "harmony", "llama", etc.
         guided_grammar_enabled: Whether a default guided grammar is active.
         guided_grammar: Default EBNF grammar for constrained decoding.
-        turboquant_kv_enabled: Enable TurboQuant KV cache compression.
-        turboquant_kv_bits: TurboQuant bit depth (2/2.5/3/3.5/4/6/8).
-        turboquant_skip_last: Skip last KVCache layer to prevent corruption.
-        qwen35_ane_prefill_enabled: Enable private fixed-shape Qwen3.5/3.6/3.8
-            ANE/GPU prompt processing.
-        qwen35_ane_prefill_sequence_length: Exact flattened token count routed
-            through the eagerly compiled ANE programs.
-        qwen35_ane_prefill_tail_padding_min_tokens: Smallest residual tokenwise
-            projection block padded to the compiled ANE shape (zero disables).
-        qwen35_ane_prefill_fraction: Fraction of eligible MLP outputs assigned
-            across the ANE instances.
-        qwen35_ane_prefill_fused_down: Fuse SwiGLU and partial down projection
-            into each dual-ANE/CPU hidden-channel branch.
-        qwen35_ane_prefill_max_layers: Maximum eligible MLP layers accelerated.
-        qwen35_ane_prefill_dual_ane: Pin a procedure bank to each physical ANE.
-        qwen35_ane_prefill_gdn: Also accelerate eligible GDN input projections.
-        qwen35_ane_prefill_gdn_fraction: Fraction of eligible GDN projection
-            outputs assigned across the ANE instances.
-        qwen35_ane_prefill_gdn_max_layers: Maximum eligible GDN layers accelerated.
-        qwen35_ane_prefill_cpu_enabled: Share eligible q4 MLP gate/up outputs
-            with the CPU. Requires a separately preprocessed FP16 checkpoint.
-        qwen35_ane_prefill_cpu_fraction: Fraction of each eligible gate/up
-            projection assigned to the CPU.
-        qwen35_ane_prefill_cpu_down_fraction: Fraction of each eligible MLP
-            down projection assigned to the CPU.
-        qwen35_ane_prefill_cpu_gdn_fraction: Fraction of the eligible GDN
-            z+qkv projection outputs assigned to the CPU after the ANE prefix.
-        qwen35_ane_prefill_cpu_threads: Requested Accelerate worker count
-            (zero lets Accelerate choose).
-        qwen35_ane_prefill_cpu_shared_resource: Use dispatch_apply's
-            shared-resource scheduling attributes for manually sharded CPU work.
-        specprefill_enabled: Enable SpecPrefill (experimental sparse prefill for MoE).
-        specprefill_draft_model: Path to draft model for SpecPrefill.
-        specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
-        specprefill_threshold: Min tokens to trigger SpecPrefill.
-        dflash_enabled: Enable DFlash speculative decoding.
-        dflash_draft_model: Path/repo for DFlash draft checkpoint.
-        dflash_draft_quant_enabled: Enable draft model quantization.
-        dflash_draft_quant_weight_bits: Quantization weight bits (2, 4, 8).
-        dflash_draft_quant_activation_bits: Quantization activation bits (16, 32).
-        dflash_draft_quant_group_size: Quantization group size (32, 64, 128).
-        dflash_max_ctx: Token threshold to fall back to BatchedEngine (None = unlimited).
-        dflash_in_memory_cache: Enable DFlash L1 (RAM) prefix cache.
-        dflash_in_memory_cache_max_entries: L1 cache max entries (default 4, matches dflash balanced profile).
-        dflash_in_memory_cache_max_bytes: L1 cache byte budget.
-        dflash_ssd_cache: Enable DFlash L2 (SSD) prefix cache spill (uses omlx SSD cache dir).
-        dflash_ssd_cache_max_bytes: L2 (SSD) disk budget; dflash evicts oldest entries when exceeded.
-        dflash_draft_window_size: Draft model sliding-attention window
-            (None = use the draft checkpoint's sliding_window when present).
-            Helps stabilise acceptance rate on long-context prompts.
-        dflash_draft_sink_size: Attention-sink tokens always kept regardless of window
-            (default 0, disabling sink tokens).
-        dflash_block_size: Draft/verify tokens per cycle (None = checkpoint default).
-        dflash_verify_mode: Verifier algorithm — "dflash", "adaptive", "ddtree", or "off"
-            (None = dflash default "adaptive"). "adaptive" can shrink block size when
-            acceptance drops.
         mtp_enabled: Enable native multi-token prediction (mlx-lm PR 990 / PR 15 monkey-patch).
             When True, BatchGenerator uses MTP draft+verify for singleton decode and
             for multi-row decode batches whose cache positions are aligned. Unaligned
             continuous batches fall back to standard decoding automatically. Compatible
-            model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive with
-            dflash_enabled.
-        vlm_mtp_enabled: Enable VLM MTP speculative decoding via an external assistant
-            drafter (mlx-vlm 191d7c8+). Target = Gemma4 VLM body, drafter must be a
-            "gemma4_assistant" model. Mutually exclusive with processor-backed
-            settings (guided grammar, thinking budget, repetition/presence
-            penalties); requests carrying such per-request parameters fall back
-            to BatchGenerator so the constraints stay enforced (#2399).
-        vlm_mtp_draft_model: Path/repo of the assistant drafter (e.g. "gemma-4-26B-A4B-it-assistant").
-        vlm_mtp_draft_block_size: Tokens drafted per round (None = mlx-vlm default).
+            model_types: qwen3_5* / qwen3_6*.
         is_pinned: Keep model loaded in memory.
         is_default: Use this model when no model is specified.
         display_name: Human-readable name for UI display.
@@ -210,16 +98,9 @@ class ModelSettings:
     model_alias: Optional[str] = (
         None  # API-visible name (alternative to directory name)
     )
-    index_cache_freq: Optional[int] = (
-        None  # IndexCache: every Nth layer keeps indexer (DeepSeek DSA only)
-    )
     enable_thinking: Optional[bool] = (
         None  # Explicit toggle for thinking/reasoning mode (None = auto)
     )
-    # Qwen4-Exp only: keep the large PLE N-gram table on SSD and gather rows
-    # through mmap. The runtime may force this on when resident loading cannot
-    # fit under the configured model-memory ceiling but mmap loading can.
-    qwen4_ple_ssd_offload: bool = False
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )
@@ -231,96 +112,15 @@ class ModelSettings:
     guided_grammar_enabled: bool = False
     guided_grammar: Optional[str] = None
 
-    # TurboQuant KV cache (mlx-vlm backend)
-    turboquant_kv_enabled: bool = False
-    turboquant_kv_bits: float = 4  # 2, 2.5, 3, 3.5, 4, 6, 8
-    turboquant_skip_last: bool = (
-        True  # Skip last KVCache layer (prevents corruption on sensitive models)
-    )
-
-    # Experimental private-API ANE/GPU prefill for dense Qwen3.5/3.6/3.8 MLPs.
-    # Off by default because the fixed-shape ANE models add load-time/runtime
-    # cache memory and rely on undocumented AppleNeuralEngine interfaces.
-    qwen35_ane_prefill_enabled: bool = False
-    qwen35_ane_prefill_sequence_length: int = 2048
-    qwen35_ane_prefill_tail_padding_min_tokens: int = 0
-    qwen35_ane_prefill_fraction: float = 0.53
-    qwen35_ane_prefill_fused_down: bool = False
-    qwen35_ane_prefill_max_layers: int = 64
-    qwen35_ane_prefill_dual_ane: bool = True
-    qwen35_ane_prefill_gdn: bool = True
-    qwen35_ane_prefill_gdn_fraction: float = 0.50
-    qwen35_ane_prefill_gdn_max_layers: int = 48
-    qwen35_ane_prefill_cpu_enabled: bool = False
-    qwen35_ane_prefill_cpu_fraction: float = 0.135
-    qwen35_ane_prefill_cpu_down_fraction: float = 0.0
-    qwen35_ane_prefill_cpu_gdn_fraction: float = 0.0
-    qwen35_ane_prefill_cpu_threads: int = 8
-    qwen35_ane_prefill_cpu_shared_resource: bool = True
-
-    # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
-    specprefill_enabled: bool = False
-    specprefill_draft_model: Optional[str] = (
-        None  # Path to draft model (must share tokenizer)
-    )
-    specprefill_keep_pct: Optional[float] = None  # Keep rate (0.1-0.5, default 0.2)
-    specprefill_threshold: Optional[int] = None  # Min tokens to trigger (default 8192)
-
-    # DFlash (block diffusion speculative decoding)
-    dflash_enabled: bool = False
-    dflash_draft_model: Optional[str] = None  # Path/repo for DFlash draft checkpoint
-    dflash_draft_quant_enabled: Optional[bool] = None
-    dflash_draft_quant_weight_bits: Optional[int] = None  # 2, 4, 8
-    dflash_draft_quant_activation_bits: Optional[int] = None  # 16, 32
-    dflash_draft_quant_group_size: Optional[int] = None  # 32, 64, 128
-    dflash_max_ctx: Optional[int] = (
-        None  # None = unlimited; trigger BatchedEngine fallback when prompt_len >= this
-    )
-    # DFlash prefix cache (private to dflash; separate from omlx tiered cache because
-    # snapshots include draft model GDN state and target hidden chunks omlx never tracks)
-    dflash_in_memory_cache: bool = True
-    dflash_in_memory_cache_max_entries: int = (
-        4  # Matches dflash balanced profile default
-    )
-    dflash_in_memory_cache_max_bytes: int = (
-        8 * 1024 * 1024 * 1024
-    )  # 8 GiB (balanced profile default)
-    dflash_ssd_cache: bool = (
-        False  # Requires in-memory cache and an omlx paged SSD cache dir
-    )
-    dflash_ssd_cache_max_bytes: int = 20 * 1024 * 1024 * 1024  # 20 GiB L2 disk budget
-    # DFlash runtime tuning knobs. None window size uses the draft checkpoint's
-    # sliding_window when present; sink size defaults to no attention-sink tokens.
-    dflash_draft_window_size: Optional[int] = None
-    dflash_draft_sink_size: Optional[int] = 0
-    dflash_block_size: Optional[int] = None
-    dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
-
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
     # uses MTP draft+verify for singleton decode and aligned multi-row decode batches.
-    # Compatible model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive
-    # with dflash.
+    # Compatible model_types: qwen3_5* / qwen3_6*.
     mtp_enabled: bool = False
     # Maximum chained MTP draft tokens per verify cycle (speculative depth).
-    # None = model-specific default (3 for DeepSeek-V4 and Qwen3.5/3.6).
+    # None = model-specific default (3 for Qwen3.5/3.6).
     # An adaptive controller picks 1..max per sequence from rolling
     # acceptance/latency estimates; set to 1 for a fixed depth-1 cycle.
     mtp_num_draft_tokens: Optional[int] = None
-
-    # VLM MTP speculative decoding via external MTP drafter (mlx-vlm f96138e+).
-    # Supported drafter types: gemma4_assistant (for Gemma 4 VLMs), qwen3_5_mtp
-    # (for Qwen 3.5/3.6). Both resolve to draft_kind="mtp" in mlx-vlm.
-    # Mutually exclusive with all other speculative paths because the wrapper
-    # bypasses mlx-lm BatchGenerator at decode time. Also exclusive with
-    # processor-backed settings (guided grammar, thinking budget, penalties)
-    # — see vlm_mtp_processor_conflicts().
-    vlm_mtp_enabled: bool = False
-    vlm_mtp_draft_model: Optional[str] = (
-        None  # Path / model id of the assistant drafter
-    )
-    vlm_mtp_draft_block_size: Optional[int] = (
-        None  # Tokens per draft round (None = mlx-vlm default)
-    )
 
     # Model management flags
     is_pinned: bool = False
@@ -339,47 +139,7 @@ class ModelSettings:
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
 
     def __post_init__(self) -> None:
-        # Native MTP is mutually exclusive with DFlash (also speculative).
-        # Reject the combo at construction time so the conflict surfaces in
-        # the admin UI / API rather than at model load. TurboQuant KV is
-        # compatible: its attention patch routes MTP's decode-shaped
-        # multi-row verify through the quantized decode kernels.
-        if self.mtp_enabled and self.dflash_enabled:
-            raise ValueError(
-                "mtp_enabled and dflash_enabled cannot both be True; choose one "
-                "speculative-decoding path per model"
-            )
-        # vlm_mtp wraps mlx-vlm's MTP loop and bypasses mlx-lm BatchGenerator
-        # at decode time, so it cannot coexist with any other speculative path
-        # or with TurboQuant (which mutates the same cache objects).
-        if self.vlm_mtp_enabled:
-            conflicts = [
-                ("dflash_enabled", self.dflash_enabled),
-                ("specprefill_enabled", self.specprefill_enabled),
-                ("mtp_enabled", self.mtp_enabled),
-                ("turboquant_kv_enabled", self.turboquant_kv_enabled),
-            ]
-            for name, value in conflicts:
-                if value:
-                    raise ValueError(
-                        f"vlm_mtp_enabled and {name} cannot both be True; "
-                        "choose one speculative path per model"
-                    )
-            # Grammar / penalty defaults materialize as per-request logits
-            # processors, which the vlm_mtp decode path cannot apply —
-            # every request would fall back to BatchGenerator and the
-            # toggle would silently never engage (#2399). Reject the combo
-            # at construction time like the speculative-path conflicts
-            # above. Thinking budget is exempt: it is applied at verify
-            # time via MTPProcessingSampler.
-            processor_conflicts = vlm_mtp_processor_conflicts(self.to_dict())
-            if processor_conflicts:
-                raise ValueError(
-                    "vlm_mtp_enabled cannot be combined with "
-                    f"{', '.join(processor_conflicts)}; these settings "
-                    "require per-request logits processors, which the "
-                    "vlm_mtp decode path does not apply"
-                )
+        pass
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.
@@ -446,11 +206,55 @@ class ModelSettingsManager:
         self._load()
         self._load_profiles()
         self._load_templates()
+        self._record_settings_file_stamp()
+
+    def _record_settings_file_stamp(self) -> None:
+        """Remember the on-disk stamp of the settings file (mtime_ns, size).
+
+        ``get_settings`` compares against this to detect external edits: the
+        manager used to read the file exactly once at startup, so a hand edit
+        of ``mtp_enabled`` (or any load-time control) never
+        reached a running server — the runtime-signature reload in
+        engine_pool compares against this manager's CACHED copy, and even an
+        engine reload served the stale in-memory settings. Only a restart
+        had any effect — the exact "settings file is ineffective" trap.
+        """
+        try:
+            st = self.settings_file.stat()
+        except OSError:
+            self._settings_mtime_ns = 0
+            self._settings_size = 0
+            return
+        self._settings_mtime_ns = st.st_mtime_ns
+        self._settings_size = st.st_size
+
+    def _reload_settings_if_changed(self) -> None:
+        """Re-read the settings file when its on-disk stamp changed.
+
+        Caller must hold ``self._lock``. A failed parse keeps the current
+        in-memory settings (an editor's partial write must not wipe every
+        model's configured draft mode); the next successful edit replaces
+        them. ``_load`` only mutates ``self._settings`` on success.
+        """
+        try:
+            st = self.settings_file.stat()
+        except OSError:
+            return
+        if (
+            st.st_mtime_ns != self._settings_mtime_ns
+            or st.st_size != self._settings_size
+        ):
+            logger.info("Model settings file changed on disk; reloading it")
+            self._load()
+            self._record_settings_file_stamp()
 
     def _load(self) -> None:
         """Load settings from the JSON file.
 
-        If the file doesn't exist or is invalid, starts with empty settings.
+        If the file doesn't exist or is invalid, starts with empty settings
+        at startup; once settings are loaded, a failed reload keeps the
+        current ones (partial external writes must not silently reset every
+        model to defaults).
         """
         if not self.settings_file.exists():
             logger.debug(f"Settings file not found: {self.settings_file}")
@@ -459,7 +263,8 @@ class ModelSettingsManager:
 
         try:
             with open(self.settings_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
+                raw = f.read()
+            data = json.loads(raw) if raw.strip() else {}
 
             # Check version
             version = data.get("version", 1)
@@ -470,38 +275,27 @@ class ModelSettingsManager:
 
             # Load model settings
             models_data = data.get("models", {})
-            self._settings = {}
+            loaded: Dict[str, ModelSettings] = {}
 
             for model_id, model_data in models_data.items():
-                # Settings saved before the vlm_mtp exclusivity rule may
-                # combine vlm_mtp_enabled with processor-backed settings;
-                # __post_init__ would raise and the except below would drop
-                # the model's entire settings blob. Keep the content-shaping
-                # settings and turn vlm_mtp off instead.
-                model_data, conflicts = resolve_vlm_mtp_conflicts(model_data)
-                if conflicts:
-                    logger.warning(
-                        "Model '%s': vlm_mtp_enabled disabled on load; it "
-                        "cannot be combined with %s. Unset those settings "
-                        "to re-enable vlm_mtp.",
-                        model_id,
-                        ", ".join(conflicts),
-                    )
                 try:
-                    self._settings[model_id] = ModelSettings.from_dict(model_data)
+                    loaded[model_id] = ModelSettings.from_dict(model_data)
                 except Exception as e:
                     logger.warning(
                         f"Failed to load settings for model '{model_id}': {e}"
                     )
 
+            self._settings = loaded
             logger.info(f"Loaded settings for {len(self._settings)} models")
 
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON in settings file: {e}")
-            self._settings = {}
+            if not self._settings:
+                self._settings = {}
         except Exception as e:
             logger.error(f"Failed to load settings file: {e}")
-            self._settings = {}
+            if not self._settings:
+                self._settings = {}
 
     def _save(self) -> None:
         """Save settings to the JSON file.
@@ -529,6 +323,7 @@ class ModelSettingsManager:
                 os.fsync(f.fileno())
 
             temp_file.replace(self.settings_file)
+            self._record_settings_file_stamp()
             logger.debug(f"Saved settings for {len(self._settings)} models")
 
         except Exception as e:
@@ -546,6 +341,12 @@ class ModelSettingsManager:
             ModelSettings for the model, or default settings if not found.
         """
         with self._lock:
+            # Pick up hand edits to the settings file: the runtime-signature
+            # reload in engine_pool compares engines against what this
+            # returns, so serving a stale cached copy made file edits (e.g.
+            # mtp_enabled) permanently invisible to a
+            # running server.
+            self._reload_settings_if_changed()
             if model_id in self._settings:
                 # Return a copy to prevent external modification
                 settings = self._settings[model_id]
@@ -678,7 +479,10 @@ class ModelSettingsManager:
             return
         try:
             with open(self.profiles_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
+                raw = f.read()
+            # A blank file (created empty by an editor or a crashed first
+            # save) is "no profiles", not an error.
+            data = json.loads(raw) if raw.strip() else {}
             version = data.get("version", 1)
             if version != PROFILES_VERSION:
                 logger.warning(
@@ -831,10 +635,6 @@ class ModelSettingsManager:
         # get_exposed_profile_runtime_settings_for_request(), which can
         # trigger an engine variant reload without persisting base settings.
         merged.update(filter_universal_fields(profile.get("settings", {}) or {}))
-        # A profile overriding penalties / grammar / thinking budget on a
-        # vlm_mtp base model would make __post_init__ raise on this
-        # request-time merge; drop vlm_mtp for the merged view instead.
-        merged, _ = resolve_vlm_mtp_conflicts(merged)
         return ModelSettings.from_dict(merged)
 
     def _runtime_settings_with_profile_locked(
@@ -843,7 +643,6 @@ class ModelSettingsManager:
         base = self._settings.get(model_id)
         merged = base.to_dict() if base is not None else {}
         merged.update(filter_profile_fields(profile.get("settings", {}) or {}))
-        merged, _ = resolve_vlm_mtp_conflicts(merged)
         return ModelSettings.from_dict(merged)
 
     def get_exposed_profile_source_model_id(self, model_id: str) -> Optional[str]:
@@ -1203,10 +1002,6 @@ class ModelSettingsManager:
             merged["active_profile_name"] = name
             if settings_sanitizer is not None:
                 settings_sanitizer(merged)
-            # Keep persistent profile application consistent with request-time
-            # profile overlays: output-shaping settings win over the speed-only
-            # VLM MTP toggle when the merged settings need logits processors.
-            merged, _ = resolve_vlm_mtp_conflicts(merged)
             new_settings = ModelSettings.from_dict(merged)
             self._settings[model_id] = new_settings
             try:
@@ -1229,7 +1024,9 @@ class ModelSettingsManager:
             return
         try:
             with open(self.templates_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
+                raw = f.read()
+            # Blank file = no templates (see _load_profiles).
+            data = json.loads(raw) if raw.strip() else {}
             version = data.get("version", 1)
             if version != TEMPLATES_VERSION:
                 logger.warning(

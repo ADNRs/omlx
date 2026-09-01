@@ -233,6 +233,100 @@ async def test_batched_engine_retries_transient_rejection_after_cleanup(monkeypa
     evict.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_batched_engine_waits_for_store_writeback_drain(monkeypatch):
+    """A preflight landing inside a finished request's SSD-writeback window
+    must wait for the teardown to drain instead of 400-ing: the request's
+    own charge fits the cap and only the unsettled current (the store
+    worker still holding the old KV) blocks it (2026-08-29: 240K preflight
+    7s after a finished 200K saw current 33.2GB vs ~19GB settled)."""
+    _GB = 1024**3
+    scheduler = MagicMock()
+    scheduler.preflight_eviction_request.side_effect = [
+        SimpleNamespace(
+            request_id="req-drain",
+            reason="prefill_preflight",
+            current_bytes=33 * _GB,
+            target_cap_bytes=46 * _GB,
+            predicted_transient_bytes=15 * _GB,
+        ),
+        SimpleNamespace(
+            request_id="req-drain",
+            reason="prefill_preflight",
+            current_bytes=30 * _GB,
+            target_cap_bytes=46 * _GB,
+            predicted_transient_bytes=15 * _GB,
+        ),
+        None,
+    ]
+    scheduler.has_pending_route_preflight_cleanup.return_value = False
+    scheduler.refresh_route_preflight_usage.side_effect = [
+        30 * _GB,  # declining vs 33GB -> keep waiting
+        20 * _GB,  # declining vs 30GB -> keep waiting
+    ]
+
+    async def _no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr("omlx.engine.base.asyncio.sleep", _no_sleep)
+    evict = AsyncMock(return_value=True)
+    from omlx.engine.base import _run_scheduler_preflight_with_cleanup_retry
+
+    await _run_scheduler_preflight_with_cleanup_retry(
+        scheduler,
+        num_prompt_tokens=242_517,
+        request_id="req-drain",
+        eviction_callback=evict,
+        executor=concurrent.futures.ThreadPoolExecutor(max_workers=1),
+    )
+
+    assert scheduler.preflight_eviction_request.call_count == 3
+    scheduler.preflight_or_raise.assert_called_once_with(
+        num_prompt_tokens=242_517,
+        request_id="req-drain",
+    )
+    evict.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_batched_engine_evicts_when_footprint_not_declining(monkeypatch):
+    """Charge fits but the footprint is steady: the teardown-drain wait must
+    not spin until the deadline — fall through to eviction immediately."""
+    _GB = 1024**3
+    scheduler = MagicMock()
+    scheduler.preflight_eviction_request.return_value = SimpleNamespace(
+        request_id="req-flat",
+        reason="prefill_preflight",
+        current_bytes=33 * _GB,
+        target_cap_bytes=46 * _GB,
+        predicted_transient_bytes=15 * _GB,
+    )
+    scheduler.has_pending_route_preflight_cleanup.return_value = False
+    # Same reading as the estimate's snapshot: nothing is draining.
+    scheduler.refresh_route_preflight_usage.return_value = 33 * _GB
+
+    async def _no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr("omlx.engine.base.asyncio.sleep", _no_sleep)
+    evict = AsyncMock(return_value=True)
+    from omlx.engine.base import _run_scheduler_preflight_with_cleanup_retry
+
+    await _run_scheduler_preflight_with_cleanup_retry(
+        scheduler,
+        num_prompt_tokens=242_517,
+        request_id="req-flat",
+        eviction_callback=evict,
+        executor=concurrent.futures.ThreadPoolExecutor(max_workers=1),
+    )
+
+    evict.assert_awaited_once()
+    scheduler.preflight_or_raise.assert_called_once_with(
+        num_prompt_tokens=242_517,
+        request_id="req-flat",
+    )
+
+
 def test_scheduler_route_preflight_cleanup_signal():
     scheduler = _make_scheduler()
     assert scheduler.has_pending_route_preflight_cleanup() is False

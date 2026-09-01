@@ -352,16 +352,6 @@ class TestMRoPEDetection:
         vlm = MagicMock(spec=[])
         assert VLMModelAdapter._detect_mrope(vlm) is False
 
-    def test_detect_mrope_true_for_minimax_m3_vl(self):
-        """MiniMax M3 uses per-row decode positions even without mrope_section."""
-        from omlx.models.vlm import VLMModelAdapter
-
-        vlm = MagicMock(spec=[])
-        vlm.config = MagicMock(spec=[])
-        vlm.config.model_type = "minimax_m3_vl"
-        assert VLMModelAdapter._detect_mrope(vlm) is True
-        assert VLMModelAdapter._detect_minimax_m3(vlm) is True
-
 
 class TestPerRequestMRoPEDecode:
     """Tests for per-request mRoPE position_ids computation during decode."""
@@ -383,14 +373,6 @@ class TestPerRequestMRoPEDecode:
         vlm.config.model_type = "qwen3_vl_moe"
         return vlm
 
-    def _make_minimax_m3_vlm_model(self):
-        """Create a mock MiniMax M3 VLM model."""
-        vlm = self._make_mrope_vlm_model()
-        vlm.config.model_type = "minimax_m3_vl"
-        vlm.config.text_config.model_type = "minimax_m3_vl"
-        vlm.config.text_config.rope_scaling = None
-        vlm.config.text_config.rope_parameters = None
-        return vlm
 
     def test_mrope_decode_uses_language_model_with_position_ids(self):
         """mRoPE decode with batch_rope_deltas should use language_model with position_ids."""
@@ -485,15 +467,16 @@ class TestPerRequestMRoPEDecode:
         assert pos_ids.shape == (3, 1, 1)
         assert pos_ids[0, 0, 0].item() == 16384.0
 
-    def test_non_minimax_mrope_mismatched_delta_size_keeps_existing_path(self):
-        """Non-MiniMax mRoPE models keep prior no-position_ids mismatch behavior."""
+    def test_non_minimax_mrope_mismatched_delta_size_still_supplies_positions(self):
+        """A rope-delta count mismatching the batch is zero-padded, and
+        position_ids are still passed (they must match the attention's
+        arange(offset, offset+L) fallback, never be omitted)."""
         import mlx.core as mx
 
         from omlx.models.vlm import VLMModelAdapter
 
         vlm = self._make_mrope_vlm_model()
         adapter = VLMModelAdapter(vlm)
-        assert adapter._uses_minimax_m3_positions is False
 
         adapter.set_batch_rope_deltas(mx.array([10.0, 0.0]))
 
@@ -505,35 +488,13 @@ class TestPerRequestMRoPEDecode:
         adapter(input_ids, cache=cache)
 
         call_kwargs = vlm.language_model.call_args[1]
-        assert "position_ids" not in call_kwargs
-
-    def test_minimax_m3_decode_uses_2d_position_ids(self):
-        """MiniMax M3 expects position_ids = (batch, seq), not Qwen-style rank 3."""
-        import mlx.core as mx
-
-        from omlx.models.vlm import VLMModelAdapter
-
-        vlm = self._make_minimax_m3_vlm_model()
-        adapter = VLMModelAdapter(vlm)
-        assert adapter._uses_mrope is True
-        assert adapter._uses_minimax_m3_positions is True
-
-        adapter.set_batch_rope_deltas(mx.array([-50.0, 0.0]))
-
-        input_ids = mx.zeros((2, 2), dtype=mx.int32)
-        cache_layer = MagicMock()
-        cache_layer.offset = mx.array([100, 80])
-        cache = [cache_layer]
-
-        adapter(input_ids, cache=cache)
-
-        call_kwargs = vlm.language_model.call_args[1]
         pos_ids = call_kwargs["position_ids"]
-        assert pos_ids.shape == (2, 2)
-        assert pos_ids[0, 0].item() == 50.0
-        assert pos_ids[0, 1].item() == 51.0
-        assert pos_ids[1, 0].item() == 80.0
-        assert pos_ids[1, 1].item() == 81.0
+        assert pos_ids.shape[1:] == (3, 1)
+        for section in range(3):
+            assert pos_ids[section, 0, 0].item() == 60
+            assert pos_ids[section, 1, 0].item() == 30
+            assert pos_ids[section, 2, 0].item() == 20
+
 
     def test_mrope_multi_token_window_advances_positions(self):
         """Regression: each row of an mRoPE window must advance from its start.
@@ -551,7 +512,6 @@ class TestPerRequestMRoPEDecode:
 
         vlm = self._make_mrope_vlm_model()
         adapter = VLMModelAdapter(vlm)
-        assert adapter._uses_minimax_m3_positions is False
 
         adapter.set_batch_rope_deltas(mx.array([-50.0, 0.0]))
 

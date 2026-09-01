@@ -148,7 +148,6 @@ class Request:
     # Emit per-chunk timing diagnostics for an internal throughput benchmark.
     # This is never set by ordinary API traffic.
     benchmark_trace: bool = False
-    benchmark_ane_sequence_length: int = 0
     # Effective prefill widths observed by the scheduler. These are populated
     # only for benchmark_trace requests so the benchmark summary can distinguish
     # a requested scheduler step from the model calls actually delivered after
@@ -210,12 +209,6 @@ class Request:
 
     # Harmony model support (gpt-oss models)
     is_harmony_model: bool = False  # True if model uses Harmony format
-
-    # SpecPrefill (sparse prefill for MoE models)
-    specprefill_indices: Optional[Any] = None  # mx.array of selected token indices
-    specprefill_total_tokens: int = 0  # Original total token count (M)
-    specprefill_position_offset: int = 0  # RoPE offset = M - N
-    specprefill_system_end: int = 0  # Token index where system prompt ends
 
     # Cache corruption recovery
     cache_corruption_retries: int = 0  # Per-request corruption retry counter

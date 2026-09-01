@@ -93,6 +93,22 @@ def serve_command(args):
 
     process_title.set_process_title()
 
+    # Web-tuning values (admin panel) are persisted as env vars in
+    # ~/.omlx/tuning.json and must be applied BEFORE the first kernel import
+    # reads them (the NAX C++ statics are read once per process). Missing
+    # file or keys = production defaults, so setdefault semantics apply.
+    try:
+        import json
+        from pathlib import Path
+
+        _tuning_path = Path.home() / ".omlx" / "tuning.json"
+        if _tuning_path.exists():
+            _values = (json.loads(_tuning_path.read_text()) or {}).get("values") or {}
+            for _key, _val in _values.items():
+                os.environ.setdefault(str(_key), str(_val))
+    except Exception:
+        pass
+
     try:
         from ._build_info import build_number
     except ImportError:
@@ -110,12 +126,6 @@ def serve_command(args):
 
     # Initialize global settings first (to get log_level from file if not specified)
     settings = init_settings(base_path=args.base_path, cli_args=args)
-
-    # The native ANE compile-cache gate reads this env var once, at the first
-    # compile, so it must be exported before any engine loads. setdefault
-    # keeps an explicit env override authoritative.
-    if settings.cache.ane_compile_cache:
-        os.environ.setdefault("OMLX_QWEN35_ANE_COMPILE_CACHE", "1")
 
     # Register TRACE level (5) — includes full message content
     TRACE = 5
@@ -343,12 +353,13 @@ def serve_command(args):
         # GPU is still using the buffer, causing kernel panics on M4.
         # With a large cache limit, freed buffers always stay in the pool
         # and are only released via mx.clear_cache() (which we protect
-        # with mx.synchronize()). See issue #300.
-        import mlx.core as mx
+        # with mx.synchronize()). See issue #300 and utils/mx_pool.py for
+        # the optional cap (mx_cache_limit_gb setting / env override).
+        from .utils.mx_pool import apply_mx_cache_limit
 
-        total_mem = mx.device_info().get("memory_size", 0)
-        if total_mem > 0:
-            mx.set_cache_limit(total_mem)
+        apply_mx_cache_limit(
+            getattr(settings.cache, "mx_cache_limit_gb", 0) or 0
+        )
 
         # Initialize server
         # Note: pinned_models and default_model are managed via admin page (model_settings.json)

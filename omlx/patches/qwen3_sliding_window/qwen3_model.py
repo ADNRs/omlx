@@ -9,7 +9,7 @@ gets every layer run as full attention regardless of the config.
 mlx-lm already implements this identically for other model families
 in this same pinned version (e.g. mlx_lm.models.gpt_oss).
 The window_size parameter in mlx_lm.models.base.create_attention_mask
-is pre-existing general-purpose, already used by gemma3_text, gemma4_text,
+is pre-existing general-purpose (also used by other mlx-lm families such as
 cohere2, exaone4, olmo3, llama, ministral3, and more. This ports that pattern
 to Qwen3.
 

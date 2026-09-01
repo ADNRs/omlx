@@ -516,9 +516,9 @@ class TestCaptureSkips:
 
     def test_ctx_lives_on_host_not_cache(self, model):
         """The slot rides the model instance: cache entries are rebuilt by
-        the insert merge (and TurboQuant conversion) on several families, so
-        cache-attribute transport silently loses the context (found in the
-        first real-server smokes: primed=0 with turboquant_kv / DeepSeek)."""
+        the insert merge on several families, so cache-attribute transport
+        silently loses the context (found in the first real-server smokes:
+        primed=0 with DeepSeek)."""
         cache = _make_cache(model)
         _chunked_prefill(model, cache, _tokens(6, seed=20), [6])
         assert getattr(model, "_omlx_mtp_prime_ctx", None) is not None
@@ -541,8 +541,8 @@ class TestCaptureSkips:
         assert prompt_priming.take_primed(model, cache_a, _tokens(1, seed=25)) is None
 
     def test_ctx_survives_kv_entry_replacement(self, model):
-        """Simulate the TurboQuant convert: swap every KVCache entry for a
-        fresh object carrying the same state, then finish activation."""
+        """Swap every KVCache entry for a fresh object carrying the same
+        state (as a cache-rebuild pass would), then finish activation."""
         from mlx_lm.models.cache import KVCache
 
         n = 9

@@ -2,6 +2,7 @@
 """Tests for omlx.model_settings module."""
 
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -10,7 +11,6 @@ import pytest
 from omlx.model_settings import (
     ModelSettings,
     ModelSettingsManager,
-    resolve_vlm_mtp_conflicts,
 )
 
 
@@ -229,76 +229,6 @@ class TestModelSettings:
         d = settings.to_dict()
         assert "model_type_override" not in d
 
-    def test_turboquant_kv_bits_default(self):
-        """Default bit depth = 4."""
-        settings = ModelSettings()
-        assert settings.turboquant_kv_bits == 4
-
-    def test_turboquant_kv_bits_roundtrip(self):
-        original = ModelSettings(turboquant_kv_bits=2.5)
-        d = original.to_dict()
-        assert d["turboquant_kv_bits"] == 2.5
-        restored = ModelSettings.from_dict(d)
-        assert restored.turboquant_kv_bits == 2.5
-
-    def test_turboquant_kv_bits_always_in_to_dict(self):
-        """Non-Optional field with a default must always serialize."""
-        settings = ModelSettings()
-        assert "turboquant_kv_bits" in settings.to_dict()
-
-    def test_turboquant_skip_last_default(self):
-        """Default = True — protects sensitive models from last-layer corruption."""
-        settings = ModelSettings()
-        assert settings.turboquant_skip_last is True
-
-    def test_turboquant_skip_last_roundtrip(self):
-        original = ModelSettings(turboquant_skip_last=False)
-        d = original.to_dict()
-        assert d["turboquant_skip_last"] is False
-        restored = ModelSettings.from_dict(d)
-        assert restored.turboquant_skip_last is False
-
-    def test_native_mtp_allows_turboquant(self):
-        settings = ModelSettings(mtp_enabled=True, turboquant_kv_enabled=True)
-        assert settings.mtp_enabled is True
-        assert settings.turboquant_kv_enabled is True
-
-    def test_vlm_mtp_rejects_turboquant(self):
-        with pytest.raises(ValueError, match="vlm_mtp_enabled.*turboquant"):
-            ModelSettings(vlm_mtp_enabled=True, turboquant_kv_enabled=True)
-
-    def test_vlm_mtp_draft_model_default(self):
-        settings = ModelSettings()
-        assert settings.vlm_mtp_draft_model is None
-
-    def test_vlm_mtp_draft_model_roundtrip(self):
-        original = ModelSettings(vlm_mtp_draft_model="gemma-4-26B-A4B-it-assistant")
-        d = original.to_dict()
-        assert d["vlm_mtp_draft_model"] == "gemma-4-26B-A4B-it-assistant"
-        restored = ModelSettings.from_dict(d)
-        assert restored.vlm_mtp_draft_model == "gemma-4-26B-A4B-it-assistant"
-
-    def test_vlm_mtp_draft_model_excluded_when_none(self):
-        settings = ModelSettings()
-        assert "vlm_mtp_draft_model" not in settings.to_dict()
-
-    def test_vlm_mtp_draft_block_size_default(self):
-        """None means 'use mlx-vlm default'."""
-        settings = ModelSettings()
-        assert settings.vlm_mtp_draft_block_size is None
-
-    def test_vlm_mtp_draft_block_size_roundtrip(self):
-        original = ModelSettings(vlm_mtp_draft_block_size=8)
-        d = original.to_dict()
-        assert d["vlm_mtp_draft_block_size"] == 8
-        restored = ModelSettings.from_dict(d)
-        assert restored.vlm_mtp_draft_block_size == 8
-
-    def test_vlm_mtp_draft_block_size_excluded_when_none(self):
-        settings = ModelSettings()
-        assert "vlm_mtp_draft_block_size" not in settings.to_dict()
-
-
 class TestModelSettingsManager:
     """Tests for ModelSettingsManager class."""
 
@@ -331,6 +261,75 @@ class TestModelSettingsManager:
             assert settings.temperature == 0.7
             assert settings.is_pinned is True
             assert settings.is_default is True
+
+    def test_external_file_edit_hot_reloads(self):
+        """A hand edit of model_settings.json must reach a running server:
+        get_settings serves the on-disk state once the file stamp changes
+        (the engine-pool runtime-signature reload compares against this, so
+        a stale cached copy made load-time controls like mtp_enabled
+        impossible to disable without a restart)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_file = Path(tmpdir) / "model_settings.json"
+            settings_file.write_text(json.dumps({
+                "version": 1,
+                "models": {"m": {"mtp_enabled": True}},
+            }))
+            manager = ModelSettingsManager(Path(tmpdir))
+            assert manager.get_settings("m").mtp_enabled is True
+
+            # External edit with a different mtime (temp+rename keeps the
+            # write atomic; force a new stamp since same-ns rewrites are
+            # possible on coarse filesystems).
+            new_text = json.dumps({
+                "version": 1,
+                "models": {"m": {"mtp_enabled": False}},
+            })
+            temp = settings_file.with_name("model_settings.json.ext.tmp")
+            temp.write_text(new_text)
+            temp.replace(settings_file)
+            os.utime(settings_file, ns=(0, manager._settings_mtime_ns + 1))
+
+            assert manager.get_settings("m").mtp_enabled is False
+
+    def test_partial_external_edit_keeps_current_settings(self):
+        """An editor's partial write (invalid JSON) must not wipe every
+        model's configured settings: the reload keeps the last good state
+        and a later valid edit replaces it."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_file = Path(tmpdir) / "model_settings.json"
+            settings_file.write_text(json.dumps({
+                "version": 1,
+                "models": {"m": {"temperature": 0.7}},
+            }))
+            manager = ModelSettingsManager(Path(tmpdir))
+
+            temp = settings_file.with_name("model_settings.json.ext.tmp")
+            temp.write_text('{"version": 1, "models": {"m": {"temp')
+            temp.replace(settings_file)
+            os.utime(settings_file, ns=(0, manager._settings_mtime_ns + 1))
+
+            assert manager.get_settings("m").temperature == 0.7
+
+            temp.write_text(json.dumps({
+                "version": 1,
+                "models": {"m": {"temperature": 0.2}},
+            }))
+            temp.replace(settings_file)
+            os.utime(settings_file, ns=(0, manager._settings_mtime_ns + 1))
+            assert manager.get_settings("m").temperature == 0.2
+
+    def test_blank_settings_and_profiles_files_load_empty(self):
+        """Zero-byte settings/profiles/templates files are "nothing stored",
+        not an error (a crashed first save left model_profiles.json empty on
+        one host and logged a JSON error at every startup)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            (base / "model_settings.json").write_text("")
+            (base / "model_profiles.json").write_text("")
+            (base / "global_templates.json").write_text("")
+            manager = ModelSettingsManager(base)
+            assert manager.get_all_settings() == {}
+            assert manager.get_settings("m").temperature is None
 
     def test_set_settings(self):
         """Test setting and saving settings."""
@@ -665,90 +664,3 @@ class TestModelSettingsManager:
 
             assert len(errors) == 0
 
-
-class TestVlmMtpProcessorExclusivity:
-    """#2399: vlm_mtp_enabled is mutually exclusive with settings that
-    materialize as per-request logits processors."""
-
-    def test_neutral_values_do_not_conflict(self):
-        settings = ModelSettings(
-            vlm_mtp_enabled=True,
-            repetition_penalty=1.0,
-            presence_penalty=0.0,
-        )
-        assert settings.vlm_mtp_enabled is True
-
-    @pytest.mark.parametrize(
-        "field,value",
-        [
-            ("repetition_penalty", 1.2),
-            ("presence_penalty", 0.5),
-            ("guided_grammar_enabled", True),
-        ],
-    )
-    def test_conflicting_setting_raises(self, field, value):
-        with pytest.raises(ValueError, match="vlm_mtp_enabled cannot be combined"):
-            ModelSettings(vlm_mtp_enabled=True, **{field: value})
-
-    def test_thinking_budget_no_longer_conflicts(self):
-        """Thinking budget is applied on the vlm_mtp path at verify time
-        (MTPProcessingSampler), so the combo is allowed."""
-        settings = ModelSettings(
-            vlm_mtp_enabled=True,
-            thinking_budget_enabled=True,
-        )
-        assert settings.vlm_mtp_enabled is True
-        assert settings.thinking_budget_enabled is True
-
-    def test_conflicts_ignored_when_vlm_mtp_off(self):
-        settings = ModelSettings(
-            repetition_penalty=1.2,
-            thinking_budget_enabled=True,
-            guided_grammar_enabled=True,
-        )
-        assert settings.vlm_mtp_enabled is False
-
-    def test_resolve_helper_clears_vlm_mtp(self):
-        data, conflicts = resolve_vlm_mtp_conflicts(
-            {"vlm_mtp_enabled": True, "guided_grammar_enabled": True}
-        )
-        assert data["vlm_mtp_enabled"] is False
-        assert conflicts == ["guided_grammar_enabled"]
-
-    def test_resolve_helper_no_conflict_passthrough(self):
-        original = {"vlm_mtp_enabled": True, "repetition_penalty": 1.0}
-        data, conflicts = resolve_vlm_mtp_conflicts(original)
-        assert data is original
-        assert conflicts == []
-
-    def test_load_migrates_legacy_conflict_preserving_settings(self):
-        """A pre-rule settings file combining vlm_mtp with a penalty must load
-        with vlm_mtp disabled and every other field intact, instead of the
-        whole blob being dropped by the load-time except."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            settings_file = Path(tmpdir) / "model_settings.json"
-            settings_file.write_text(
-                json.dumps(
-                    {
-                        "version": 1,
-                        "models": {
-                            "legacy-model": {
-                                "vlm_mtp_enabled": True,
-                                "vlm_mtp_draft_model": "gemma-assistant",
-                                "repetition_penalty": 1.3,
-                                "max_context_window": 8192,
-                                "is_pinned": True,
-                            }
-                        },
-                    }
-                )
-            )
-
-            manager = ModelSettingsManager(Path(tmpdir))
-            loaded = manager.get_settings("legacy-model")
-
-            assert loaded.vlm_mtp_enabled is False
-            assert loaded.repetition_penalty == 1.3
-            assert loaded.max_context_window == 8192
-            assert loaded.is_pinned is True
-            assert loaded.vlm_mtp_draft_model == "gemma-assistant"

@@ -175,7 +175,7 @@ def _ctx(**overrides) -> dict:
         "quantization": "4bit",
         "sampling_profile": "deterministic",
         "batch_size": 8,
-        "feature_flags": [{"key": "turboquant_kv_4bit", "label": "TurboQuant KV 4-bit"}],
+        "feature_flags": [{"key": "dflash", "label": "DFlash"}],
         "model_settings": {"max_context_window": 32768},
         "submission_group": "group-1",
         "owner_hash_full": "h" * 64 + "a",
@@ -241,7 +241,7 @@ class TestUploadIntelligenceResult:
         assert payload["model_repo"] == "mlx-community/Qwen3-4bit"
         assert payload["category_counts"] == {"anatomy": [4, 4]}
         assert payload["owner_hash"] == "h" * 64 + "a"
-        assert payload["feature_flags"][0]["key"] == "turboquant_kv_4bit"
+        assert payload["feature_flags"][0]["key"] == "dflash"
         assert payload["raw_truncated"] is False
         assert payload["raw_size"] > 0
 

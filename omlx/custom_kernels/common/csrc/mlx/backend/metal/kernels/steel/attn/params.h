@@ -192,6 +192,11 @@ struct AttnChunkReduceParams {
   int64_t o_chunk_stride; ///< Elements per chunk in the partial O slab
   int64_t lse_chunk_stride; ///< Elements per chunk in the logsumexp slab
   int64_t O_strides[3]; ///< Output strides (B, H, L, D = 1)
+
+  /// >0: slab rows are gqa-packed heads — row g*q_pack + t is query token t
+  /// of packed head g inside kv head h, landing at logical head
+  /// h*(qL/q_pack)+g. 0 keeps the unpacked identity mapping.
+  int q_pack;
 };
 
 } // namespace steel

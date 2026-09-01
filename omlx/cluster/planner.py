@@ -697,7 +697,7 @@ def _model_source(model_type: str) -> str:
     """Source of the mlx-lm module for this model type, or "".
 
     Consults ``sys.modules`` first so architectures oMLX registers itself —
-    ``minimax_m3_vl``, ``deepseek_v4`` — are judged on the module that will
+    families registered at runtime — are judged on the module that will
     actually be imported rather than a file mlx-lm does not ship.
     """
 
@@ -746,7 +746,7 @@ def _supports_pipeline(config: dict[str, Any]) -> bool:
     if not isinstance(model_type, str):
         return False
     # An architecture oMLX explicitly vouches for wins, even a VLM: the
-    # minimax_m3_vl patch ships its own ``pipeline()`` and sets
+    # A registered vendored-family patch may ship its own ``pipeline()`` and set
     # ``SUPPORTS_PIPELINE = True``. Honour that before the vision guard below.
     import sys
 
@@ -773,8 +773,9 @@ def _supports_pipeline(config: dict[str, Any]) -> bool:
 # gigabytes on the assumption that it is yes.
 _PIPELINE_MARKERS = ("def pipeline(", "PipelineMixin")
 
-# ``from .deepseek_v32 import Model as DSV32Model`` — glm_moe_dsa inherits its
-# pipeline support this way, so a source-only check would wrongly refuse it.
+# Some architectures inherit pipeline support from a base via
+# ``from .<base> import Model``, so a source-only check would wrongly refuse
+# them.
 _MODEL_BASE_IMPORT = re.compile(r"^from \.(\w+) import .*\bModel\b", re.MULTILINE)
 
 

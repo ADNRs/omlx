@@ -21,25 +21,11 @@ class _FakeQwenModel:
 _FakeQwenModel.__module__ = "mlx_lm.models.qwen3_5_moe"
 
 
-class _FakeQwen4Model:
-    pass
-
-
-_FakeQwen4Model.__module__ = "mlx_vlm.models.qwen4_exp.qwen4_exp"
-
-
 class _FakeOtherModel:
     pass
 
 
 _FakeOtherModel.__module__ = "mlx_lm.models.deepseek_v3"
-
-
-class _FakeHyV3Model:
-    pass
-
-
-_FakeHyV3Model.__module__ = "mlx_lm.models.hy_v3"
 
 
 def _make_model(
@@ -108,79 +94,6 @@ def test_fused_output_bit_exact(quantize):
         assert mx.array_equal(ref, out).item()
     for ref, out in zip(ref_prefill, out_prefill):
         assert mx.array_equal(ref, out).item()
-
-
-def test_laguna_family_fused_bit_exact():
-    """The vendored laguna model fuses its nvfp4 SwitchGLU experts."""
-    from omlx.patches.laguna import apply_laguna_patch
-
-    apply_laguna_patch()
-
-    from mlx_lm.models import laguna
-
-    args = laguna.ModelArgs(
-        model_type="laguna",
-        vocab_size=256,
-        hidden_size=HIDDEN,
-        intermediate_size=INTER,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=16,
-        max_position_embeddings=128,
-        layer_types=["full_attention", "full_attention"],
-        mlp_only_layers=[],
-        num_experts=E,
-        num_experts_per_tok=TOPK,
-        moe_intermediate_size=INTER,
-        shared_expert_intermediate_size=INTER,
-    )
-    mx.random.seed(11)
-    model = laguna.Model(args)
-    for layer in model.model.layers:
-        sw = layer.mlp.switch_mlp
-        sw.gate_proj = sw.gate_proj.to_quantized(16, 4, mode="nvfp4")
-        sw.up_proj = sw.up_proj.to_quantized(16, 4, mode="nvfp4")
-        sw.down_proj = sw.down_proj.to_quantized(16, 4, mode="nvfp4")
-
-    x = mx.array([[3, 1, 4, 1, 5]])
-    ref = model(x)
-    mx.eval(ref)
-
-    fused = apply_qwen35_moe_gate_up_fusion(model)
-    assert fused == 2
-    for layer in model.model.layers:
-        assert hasattr(layer.mlp.switch_mlp, "gate_up_proj")
-        assert layer.mlp.switch_mlp.gate_up_proj.mode == "nvfp4"
-
-    out = model(x)
-    mx.eval(out)
-    assert mx.array_equal(ref, out).item()
-
-
-@pytest.mark.parametrize("bits", [5, 6, 8])
-def test_hy_v3_family_fused_bit_exact(bits):
-    """HyV3 uses stock SwitchGLU and receives the same bit-exact fusion."""
-    model = _make_model(model_cls=_FakeHyV3Model, group_size=64, bits=bits)
-    x = (mx.random.normal(shape=(1, 1, HIDDEN)) * 0.5).astype(mx.bfloat16)
-    indices = mx.random.randint(0, E, shape=(1, 1, TOPK))
-
-    ref = _forward_all(model, x, indices)
-    mx.eval(ref)
-
-    assert apply_qwen35_moe_gate_up_fusion(model) == 2
-    out = _forward_all(model, x, indices)
-    mx.eval(out)
-
-    for expected, actual in zip(ref, out):
-        assert mx.array_equal(expected, actual).item()
-
-
-def test_qwen4_exp_family_is_eligible_for_gate_up_fusion():
-    model = _make_model(model_cls=_FakeQwen4Model, n_blocks=1)
-
-    assert apply_qwen35_moe_gate_up_fusion(model) == 1
-    assert hasattr(model.blocks[0], "gate_up_proj")
 
 
 def test_env_kill_switch(monkeypatch):

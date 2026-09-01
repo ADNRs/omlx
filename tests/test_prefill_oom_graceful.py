@@ -15,7 +15,7 @@ fake object so no model load or GPU is required.
 
 import logging
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -162,7 +162,13 @@ def _call(ns, requested, kv_len=0):
         )
 
 
-def test_adaptive_throttle_requests_eviction_before_shrinking():
+def test_adaptive_throttle_shrinks_without_eviction_pause():
+    """The sizing path deliberately never pauses for eviction: the
+    historical pause->eviction->requeue loop resumed prefills from early
+    boundaries and re-prefilled tens of thousands of tokens (three
+    restarts measured on one 131k request). Under the same pressure it
+    now shrinks the chunk to the remaining headroom; the physical safety
+    cap (_guard_prefill_chunk) keeps the eviction escalation."""
     ns = _throttle_ctx(
         current=50 * _GB,
         hard=58 * _GB,
@@ -176,26 +182,16 @@ def test_adaptive_throttle_requests_eviction_before_shrinking():
         Scheduler._raise_prefill_eviction_if_available.__get__(ns, Scheduler)
     )
 
-    with pytest.raises(_PrefillEvictionNeeded) as exc:
-        _call(ns, 2048)
-
-    assert request.prefill_eviction_retries == 1
-    assert exc.value.request.request_id == "r"
-    assert exc.value.request.model_id == "model-b"
-    assert exc.value.request.requested_tokens == 2048
-    assert exc.value.request.reason == "adaptive_prefill_throttle"
-
-    # A second pause is allowed: the first pass can be satisfied by a
-    # marginal transient reclaim without ever reaching the durable rungs
-    # (ANE bank release), so recurring pressure earns one more shot at the
-    # ladder before the guard falls back to throttling for good.
-    with pytest.raises(_PrefillEvictionNeeded):
-        _call(ns, 2048)
-    assert request.prefill_eviction_retries == 2
-
-    # The third time the request does not loop on eviction; it throttles.
     result = _call(ns, 2048)
+
+    # No pause, no eviction retries — just a smaller chunk.
     assert result < 2048
+    assert request.prefill_eviction_retries == 0
+
+    # Repeated pressure keeps throttling, never escalates.
+    result2 = _call(ns, 2048)
+    assert result2 < 2048
+    assert request.prefill_eviction_retries == 0
 
 
 def _guard_call(ns, n, kv_len=0):
@@ -236,7 +232,11 @@ def test_throttle_shrinks_big_chunk_from_low_baseline():
         int(hard * Scheduler._PREFILL_HEADROOM_SAFETY),
         int(hard * Scheduler._PREFILL_ABORT_MARGIN),
     )
-    n = _call(ns, 2048, kv_len=5000)
+    # Pin the MLX pool: ambient pool residue from earlier GPU tests in the
+    # process shifts sizing_current, and this test's arithmetic sits one
+    # snap-grid cell from the assert boundary (n_fit 672 vs 704).
+    with patch.object(sched_mod, "_mx_pool_bytes", return_value=0):
+        n = _call(ns, 2048, kv_len=5000)
     assert n < 2048  # throttled despite low baseline
     assert n >= ns._prefill_min_chunk_tokens
     # The chosen chunk's predicted peak must fit under the sizing target.
@@ -321,6 +321,46 @@ def test_throttle_predictor_anchors_on_recent_measurement():
     assert current + _per_token(bpt) * n <= cap + _per_token(bpt)
 
 
+def test_throttle_sizes_against_recyclable_mlx_pool():
+    """262K-top regression (2026-08-28): near the context ceiling the
+    physical footprint legitimately sits over the sizing target (resident
+    KV + weights) while several GB of MLX buffer pool remain cached. The
+    pool is recycled by the next chunk, so the throttle must size against
+    the pool-net current instead of flooring every chunk at 32 tokens for
+    the last ~30K tokens of prefill."""
+    hard = 47.5 * _GB
+    current = 43 * _GB  # physical, over the 42.75GB sizing target
+    bpt = 2 * 1024**2  # ~2MB/token: full chunk ~5.3GB after safety
+    ns = _throttle_ctx(current=current, hard=hard, samples_bpt=bpt)
+    ns._fake_current = current
+
+    with patch.object(sched_mod, "_mx_pool_bytes", return_value=6 * _GB):
+        assert _call(ns, 2048, kv_len=250_000) == 2048
+
+    # Control: identical pressure without recyclable pool must still shrink
+    # (and at n_fit=0 it floors — the old behavior).
+    with patch.object(sched_mod, "_mx_pool_bytes", return_value=0):
+        assert _call(ns, 2048, kv_len=250_000) == 32
+
+
+def test_throttle_pool_netting_keeps_partial_shrink():
+    """A pool smaller than the transient gap buys a proportional chunk, not
+    an all-or-nothing pass: sizing stays on the pool-net current."""
+    hard = 47.5 * _GB
+    current = 41 * _GB
+    bpt = 2 * 1024**2  # per_token ~2.6MB after safety
+    ns = _throttle_ctx(current=current, hard=hard, samples_bpt=bpt)
+    ns._fake_current = current
+
+    target = int(hard * Scheduler._PREFILL_HEADROOM_SAFETY)
+    with patch.object(sched_mod, "_mx_pool_bytes", return_value=2 * _GB):
+        n = _call(ns, 2048, kv_len=250_000)
+    assert n < 2048
+    assert n > 32
+    # The chosen chunk fits the target over the pool-net current.
+    assert (current - 2 * _GB) + _per_token(bpt) * n <= target + _per_token(bpt)
+
+
 # --------------------------------------------------------------------------
 # Scheduler._guard_prefill_chunk (the crash preventer)
 # --------------------------------------------------------------------------
@@ -331,6 +371,21 @@ def test_guard_passes_through_when_chunk_fits():
     ns = _throttle_ctx(current=10 * _GB, hard=hard, samples_bpt=1024 * 1024)
     ns._fake_current = 10 * _GB
     assert _guard_call(ns, 512, kv_len=5000) == 512
+
+
+def test_guard_passes_through_using_recyclable_mlx_pool():
+    """The pre-chunk guard's fast path applies the same pool netting as the
+    throttle: a chunk that fits by recycling pooled buffers must not fall
+    into the reclaim ladder, which clears the pool on EVERY chunk near the
+    ceiling and defeats the pool's purpose (262K-top churn, 2026-08-28)."""
+    hard = 48 * _GB  # abort cap = 48 * 0.90 = 43.2GB
+    current = 41 * _GB
+    bpt = 1024 * 1024  # admission bound for 2048 tokens ~2.7GB
+    ns = _throttle_ctx(current=current, hard=hard, samples_bpt=bpt)
+    ns._fake_current = current
+
+    with patch.object(sched_mod, "_mx_pool_bytes", return_value=3 * _GB):
+        assert _guard_call(ns, 2048, kv_len=250_000) == 2048
 
 
 def test_guard_shrinks_when_chunk_would_breach_cap():
@@ -398,7 +453,6 @@ def test_guard_rejection_logs_admission_terms_breakdown(caplog):
     assert "current=" in msg
     assert "predicted_transient=" in msg
     assert "observed_max_bytes=" in msg
-    assert "ane_prefill_transient_bytes=0.00GB" in msg  # ns.memory_monitor is None
 
 
 def test_guard_requests_eviction_before_capacity_rejection():
@@ -693,6 +747,115 @@ def test_record_chunk_transient_skips_tail_samples():
     assert tracker.last_delta_bytes == 32 * 1024**2
 
 
+def test_out_of_band_release_refill_does_not_poison_tracker():
+    """Regression (2026-08-27 context bench, 200K oQ4e): the enforcer's
+    soft-pressure reclaim dropped ~13GB BETWEEN chunk windows; the next
+    2048-token window measured the pool refill as a 12.4GB "chunk
+    transient" (6220KB/token vs a 1420KB EWMA). The raw last-delta anchor
+    fed admission a 16.5GB predicted transient and the re-preflight
+    rejected a request that actually fit (57.84GB demanded vs a 46.55GB
+    ceiling). The inter-window drop must land in the reclaim ledger so the
+    existing pool-reallocation filter skips the refill sample."""
+    tracker = PrefillTransientTracker()
+    ns = SimpleNamespace(
+        _prefill_min_chunk_tokens=32,
+        _prefill_speed_priority=True,
+        _prefill_transient_tracker=tracker,
+    )
+    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+        ns, Scheduler
+    )
+    ns._predicted_chunk_transient = Scheduler._predicted_chunk_transient.__get__(
+        ns, Scheduler
+    )
+    ns._PREFILL_TRANSIENT_SAFETY = Scheduler._PREFILL_TRANSIENT_SAFETY
+    ns.memory_monitor = SimpleNamespace(
+        estimate_chunk_transient_bytes=lambda _n, _kv: 0,
+        estimate_prompt_kv_bytes=lambda _n: 0,
+    )
+
+    healthy_per_token = 1316 * 1024
+    chunk = 2048
+    # Healthy windows: footprint grows by the per-token cost each chunk.
+    base = 30 * _GB
+    ns._record_chunk_transient(
+        chunk, base, base + chunk * healthy_per_token,
+        request_id="r", loop_label="test", requested_step=chunk,
+    )
+    ns._record_chunk_transient(
+        chunk,
+        base + chunk * healthy_per_token,
+        base + 2 * chunk * healthy_per_token,
+        request_id="r", loop_label="test", requested_step=chunk,
+    )
+    assert tracker.samples == 2
+    ewma_before = tracker.bytes_per_token
+    last_before = tracker.last_delta_bytes
+    healthy_prediction = ns._predicted_chunk_transient(chunk, 194_560)
+
+    # Out-of-band release: footprint drops 13GB between windows (enforcer
+    # soft-pressure / async SSD writeback), then the next window measures
+    # the pool REFILL: pre < last_post, delta = +12.4GB.
+    window_end = base + 2 * chunk * healthy_per_token
+    released = 13 * _GB
+    refill = 12441 * 1024**2
+    ns._record_chunk_transient(
+        chunk,
+        window_end - released,
+        window_end - released + refill,
+        request_id="r", loop_label="test", requested_step=chunk,
+    )
+
+    # The refill sample must be skipped entirely: tracker state unchanged.
+    assert tracker.samples == 2
+    assert tracker.last_delta_bytes == last_before
+    assert tracker.bytes_per_token == pytest.approx(ewma_before)
+    assert tracker.recent_reclaim_bytes == 0  # cleared by the skipped sample
+
+    # And the admission-facing prediction must not carry the refill.
+    assert ns._predicted_chunk_transient(chunk, 194_560) == pytest.approx(
+        healthy_prediction
+    )
+
+
+def test_predicted_transient_caps_raw_last_anchor_against_ewma():
+    """Belt-and-suspenders for anchors the ledger cannot see: a raw
+    last-delta per-token rate far above the EWMA is capped at 2x the EWMA.
+    The tracker records last_delta RAW even when its 8x outlier gate
+    rejects the sample from the EWMA blend — without the cap that raw
+    anchor flows straight into admission as a fake per-token cost."""
+    ewma_per_token = 700 * 1024
+    poison_per_token = 6300 * 1024  # 9x: rejected from EWMA, kept raw
+    chunk = 2048
+    tracker = PrefillTransientTracker()
+    tracker.update(1, int(ewma_per_token))
+    tracker.update(chunk, int(poison_per_token * chunk))
+    assert tracker.bytes_per_token == pytest.approx(ewma_per_token)
+    assert (
+        tracker.last_delta_bytes / tracker.last_n_tokens == poison_per_token
+    )
+    ns = SimpleNamespace(
+        _prefill_transient_tracker=tracker,
+        _PREFILL_TRANSIENT_SAFETY=Scheduler._PREFILL_TRANSIENT_SAFETY,
+        memory_monitor=SimpleNamespace(
+            estimate_chunk_transient_bytes=lambda _n, _kv: 0,
+            estimate_prompt_kv_bytes=lambda _n: 0,
+        ),
+    )
+    ns._predicted_chunk_transient = Scheduler._predicted_chunk_transient.__get__(
+        ns, Scheduler
+    )
+
+    predicted = ns._predicted_chunk_transient(chunk, 194_560)
+
+    # Capped anchor: 2x EWMA x 2048 x safety — NOT the raw 6300KB/token.
+    uncapped = poison_per_token * chunk * Scheduler._PREFILL_TRANSIENT_SAFETY
+    assert predicted < uncapped / 2
+    assert predicted == pytest.approx(
+        2.0 * ewma_per_token * chunk * Scheduler._PREFILL_TRANSIENT_SAFETY
+    )
+
+
 def test_record_chunk_transient_marks_floor_samples_only():
     """Only floor-size chunks may feed the observed max the admission
     charge uses; big-chunk transients stay EWMA-only."""
@@ -891,7 +1054,102 @@ def test_step_prefill_reclaims_before_first_guard():
         loop_label="chunked_step",
         kv_len=0,
         requested_step=2,
+        pool_growth=ANY,
     )
+
+
+def test_reclaim_ledger_expires_after_request_boundary():
+    """Regression (2026-08-28, salt-B prime): a dying prefill's tail chunks
+    record big negative deltas (snapshot writeback draining) into the
+    reclaim ledger; with no subsequent positive chunk the ledger survived
+    request death and inflated the NEXT request's front-door admission
+    (~10GB priced as an imminent refill on top of an already-reduced
+    current). The refill risk expires with the TTL."""
+    import time as _time
+
+    from omlx.prefill_transient_tracker import PrefillTransientTracker as T
+
+    tracker = T()
+    tracker.record_reclaim(int(9.7 * _GB))
+    assert tracker.recent_reclaim_bytes == int(9.7 * _GB)  # fresh: priced
+
+    tracker._recent_reclaim_at = _time.monotonic() - (
+        T._RECLAIM_TTL_S + 5
+    )
+    assert tracker.recent_reclaim_bytes == 0  # expired: not priced
+
+    # A fresh release after expiry re-arms the ledger.
+    tracker.record_reclaim(1 * _GB)
+    assert tracker.recent_reclaim_bytes == 1 * _GB
+
+
+def test_out_of_band_releases_replace_not_accumulate():
+    """Regression (2026-08-28, fresh 262K rejected at ~25K tokens):
+    steady-state MLX pool trimming books ~500MB per inter-window release;
+    ACCUMULATING them inside the TTL charged GBs of phantom refill into
+    admission (49GB KV+SDPA on a 258K prompt). The latest inter-window
+    drop alone is the next chunk's expected refill."""
+    from omlx.prefill_transient_tracker import PrefillTransientTracker as T
+
+    tracker = T()
+    for _ in range(20):  # 20 windows x ~500MB trims
+        tracker.set_reclaim(int(500 * 1024**2))
+    assert tracker.recent_reclaim_bytes == int(500 * 1024**2)
+
+    # A big single release (pause/evict) replaces wholesale.
+    tracker.set_reclaim(int(9 * _GB))
+    assert tracker.recent_reclaim_bytes == int(9 * _GB)
+
+
+def test_pool_growth_refill_window_is_not_a_chunk_cost():
+    """Regression (262K bench tail): a capped MLX pool cycling at its limit
+    makes a window measure several GB of refill; per-token normalization on
+    a small chunk (7.5GB / 288 tokens = 26MB/token) ratcheted the EWMA to
+    ~20MB/token and collapsed chunks to the floor for the rest of the
+    prefill. Pool growth inside the window is subtracted first."""
+    tracker = PrefillTransientTracker()
+    ns = SimpleNamespace(
+        _prefill_min_chunk_tokens=32,
+        _prefill_speed_priority=True,
+        _prefill_transient_tracker=tracker,
+    )
+    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+        ns, Scheduler
+    )
+
+    # Healthy full-step sample seeds the tracker.
+    ns._record_chunk_transient(
+        2048, 100 * _GB, 100 * _GB + 2.6 * _GB,
+        request_id="r", loop_label="test", requested_step=2048,
+    )
+    assert tracker.samples == 1
+
+    # Refill-dominated window: phys grows 7.5GB but 7.4GB of it is pool
+    # growth on a full-step chunk. After subtraction the residual ~100MB
+    # per 2048 tokens is a normal sample, not a 26MB/token outlier.
+    refill = 7.4 * _GB
+    ns._record_chunk_transient(
+        2048,
+        102.6 * _GB,
+        102.6 * _GB + 7.5 * _GB,
+        request_id="r", loop_label="test", requested_step=2048,
+        pool_growth=refill,
+    )
+    assert tracker.samples == 2
+    last_rate = tracker.last_delta_bytes / tracker.last_n_tokens
+    assert last_rate < 1 * 1024**2  # well under 1MB/token
+    assert tracker.bytes_per_token < 2 * 1024**2
+
+    # Pure-refill window records ~0 and is skipped entirely.
+    before = tracker.samples
+    ns._record_chunk_transient(
+        2048,
+        110 * _GB,
+        110 * _GB + 6 * _GB,
+        request_id="r", loop_label="test", requested_step=2048,
+        pool_growth=6 * _GB,
+    )
+    assert tracker.samples == before  # delta<=0 path: not a sample
 
 
 # --------------------------------------------------------------------------
@@ -1068,6 +1326,48 @@ def test_guard_shrink_math_unchanged_by_observed_max():
     ns._prefill_transient_tracker._observed_max_bytes = 512 * 1024**2
     after = _guard_call(ns, 2048, kv_len=50_000)
     assert after == before
+
+
+def test_admission_ignores_previous_request_teardown_ledger():
+    """Front-door admission must not price the reclaim ledger: right after a
+    completed long-context request the ledger holds that request's permanent
+    teardown (snapshot writeback, freed KV, pool clear), which the NEW
+    request's chunks never refill. Charging it rejected a fresh 240K after a
+    finished 200K with a phantom ~22GB refill (2026-08-28; an engine reload
+    between runs dodged it by resetting the tracker)."""
+    ns = _throttle_ctx(
+        current=18 * _GB, hard=46 * _GB, samples_bpt=2 * 1024**2
+    )
+    monitor = _monitor(head_dim=256)
+    monitor.set_model_info(
+        num_layers=64,
+        num_kv_heads=4,
+        head_dim=256,
+        dtype_size=2,
+        num_attention_heads=24,
+        num_kv_cache_layers=16,
+    )
+    ns.memory_monitor = monitor
+    # Simulate the teardown booking: warm ledger within its 20s TTL.
+    ns._prefill_transient_tracker.set_reclaim(11 * _GB)
+    ns._prefill_transient_tracker.record_reclaim(11 * _GB)
+
+    est = Scheduler._admission_estimate(
+        ns,
+        num_prompt_tokens=242_517,
+        cached_tokens=0,
+        current=18 * _GB,
+    )
+    assert est is not None
+    # Without the fix the transient carried the ~22GB ledger and the total
+    # exceeded a 46GB ceiling; with it the transient is the per-chunk
+    # prediction (~85MB) and only kv_exact dominates.
+    assert est.transient < 1 * _GB
+    assert est.estimated < 46 * _GB
+
+    # The mid-prefill bound (guard/throttle) still charges the ledger.
+    bound = Scheduler._admission_transient_bound(ns, 32, 242_000)
+    assert bound >= 22 * _GB
 
 
 # --------------------------------------------------------------------------

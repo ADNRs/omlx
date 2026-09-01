@@ -223,12 +223,14 @@ def test_dispatch_budget_zeroed_on_old_extension(monkeypatch):
 
 
 def test_apply_skips_on_nax_gpu(monkeypatch):
-    # On NAX GPUs stock SDPA's unfused head_dim-256 prefill runs its matmuls
-    # on the tensor units and beats the pre-NAX steel kernel (M5 Max report:
-    # 4k pp 828 -> 400 tok/s), so the auto mode must not install the patch.
+    # On NAX GPUs without the rebuilt fused dsplit kernel, stock SDPA's
+    # unfused head_dim-256 prefill runs its matmuls on the tensor units and
+    # beats the pre-NAX steel kernel (M5 Max report: 4k pp 828 -> 400
+    # tok/s), so the auto mode must not install the patch.
     import omlx.patches.qwen35_fa256_attention as patch
 
     monkeypatch.setattr(patch, "is_nax_available", lambda: True)
+    monkeypatch.setattr(patch, "_nax_kernel", lambda: None)
     assert patch.apply_qwen35_fa256_attention_patch() is False
 
 
@@ -248,17 +250,6 @@ def test_apply_env_kill_switch_wins(monkeypatch):
     monkeypatch.setattr(patch, "is_nax_available", lambda: False)
     monkeypatch.setenv("OMLX_FA256_STEEL", "0")
     assert patch.apply_qwen35_fa256_attention_patch() is False
-
-
-def test_qwen_native_symbols_are_not_registered_on_glm_extension():
-    from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
-
-    assert not glm_fast.has_symbol("qwen35_fa256_attention")
-    assert not glm_fast.has_symbol("qwen35_q4_affine_qmm_t")
-    assert not glm_fast.has_symbol("qwen35_q5_affine_qmm_t")
-    assert not glm_fast.has_symbol("qwen35_q6_affine_qmm_t")
-    assert not glm_fast.has_symbol("qwen35_q8_affine_qmm_t")
-    assert not glm_fast.has_symbol("qwen35_moe_weighted_sum")
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="Metal is required")

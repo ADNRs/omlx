@@ -91,9 +91,11 @@ venv.bak/
 logs/
 
 # Temporary files
-tmp/
 temp/
 *.tmp
+# Temporary files
+tmp/
+
 
 # MLX cache
 .mlx_cache/

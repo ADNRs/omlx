@@ -596,6 +596,18 @@ template <typename T>
   const int b = bh / params->H;
   const int h = bh % params->H;
 
+  // GQA-packed slabs (q_pack > 0): row g*q_pack + t is query token t of
+  // packed head g within kv head h; the logical output position is head
+  // h*(qL/q_pack)+g at token t. The slab stays packed-row addressed, so
+  // only the destination coordinates unpack.
+  int out_row = row;
+  int out_h = h;
+  if (params->q_pack > 0) {
+    const int g = row / params->q_pack;
+    out_row = row % params->q_pack;
+    out_h = h * (params->qL / params->q_pack) + g;
+  }
+
   const ulong row_off = ulong(bh) * ulong(params->qL) + row;
   const ulong o_off = row_off * ulong(params->D) + 4 * d4;
 
@@ -618,8 +630,8 @@ template <typename T>
   }
   const float4 out = den > 0 ? acc / den : float4(0);
 
-  device T* dst = O + b * params->O_strides[0] + h * params->O_strides[1] +
-      row * params->O_strides[2] + 4 * d4;
+  device T* dst = O + b * params->O_strides[0] + out_h * params->O_strides[1] +
+      out_row * params->O_strides[2] + 4 * d4;
   dst[0] = static_cast<T>(out.x);
   dst[1] = static_cast<T>(out.y);
   dst[2] = static_cast<T>(out.z);

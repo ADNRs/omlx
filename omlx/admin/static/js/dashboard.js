@@ -1,11 +1,7 @@
     // OCR model types that require temperature=0.0 (deterministic output)
     const OCR_CONFIG_MODEL_TYPES = new Set([
-        'deepseekocr', 'deepseekocr_2', 'dots_ocr', 'glm_ocr',
+        'dots_ocr', 'glm_ocr',
     ]);
-    const DSA_MODEL_TYPES = new Set([
-        'deepseek_v32', 'glm_moe_dsa',
-    ]);
-    const QWEN35_ANE_CONFIG_PREFIXES = ['qwen3_5', 'qwen3_6', 'qwen3_8'];
     const DIFFUSION_CONFIG_MODEL_TYPES = new Set([
         'diffusion_gemma',
     ]);
@@ -24,50 +20,7 @@
         'guided_grammar_enabled',
         'guided_grammar',
         'max_tool_result_tokens',
-        'index_cache_freq',
-        'turboquant_kv_enabled',
-        'turboquant_kv_bits',
-        'turboquant_skip_last',
-        'qwen35_ane_prefill_enabled',
-        'qwen35_ane_prefill_sequence_length',
-        'qwen35_ane_prefill_tail_padding_min_tokens',
-        'qwen35_ane_prefill_fraction',
-        'qwen35_ane_prefill_fused_down',
-        'qwen35_ane_prefill_max_layers',
-        'qwen35_ane_prefill_dual_ane',
-        'qwen35_ane_prefill_gdn',
-        'qwen35_ane_prefill_gdn_fraction',
-        'qwen35_ane_prefill_gdn_max_layers',
-        'qwen35_ane_prefill_cpu_enabled',
-        'qwen35_ane_prefill_cpu_fraction',
-        'qwen35_ane_prefill_cpu_down_fraction',
-        'qwen35_ane_prefill_cpu_gdn_fraction',
-        'qwen35_ane_prefill_cpu_threads',
-        'qwen35_ane_prefill_cpu_shared_resource',
-        'specprefill_enabled',
-        'specprefill_draft_model',
-        'specprefill_keep_pct',
-        'specprefill_threshold',
-        'dflash_enabled',
-        'dflash_draft_model',
-        'dflash_draft_quant_enabled',
-        'dflash_draft_quant_weight_bits',
-        'dflash_draft_quant_activation_bits',
-        'dflash_draft_quant_group_size',
-        'dflash_max_ctx',
-        'dflash_in_memory_cache',
-        'dflash_in_memory_cache_max_entries',
-        'dflash_in_memory_cache_max_bytes',
-        'dflash_ssd_cache',
-        'dflash_ssd_cache_max_bytes',
-        'dflash_draft_window_size',
-        'dflash_draft_sink_size',
-        'dflash_block_size',
-        'dflash_verify_mode',
         'mtp_enabled',
-        'vlm_mtp_enabled',
-        'vlm_mtp_draft_model',
-        'vlm_mtp_draft_block_size',
     ]);
     const DIFFUSION_UNSUPPORTED_CT_KWARGS = new Set([
         'enable_thinking',
@@ -76,17 +29,6 @@
     ]);
     const REASONING_EFFORT_PRESETS = new Set([
         'low', 'medium', 'high', 'xhigh', 'max',
-    ]);
-    const VLM_MTP_DRAFTER_CONFIG_MODEL_TYPES = new Set([
-        'gemma4_assistant',
-        'gemma4_unified_assistant',
-        'qwen3_5_mtp',
-    ]);
-    // DFlash drafters that carry no "dflash" name token. Meta ships the Muse
-    // Glimmer DFlash drafter as "-assistant", which oMLX's name heuristics
-    // would otherwise route to the MTP/spec-prefill buckets.
-    const DFLASH_DRAFTER_CONFIG_MODEL_TYPES = new Set([
-        'muse_glimmer_assistant',
     ]);
     const DASHBOARD_MAIN_TABS = new Set(['status', 'cluster', 'settings', 'models', 'logs', 'bench']);
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models']);
@@ -125,7 +67,7 @@
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
                 scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
-                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', hot_cache_write_through: false, ane_compile_cache: false, initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_precision: 'fp32' },
+                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', hot_cache_write_through: false, initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_precision: 'fp32' },
                 sampling: { max_context_window: 32768, max_context_window_policy: null, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '', expose_tools: true },
                 huggingface: { endpoint: '', hf_cache_enabled: true, hf_cache_path: '' },
@@ -223,49 +165,12 @@
                 max_tool_result_tokens: null,
                 ctKwargEntries: [],
                 is_diffusion_model: false,
-                qwen35_ane_prefill_enabled: false,
-                qwen35_ane_prefill_sequence_length: 2048,
-                qwen35_ane_prefill_tail_padding_min_tokens: 0,
-                qwen35_ane_prefill_fraction: 0.53,
-                qwen35_ane_prefill_fused_down: false,
-                qwen35_ane_prefill_max_layers: 64,
-                qwen35_ane_prefill_dual_ane: true,
-                qwen35_ane_prefill_gdn: true,
-                qwen35_ane_prefill_gdn_fraction: 0.5,
-                qwen35_ane_prefill_gdn_max_layers: 48,
-                qwen35_ane_prefill_cpu_enabled: false,
-                qwen35_ane_prefill_cpu_fraction: 0.135,
-                qwen35_ane_prefill_cpu_down_fraction: 0,
-                qwen35_ane_prefill_cpu_gdn_fraction: 0,
-                qwen35_ane_prefill_cpu_threads: 8,
-                qwen35_ane_prefill_cpu_shared_resource: true,
                 trust_remote_code: false,
             },
             savingModelSettings: false,
             importingMtplx: false,
             loadingGenDefaults: false,
             reasoningParsers: [],
-            aneTuning: {
-                tuningId: null,
-                modelId: null,
-                running: false,
-                cancelling: false,
-                applying: false,
-                applied: false,
-                total: 0,
-                status: null,
-                error: '',
-            },
-            aneTuningOverrides: {
-                allowCpu: true,
-                allowCpuGate: true,
-                allowCpuDown: true,
-                allowAneGdn: true,
-                allowCpuGdn: true,
-                allowCpuSharedResource: true,
-            },
-            _aneTuningPollTimer: null,
-
             // Profile / template / preset state
             profiles: [],                // per-model profiles for selectedModel
             templates: [],               // global templates
@@ -670,6 +575,8 @@
             oqError: '',
             oqSuccess: '',
             _oqRefreshTimer: null,
+            tuning: { values: {}, applied_text: '', winner_stage: null, job: null, results: {}, winner_text: '', restart_hint: '', lastError: '' },
+            modelTuningTokens: 262144,
             // oQ Advanced Settings
             oqAdvancedOpen: false,
             oqTextOnly: false,
@@ -709,7 +616,6 @@
             // Benchmark state
             benchModelId: '',
             benchContextProfile: 'code_python',
-            benchAlignPromptToAne: false,
             benchPromptLengths: { 1024: true, 4096: true, 8192: false, 16384: false, 32768: false, 65536: false, 131072: false, 200000: false },
             benchBatchSizes: { 2: true, 4: true, 8: false },
             benchForceLmEngine: false,
@@ -840,6 +746,7 @@
                     this.loadServerInfo(),
                     this.loadProfileFields(),
                     this.loadPresets(),
+                    this.loadTuning(),
                     this.checkForUpdate()
                 ]);
 
@@ -6729,7 +6636,6 @@
                             initial_cache_blocks: this.globalSettings.cache.initial_cache_blocks,
                             hot_cache_only: this.globalSettings.cache.hot_cache_only,
                             hot_cache_write_through: this.globalSettings.cache.hot_cache_write_through,
-                            ane_compile_cache: this.globalSettings.cache.ane_compile_cache,
                             gdn_snapshot_storage: this.globalSettings.cache.gdn_snapshot_storage,
                             gdn_ssd_pending_max_size: this.globalSettings.cache.gdn_ssd_pending_max_size,
                             gdn_sidecar_precision: this.globalSettings.cache.gdn_sidecar_precision,
@@ -6984,10 +6890,6 @@
                         }
                         continue;
                     }
-                    if (k === 'index_cache_freq') {
-                        if (ms.enableIndexCache) out.index_cache_freq = ms.index_cache_freq || 4;
-                        continue;
-                    }
                     if (k === 'max_tool_result_tokens') {
                         if (ms.enableToolResultLimit && ms.max_tool_result_tokens) {
                             out.max_tool_result_tokens = Number(ms.max_tool_result_tokens);
@@ -7207,12 +7109,6 @@
                 return DIFFUSION_CONFIG_MODEL_TYPES.has(modelType);
             },
 
-            isQwen35AnePrefillModel(model) {
-                const modelType = String(model?.config_model_type || '')
-                    .toLowerCase()
-                    .replace(/-/g, '_');
-                return QWEN35_ANE_CONFIG_PREFIXES.some(prefix => modelType.startsWith(prefix));
-            },
 
             isDiffusionUnsupportedProfileField(field) {
                 return DIFFUSION_UNSUPPORTED_PROFILE_FIELDS.has(field);
@@ -7238,67 +7134,12 @@
                 return model.model_type === 'llm' || model.model_type === 'vlm' || !model.model_type;
             },
 
-            isDflashDraftModel(model) {
-                const configType = String(model?.config_model_type || '').toLowerCase();
-                if (DFLASH_DRAFTER_CONFIG_MODEL_TYPES.has(configType)) {
-                    return true;
-                }
-                // DFlash 2 checkpoints are versioned ("-DFlash2"), so allow an
-                // optional numeric suffix after the "dflash" token.
-                return /(^|[-_/\s])dflash[0-9]*($|[-_/\s])/i.test(this.draftModelSearchText(model));
-            },
-
-            isVlmMtpDraftModel(model) {
-                const configType = String(model?.config_model_type || '').toLowerCase();
-                if (configType) {
-                    return VLM_MTP_DRAFTER_CONFIG_MODEL_TYPES.has(configType);
-                }
-                return /assistant|(^|[-_/\s])mtp($|[-_/\s])/i.test(this.draftModelSearchText(model));
-            },
-
-            isSpecPrefillDraftModel(model) {
-                return !this.isDflashDraftModel(model)
-                    && !this.isVlmMtpDraftModel(model);
-            },
-
             draftModelCandidates(filterFn, { fallbackToBase = true } = {}) {
                 const base = (this.models || []).filter((model) => (
                     this.isDraftModelBaseCandidate(model)
                 ));
                 const filtered = base.filter(filterFn);
                 return (filtered.length > 0 || !fallbackToBase) ? filtered : base;
-            },
-
-            specPrefillDraftModelCandidates() {
-                return this.draftModelCandidates((model) => this.isSpecPrefillDraftModel(model));
-            },
-
-            dflashDraftModelCandidates() {
-                return this.draftModelCandidates((model) => this.isDflashDraftModel(model));
-            },
-
-            vlmMtpDraftModelCandidates() {
-                return this.draftModelCandidates(
-                    (model) => this.isVlmMtpDraftModel(model),
-                    { fallbackToBase: false },
-                );
-            },
-
-            // Settings that materialize as per-request logits processors,
-            // which the VLM MTP decode path cannot apply (#2399). Mirrors
-            // vlm_mtp_processor_conflicts() in model_settings.py; neutral
-            // values (repetition 1.0, presence 0.0) do not conflict.
-            // Thinking budget is exempt: it is applied on the vlm_mtp path
-            // at verify time (MTPProcessingSampler).
-            vlmMtpProcessorConflict() {
-                const ms = this.modelSettings;
-                if (!ms) return false;
-                const num = (v) => (v === null || v === undefined || v === '' ? null : Number(v));
-                const rep = num(ms.repetition_penalty);
-                const pres = num(ms.presence_penalty);
-                return (rep !== null && rep !== 1.0)
-                    || (pres !== null && pres !== 0.0)
-                    || !!ms.guided_grammar_enabled;
             },
 
             // Coerce a raw kwarg string from the panel into its JSON type:
@@ -7386,61 +7227,11 @@
                     max_tool_result_tokens: s.max_tool_result_tokens || null,
                     reasoning_parser: s.reasoning_parser || '',
                     ttl_seconds: s.ttl_seconds ?? null,
-                    enableIndexCache: !!(s.index_cache_freq),
-                    index_cache_freq: s.index_cache_freq || null,
-                    turboquant_kv_enabled: s.turboquant_kv_enabled || false,
-                    turboquant_kv_bits: s.turboquant_kv_bits || 4,
-                    qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
-                    qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048,
-                    qwen35_ane_prefill_tail_padding_min_tokens: s.qwen35_ane_prefill_tail_padding_min_tokens ?? 0,
-                    qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? 0.53,
-                    qwen35_ane_prefill_fused_down: s.qwen35_ane_prefill_fused_down || false,
-                    qwen35_ane_prefill_max_layers: s.qwen35_ane_prefill_max_layers || 64,
-                    qwen35_ane_prefill_dual_ane: s.qwen35_ane_prefill_dual_ane !== false,
-                    qwen35_ane_prefill_gdn: s.qwen35_ane_prefill_gdn !== false,
-                    qwen35_ane_prefill_gdn_fraction: s.qwen35_ane_prefill_gdn_fraction ?? 0.5,
-                    qwen35_ane_prefill_gdn_max_layers: s.qwen35_ane_prefill_gdn_max_layers ?? 48,
-                    qwen35_ane_prefill_cpu_enabled: s.qwen35_ane_prefill_cpu_enabled || false,
-                    qwen35_ane_prefill_cpu_fraction: s.qwen35_ane_prefill_cpu_fraction ?? 0.135,
-                    qwen35_ane_prefill_cpu_down_fraction: s.qwen35_ane_prefill_cpu_down_fraction ?? 0,
-                    qwen35_ane_prefill_cpu_gdn_fraction: s.qwen35_ane_prefill_cpu_gdn_fraction ?? 0,
-                    qwen35_ane_prefill_cpu_threads: s.qwen35_ane_prefill_cpu_threads ?? 8,
-                    qwen35_ane_prefill_cpu_shared_resource: s.qwen35_ane_prefill_cpu_shared_resource !== false,
-                    specprefill_enabled: s.specprefill_enabled || false,
-                    specprefill_draft_model: s.specprefill_draft_model || '',
-                    specprefill_keep_pct: s.specprefill_keep_pct ? String(s.specprefill_keep_pct) : '0.2',
-                    specprefill_threshold: s.specprefill_threshold || null,
-                    dflash_enabled: s.dflash_enabled || false,
-                    dflash_draft_model: s.dflash_draft_model || '',
-                    dflash_draft_quant_enabled: s.dflash_draft_quant_enabled || false,
-                    dflash_draft_quant_weight_bits: s.dflash_draft_quant_weight_bits || 4,
-                    dflash_draft_quant_activation_bits: s.dflash_draft_quant_activation_bits || 16,
-                    dflash_draft_quant_group_size: s.dflash_draft_quant_group_size || 64,
-                    dflash_max_ctx: s.dflash_max_ctx ?? null,
-                    dflash_in_memory_cache: s.dflash_in_memory_cache !== false,
-                    dflash_in_memory_cache_max_entries: s.dflash_in_memory_cache_max_entries || 4,
-                    dflash_in_memory_cache_max_gib: s.dflash_in_memory_cache_max_bytes
-                        ? Math.round(s.dflash_in_memory_cache_max_bytes / (1024 ** 3))
-                        : 8,
-                    dflash_ssd_cache: s.dflash_ssd_cache || false,
-                    dflash_ssd_cache_max_gib: s.dflash_ssd_cache_max_bytes
-                        ? Math.round(s.dflash_ssd_cache_max_bytes / (1024 ** 3))
-                        : 20,
-                    dflash_draft_window_size: s.dflash_draft_window_size ?? null,
-                    dflash_draft_sink_size: s.dflash_draft_sink_size ?? 0,
-                    dflash_block_size: s.dflash_block_size ?? null,
-                    dflash_verify_mode: s.dflash_verify_mode || 'adaptive',
-                    dflash_compatible: model?.dflash_compatible !== false,
-                    dflash_compatibility_reason: model?.dflash_compatibility_reason || '',
-                    dflash_ssd_cache_available: !!model?.dflash_ssd_cache_available,
                     mtp_enabled: s.mtp_enabled || false,
                     mtp_compatible: model?.mtp_compatible === true,
                     mtp_compatibility_reason: model?.mtp_compatibility_reason || '',
                     is_paroquant: model?.is_paroquant === true,
                     paroquant_reason: model?.paroquant_reason || '',
-                    vlm_mtp_enabled: s.vlm_mtp_enabled || false,
-                    vlm_mtp_draft_model: s.vlm_mtp_draft_model || '',
-                    vlm_mtp_draft_block_size: s.vlm_mtp_draft_block_size ?? null,
                     ctKwargEntries,
                     is_diffusion_model: isDiffusion,
                     trust_remote_code: s.trust_remote_code || false,
@@ -7450,7 +7241,7 @@
             _resetPresetApplicableFields() {
                 // Reset all fields a preset can touch so switching presets does not leave
                 // stale values. Intentionally does NOT touch model_alias / model_type_override
-                // / is_pinned / is_default / turboquant_* / dflash_* / specprefill_* / index_cache_*.
+                // / is_pinned / is_default / mtp_*.
                 const ms = this.modelSettings;
                 ms.temperature = null;
                 ms.top_p = null;
@@ -7811,439 +7602,9 @@
                 }
             },
 
-            aneTuningForSelectedModel() {
-                return !!this.selectedModel
-                    && this.aneTuning.modelId === this.selectedModel.id;
-            },
-
-            aneTuningProgressPercent() {
-                const current = Number(this.aneTuning.status?.current || 0);
-                const total = Number(
-                    this.aneTuning.status?.total || this.aneTuning.total || 0
-                );
-                if (total <= 0) return 0;
-                return Math.max(0, Math.min(100, current / total * 100));
-            },
-
-            aneTuningRecommendationText() {
-                const recommendation = this.aneTuning.status?.recommendation;
-                if (!recommendation) return '';
-                const measured = recommendation.processing_tps !== null
-                    && recommendation.processing_tps !== undefined;
-                const speed = Number(recommendation.processing_tps || 0).toFixed(1);
-                const speedup = Number(recommendation.speedup_percent || 0);
-                const speedupText = `${speedup >= 0 ? '+' : ''}${speedup.toFixed(1)}%`;
-                const speedSuffix = measured
-                    ? ` · ${speed} prompt tok/s · ${speedupText}`
-                    : '';
-                if (!recommendation.enabled) {
-                    return `GPU only${speedSuffix}`;
-                }
-                const parts = [
-                    `${recommendation.fused_down ? 'Fused MLP per ANE' : 'MLP'} ${Math.round(Number(recommendation.mlp_fraction) * 100)}%`,
-                ];
-                if (recommendation.gdn_enabled) {
-                    parts.push(
-                        `GDN ${Math.round(Number(recommendation.gdn_fraction) * 100)}%`
-                    );
-                } else {
-                    parts.push('GDN off');
-                }
-                if (recommendation.cpu_enabled) {
-                    parts.push(
-                        `CPU gate ${Math.round(Number(recommendation.cpu_fraction || 0) * 100)}%`,
-                        `CPU down ${Math.round(Number(recommendation.cpu_down_fraction || 0) * 100)}%`,
-                        `CPU GDN ${Math.round(Number(recommendation.cpu_gdn_fraction || 0) * 100)}%`,
-                    );
-                }
-                if (Number(recommendation.tail_padding_min_tokens || 0) > 0) {
-                    parts.push(
-                        `Pad tails ≥${Number(recommendation.tail_padding_min_tokens)}`
-                    );
-                }
-                return `${parts.join(' · ')}${speedSuffix}`;
-            },
-
-            aneTuningResultText(result) {
-                if (result?.processing_tps === null
-                    || result?.processing_tps === undefined) {
-                    if (result?.latency_ms !== null
-                        && result?.latency_ms !== undefined) {
-                        return `${Number(result.latency_ms).toFixed(2)} ms`;
-                    }
-                    // Keep unfinished rows visible but leave their result cell
-                    // blank, including the candidate that stopped the run.
-                    return '';
-                }
-                const speed = Number(result.processing_tps).toFixed(1);
-                if (result.speedup_percent === null
-                    || result.speedup_percent === undefined) {
-                    return speed;
-                }
-                const speedup = Number(result.speedup_percent);
-                return `${speed} (${speedup >= 0 ? '+' : ''}${speedup.toFixed(1)}%)`;
-            },
-
-            _scheduleANETuningPoll() {
-                if (this._aneTuningPollTimer) {
-                    clearTimeout(this._aneTuningPollTimer);
-                }
-                if (!this.aneTuning.running) return;
-                this._aneTuningPollTimer = setTimeout(
-                    () => this.pollANETuning(),
-                    1000,
-                );
-            },
-
-            async startANETuning() {
-                if (!this.selectedModel || this.aneTuning.running) return;
-                const modelId = this.selectedModel.id;
-                if (this._aneTuningPollTimer) {
-                    clearTimeout(this._aneTuningPollTimer);
-                    this._aneTuningPollTimer = null;
-                }
-                this.aneTuning = {
-                    tuningId: null,
-                    modelId,
-                    running: true,
-                    cancelling: false,
-                    applying: false,
-                    applied: false,
-                    total: 0,
-                    status: null,
-                    error: '',
-                };
-                try {
-                    const response = await fetch('/admin/api/bench/ane-tune/start', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            model_id: modelId,
-                            sequence_length: parseInt(
-                                this.modelSettings.qwen35_ane_prefill_sequence_length
-                            ) || 2048,
-                            repeats: 2,
-                            allow_cpu: this.aneTuningOverrides.allowCpu,
-                            allow_cpu_gate: this.aneTuningOverrides.allowCpu
-                                && this.aneTuningOverrides.allowCpuGate,
-                            allow_cpu_down: this.aneTuningOverrides.allowCpu
-                                && this.aneTuningOverrides.allowCpuDown,
-                            allow_ane_gdn: this.aneTuningOverrides.allowAneGdn,
-                            allow_cpu_gdn: this.aneTuningOverrides.allowCpu
-                                && this.aneTuningOverrides.allowAneGdn
-                                && this.aneTuningOverrides.allowCpuGdn,
-                            allow_cpu_shared_resource: this.aneTuningOverrides.allowCpu
-                                && this.aneTuningOverrides.allowCpuSharedResource,
-                        }),
-                    });
-                    const data = await response.json().catch(() => ({}));
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (!response.ok) {
-                        throw new Error(data.detail || 'Failed to start ANE tuning.');
-                    }
-                    this.aneTuning.tuningId = data.tuning_id;
-                    this.aneTuning.total = Number(data.total || 0);
-                    await this.pollANETuning();
-                } catch (error) {
-                    this.aneTuning.running = false;
-                    this.aneTuning.error = error.message || String(error);
-                }
-            },
-
-            async pollANETuning() {
-                const tuningId = this.aneTuning.tuningId;
-                if (!tuningId || !this.aneTuning.running) return;
-                try {
-                    const response = await fetch(
-                        `/admin/api/bench/ane-tune/${encodeURIComponent(tuningId)}/results`
-                    );
-                    const data = await response.json().catch(() => ({}));
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (!response.ok) {
-                        throw new Error(data.detail || 'Failed to read ANE tuning progress.');
-                    }
-                    if (this.aneTuning.tuningId !== tuningId) return;
-                    if (!data.termination_reason && data.status === 'error') {
-                        data.termination_reason = data.error || data.message || 'ANE tuning failed.';
-                    }
-                    this.aneTuning.status = data;
-                    this.aneTuning.total = Number(data.total || this.aneTuning.total || 0);
-                    this.aneTuning.running = data.status === 'running';
-                    this.aneTuning.cancelling = false;
-                    if (data.status === 'error' || data.status === 'cancelled') {
-                        // Early termination belongs beside the partial result
-                        // matrix. Keep this field for request/transport errors.
-                        this.aneTuning.error = '';
-                    }
-                    this._scheduleANETuningPoll();
-                } catch (error) {
-                    this.aneTuning.running = false;
-                    this.aneTuning.cancelling = false;
-                    this.aneTuning.error = error.message || String(error);
-                }
-            },
-
-            async cancelANETuning() {
-                const tuningId = this.aneTuning.tuningId;
-                if (!tuningId || !this.aneTuning.running || this.aneTuning.cancelling) return;
-                this.aneTuning.cancelling = true;
-                try {
-                    const response = await fetch(
-                        `/admin/api/bench/ane-tune/${encodeURIComponent(tuningId)}/cancel`,
-                        { method: 'POST' },
-                    );
-                    const data = await response.json().catch(() => ({}));
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (!response.ok) {
-                        throw new Error(data.detail || 'Failed to cancel ANE tuning.');
-                    }
-                    await this.pollANETuning();
-                } catch (error) {
-                    this.aneTuning.cancelling = false;
-                    this.aneTuning.error = error.message || String(error);
-                }
-            },
-
-            async applyANETuningRecommendation() {
-                if (!this.selectedModel || !this.aneTuningForSelectedModel()) return;
-                const recommendation = this.aneTuning.status?.recommendation;
-                if (!recommendation || this.aneTuning.applying) return;
-                const patch = {
-                    qwen35_ane_prefill_enabled: !!recommendation.enabled,
-                    qwen35_ane_prefill_sequence_length: Number(recommendation.sequence_length),
-                    qwen35_ane_prefill_tail_padding_min_tokens: Number(
-                        recommendation.tail_padding_min_tokens || 0
-                    ),
-                };
-                if (recommendation.enabled) {
-                    patch.qwen35_ane_prefill_fraction = Number(recommendation.mlp_fraction);
-                    patch.qwen35_ane_prefill_fused_down = !!recommendation.fused_down;
-                    patch.qwen35_ane_prefill_gdn = !!recommendation.gdn_enabled;
-                    if (recommendation.gdn_enabled) {
-                        patch.qwen35_ane_prefill_gdn_fraction = Number(
-                            recommendation.gdn_fraction
-                        );
-                    }
-                    patch.qwen35_ane_prefill_cpu_enabled = !!recommendation.cpu_enabled;
-                    patch.qwen35_ane_prefill_cpu_fraction = Number(
-                        recommendation.cpu_fraction || 0
-                    );
-                    patch.qwen35_ane_prefill_cpu_down_fraction = Number(
-                        recommendation.cpu_down_fraction || 0
-                    );
-                    patch.qwen35_ane_prefill_cpu_gdn_fraction = Number(
-                        recommendation.cpu_gdn_fraction || 0
-                    );
-                    if (recommendation.cpu_threads !== null
-                        && recommendation.cpu_threads !== undefined) {
-                        patch.qwen35_ane_prefill_cpu_threads = Number(
-                            recommendation.cpu_threads
-                        );
-                    }
-                    if (recommendation.cpu_shared_resource !== null
-                        && recommendation.cpu_shared_resource !== undefined) {
-                        patch.qwen35_ane_prefill_cpu_shared_resource =
-                            !!recommendation.cpu_shared_resource;
-                    }
-                }
-
-                this.aneTuning.applying = true;
-                this.aneTuning.error = '';
-                try {
-                    const response = await fetch(
-                        `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/settings`,
-                        {
-                            method: 'PUT',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify(patch),
-                        },
-                    );
-                    const data = await response.json().catch(() => ({}));
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (!response.ok) {
-                        throw new Error(data.detail || 'Failed to apply ANE tuning result.');
-                    }
-                    Object.assign(this.modelSettings, patch);
-                    const model = this.models.find(item => item.id === this.selectedModel.id);
-                    if (model && data.settings) {
-                        model.settings = { ...data.settings };
-                    }
-                    this.aneTuning.applied = true;
-                } catch (error) {
-                    this.aneTuning.error = error.message || String(error);
-                } finally {
-                    this.aneTuning.applying = false;
-                }
-            },
-
-            async openModelSettings(model) {
-                this.profileError = '';
-                this.showNewProfileForm = false;
-                this.showNewTemplateForm = false;
-                this.editingProfile = null;
-                this.editingTemplate = null;
-                this.profileDeleteConfirm = null;
-                this.templateDeleteConfirm = null;
-                const isDiffusion = this.isDiffusionModel(model);
-                this.activeProfileName = isDiffusion
-                    ? null
-                    : ((model.settings && model.settings.active_profile_name) || null);
-                if (isDiffusion) {
-                    this.profiles = [];
-                    this.templates = [];
-                    this.profilesDrift = false;
-                } else {
-                    try {
-                        const saved = localStorage.getItem('omlx_profile_scope');
-                        if (saved === 'preset' || saved === 'global' || saved === 'model') {
-                            this.profileScope = saved;
-                        }
-                    } catch (e) {}
-                    await Promise.all([
-                        this.loadProfilesForModel(model.id),
-                        this.loadTemplates(),
-                    ]);
-                    if (this.reasoningParsers.length === 0) {
-                        try {
-                            const resp = await fetch('/admin/api/grammar/parsers');
-                            if (resp.ok) this.reasoningParsers = await resp.json();
-                            else if (resp.status === 401) window.location.href = '/admin';
-                        } catch (_) { /* network error */ }
-                    }
-                }
-                this.selectedModel = model;
-                this.modelSettings = this.buildModelSettingsState(
-                    model,
-                    model.settings || {},
-                );
-                if (isDiffusion) {
-                    this.profilesDrift = false;
-                } else {
-                    this.computeDrift();
-                }
-                this.showModelSettingsModal = true;
-            },
-
-            async importMtplxSidecar() {
-                if (!this.selectedModel || this.importingMtplx) return;
-                this.importingMtplx = true;
-                try {
-                    const response = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/import-mtplx`, {
-                        method: 'POST',
-                    });
-                    const data = await response.json().catch(() => ({}));
-                    if (!response.ok) {
-                        alert(data.detail || window.t('js.error.mtplx_import_failed'));
-                        return;
-                    }
-                    if (data.message) alert(data.message);
-                    // Refresh so mtp_compatible flips and the toggle unlocks.
-                    await this.loadModels();
-                    const model = this.models.find(m => m.id === this.selectedModel.id);
-                    if (model) await this.openModelSettings(model);
-                } catch (e) {
-                    alert(window.t('js.error.mtplx_import_failed'));
-                } finally {
-                    this.importingMtplx = false;
-                }
-            },
-
-            validateQwenAneSettings() {
-                if (!this.modelSettings.qwen35_ane_prefill_enabled) return null;
-
-                const integer = (value, label, minimum) => {
-                    if (value === '' || value === null || value === undefined) {
-                        return `${label} is required.`;
-                    }
-                    const number = Number(value);
-                    if (!Number.isInteger(number)) return `${label} must be an integer.`;
-                    if (number < minimum) return `${label} must be at least ${minimum}.`;
-                    return null;
-                };
-                const fraction = (value, label, minimum, maximum) => {
-                    if (value === '' || value === null || value === undefined) {
-                        return `${label} is required.`;
-                    }
-                    const number = Number(value);
-                    if (!Number.isFinite(number)) return `${label} must be a number.`;
-                    if (number < minimum || number > maximum) {
-                        return `${label} must be between ${minimum} and ${maximum}.`;
-                    }
-                    return null;
-                };
-
-                const sequenceLength = Number(this.modelSettings.qwen35_ane_prefill_sequence_length);
-                let error = integer(sequenceLength, 'ANE prompt block', 1024);
-                if (!error && sequenceLength % 64 !== 0) {
-                    error = 'ANE prompt block must be a multiple of 64.';
-                }
-                if (error) return error;
-                error = integer(
-                    this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens,
-                    'ANE tail padding threshold',
-                    0,
-                );
-                if (error) return error;
-                if (Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens) >= sequenceLength) {
-                    return 'ANE tail padding threshold must be less than the prompt block.';
-                }
-                error = fraction(this.modelSettings.qwen35_ane_prefill_fraction, 'MLP ANE fraction', 0.05, 0.90);
-                if (error) return error;
-                error = integer(this.modelSettings.qwen35_ane_prefill_max_layers, 'ANE MLP layer limit', 1);
-                if (error) return error;
-
-                if (this.modelSettings.qwen35_ane_prefill_cpu_enabled) {
-                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_fraction, 'CPU MLP fraction', 0, 0.25);
-                    if (error) return error;
-                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction, 'CPU MLP down fraction', 0, 0.50);
-                    if (error) return error;
-                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction, 'CPU GDN fraction', 0, 0.50);
-                    if (error) return error;
-                    error = integer(this.modelSettings.qwen35_ane_prefill_cpu_threads, 'CPU worker count', 0);
-                    if (error) return error;
-                    if (Number(this.modelSettings.qwen35_ane_prefill_cpu_threads) > 64) {
-                        return 'CPU worker count must be between 0 and 64.';
-                    }
-                    if (Number(this.modelSettings.qwen35_ane_prefill_fraction)
-                        + Number(this.modelSettings.qwen35_ane_prefill_cpu_fraction) >= 1) {
-                        return 'MLP ANE and CPU fractions must total less than 1.0.';
-                    }
-                }
-
-                if (this.modelSettings.qwen35_ane_prefill_gdn) {
-                    error = fraction(this.modelSettings.qwen35_ane_prefill_gdn_fraction, 'GDN ANE fraction', 0.05, 0.90);
-                    if (error) return error;
-                    if (this.modelSettings.qwen35_ane_prefill_cpu_enabled
-                        && Number(this.modelSettings.qwen35_ane_prefill_gdn_fraction)
-                        + Number(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction) >= 1) {
-                        return 'GDN ANE and CPU fractions must total less than 1.0.';
-                    }
-                    error = integer(this.modelSettings.qwen35_ane_prefill_gdn_max_layers, 'ANE GDN layer limit', 0);
-                    if (error) return error;
-                }
-                return null;
-            },
 
             async saveModelSettings() {
                 if (!this.selectedModel) return;
-
-                const qwenAneValidationError = this.validateQwenAneSettings();
-                if (qwenAneValidationError) {
-                    alert(qwenAneValidationError);
-                    return;
-                }
 
                 this.savingModelSettings = true;
                 try {
@@ -8294,9 +7655,6 @@
                                 force_sampling: this.modelSettings.force_sampling,
                                 reasoning_parser: this.modelSettings.reasoning_parser || null,
                                 ttl_seconds: this.modelSettings.ttl_seconds || null,
-                                index_cache_freq: this.modelSettings.enableIndexCache
-                                    ? (this.modelSettings.index_cache_freq || 4)
-                                    : 0,
                                 enable_thinking: this.modelSettings.enable_thinking,
                                 qwen4_ple_ssd_offload:
                                     !!this.modelSettings.qwen4_ple_ssd_offload,
@@ -8315,104 +7673,7 @@
                                     ? chatTemplateKwargs : null,
                                 forced_ct_kwargs: forcedCtKwargs.length > 0
                                     ? forcedCtKwargs : null,
-                                turboquant_kv_enabled: this.modelSettings.turboquant_kv_enabled,
-                                turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
-                                    ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
-                                    : 4,
-                                qwen35_ane_prefill_enabled: !!this.modelSettings.qwen35_ane_prefill_enabled,
-                                // Validation only runs when the feature is enabled, so a
-                                // blank numeric input must fall back to the server default
-                                // instead of coercing to 0 and failing an unrelated save.
-                                qwen35_ane_prefill_sequence_length: Number(this.modelSettings.qwen35_ane_prefill_sequence_length) || 2048,
-                                qwen35_ane_prefill_tail_padding_min_tokens: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens))
-                                    ? Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens)
-                                    : 0,
-                                qwen35_ane_prefill_fraction: Number(this.modelSettings.qwen35_ane_prefill_fraction) || 0.53,
-                                qwen35_ane_prefill_max_layers: Number(this.modelSettings.qwen35_ane_prefill_max_layers) || 64,
-                                qwen35_ane_prefill_dual_ane: !!this.modelSettings.qwen35_ane_prefill_dual_ane,
-                                qwen35_ane_prefill_gdn: !!this.modelSettings.qwen35_ane_prefill_gdn,
-                                qwen35_ane_prefill_gdn_fraction: Number(this.modelSettings.qwen35_ane_prefill_gdn_fraction) || 0.5,
-                                qwen35_ane_prefill_gdn_max_layers: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers))
-                                    ? Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers)
-                                    : 48,
-                                qwen35_ane_prefill_cpu_enabled: !!this.modelSettings.qwen35_ane_prefill_cpu_enabled,
-                                qwen35_ane_prefill_cpu_fraction: Number(this.modelSettings.qwen35_ane_prefill_cpu_fraction),
-                                qwen35_ane_prefill_cpu_down_fraction: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction))
-                                    ? Number(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction)
-                                    : 0,
-                                qwen35_ane_prefill_cpu_gdn_fraction: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction))
-                                    ? Number(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction)
-                                    : 0,
-                                qwen35_ane_prefill_cpu_threads: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_threads))
-                                    ? Number(this.modelSettings.qwen35_ane_prefill_cpu_threads)
-                                    : 8,
-                                qwen35_ane_prefill_cpu_shared_resource: !!this.modelSettings.qwen35_ane_prefill_cpu_shared_resource,
-                                specprefill_enabled: this.modelSettings.specprefill_enabled,
-                                specprefill_draft_model: this.modelSettings.specprefill_draft_model || null,
-                                specprefill_keep_pct: this.modelSettings.specprefill_enabled
-                                    ? parseFloat(this.modelSettings.specprefill_keep_pct) || 0.2
-                                    : null,
-                                specprefill_threshold: this.modelSettings.specprefill_enabled
-                                    ? (this.modelSettings.specprefill_threshold || null)
-                                    : null,
-                                dflash_enabled: this.modelSettings.dflash_enabled,
-                                dflash_draft_model: this.modelSettings.dflash_draft_model || null,
-                                dflash_draft_quant_enabled: this.modelSettings.dflash_enabled && !!this.modelSettings.dflash_draft_quant_enabled,
-                                dflash_draft_quant_weight_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_enabled
-                                    ? parseInt(this.modelSettings.dflash_draft_quant_weight_bits)
-                                    : null,
-                                dflash_draft_quant_activation_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_enabled
-                                    ? parseInt(this.modelSettings.dflash_draft_quant_activation_bits)
-                                    : null,
-                                dflash_draft_quant_group_size: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_enabled
-                                    ? parseInt(this.modelSettings.dflash_draft_quant_group_size)
-                                    : null,
-                                dflash_max_ctx: this.modelSettings.dflash_enabled && this.modelSettings.dflash_max_ctx
-                                    ? parseInt(this.modelSettings.dflash_max_ctx)
-                                    : null,
-                                dflash_in_memory_cache: this.modelSettings.dflash_enabled
-                                    ? !!this.modelSettings.dflash_in_memory_cache
-                                    : true,
-                                dflash_in_memory_cache_max_entries: this.modelSettings.dflash_enabled
-                                    ? (parseInt(this.modelSettings.dflash_in_memory_cache_max_entries) || 4)
-                                    : 4,
-                                dflash_in_memory_cache_max_bytes: this.modelSettings.dflash_enabled
-                                    ? Math.max(1, parseInt(this.modelSettings.dflash_in_memory_cache_max_gib) || 8) * (1024 ** 3)
-                                    : 8 * (1024 ** 3),
-                                dflash_ssd_cache: this.modelSettings.dflash_enabled
-                                    && !!this.modelSettings.dflash_in_memory_cache
-                                    && !!this.modelSettings.dflash_ssd_cache_available
-                                    && !!this.modelSettings.dflash_ssd_cache,
-                                dflash_ssd_cache_max_bytes: this.modelSettings.dflash_enabled
-                                    ? Math.max(1, parseInt(this.modelSettings.dflash_ssd_cache_max_gib) || 20) * (1024 ** 3)
-                                    : 20 * (1024 ** 3),
-                                // Long-context tuning. Empty → oMLX default.
-                                dflash_draft_window_size: this.modelSettings.dflash_enabled
-                                    && this.modelSettings.dflash_draft_window_size
-                                    ? parseInt(this.modelSettings.dflash_draft_window_size)
-                                    : null,
-                                dflash_draft_sink_size: this.modelSettings.dflash_enabled
-                                    && this.modelSettings.dflash_draft_sink_size !== null
-                                    && this.modelSettings.dflash_draft_sink_size !== undefined
-                                    && this.modelSettings.dflash_draft_sink_size !== ''
-                                    ? parseInt(this.modelSettings.dflash_draft_sink_size)
-                                    : 0,
-                                dflash_block_size: this.modelSettings.dflash_enabled
-                                    && this.modelSettings.dflash_block_size
-                                    ? parseInt(this.modelSettings.dflash_block_size)
-                                    : null,
-                                dflash_verify_mode: this.modelSettings.dflash_enabled
-                                    ? (this.modelSettings.dflash_verify_mode || 'adaptive')
-                                    : null,
                                 mtp_enabled: !!this.modelSettings.mtp_enabled,
-                                vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
-                                vlm_mtp_draft_model: this.modelSettings.vlm_mtp_enabled
-                                    ? (this.modelSettings.vlm_mtp_draft_model || null)
-                                    : null,
-                                vlm_mtp_draft_block_size: this.modelSettings.vlm_mtp_enabled
-                                    && this.modelSettings.vlm_mtp_draft_block_size
-                                    ? parseInt(this.modelSettings.vlm_mtp_draft_block_size)
-                                    : null,
                                 trust_remote_code: this.modelSettings.trust_remote_code,
                             };
                             if (isDiffusion) {
@@ -8424,54 +7685,13 @@
                                     presence_penalty: null,
                                     force_sampling: false,
                                     reasoning_parser: null,
-                                    index_cache_freq: 0,
                                     enable_thinking: null,
                                     thinking_budget_enabled: false,
                                     thinking_budget_tokens: 0,
                                     guided_grammar_enabled: false,
                                     guided_grammar: null,
                                     max_tool_result_tokens: 0,
-                                    turboquant_kv_enabled: false,
-                                    turboquant_kv_bits: 4,
-                                    qwen35_ane_prefill_enabled: false,
-                                    qwen35_ane_prefill_sequence_length: 2048,
-                                    qwen35_ane_prefill_tail_padding_min_tokens: 0,
-                                    qwen35_ane_prefill_fraction: 0.53,
-                                    qwen35_ane_prefill_max_layers: 64,
-                                    qwen35_ane_prefill_dual_ane: true,
-                                    qwen35_ane_prefill_gdn: true,
-                                    qwen35_ane_prefill_gdn_fraction: 0.5,
-                                    qwen35_ane_prefill_gdn_max_layers: 48,
-                                    qwen35_ane_prefill_cpu_enabled: false,
-                                    qwen35_ane_prefill_cpu_fraction: 0.135,
-                                    qwen35_ane_prefill_cpu_down_fraction: 0,
-                                    qwen35_ane_prefill_cpu_gdn_fraction: 0,
-                                    qwen35_ane_prefill_cpu_threads: 8,
-                                    qwen35_ane_prefill_cpu_shared_resource: true,
-                                    specprefill_enabled: false,
-                                    specprefill_draft_model: null,
-                                    specprefill_keep_pct: null,
-                                    specprefill_threshold: null,
-                                    dflash_enabled: false,
-                                    dflash_draft_model: null,
-                                    dflash_draft_quant_enabled: false,
-                                    dflash_draft_quant_weight_bits: null,
-                                    dflash_draft_quant_activation_bits: null,
-                                    dflash_draft_quant_group_size: null,
-                                    dflash_max_ctx: null,
-                                    dflash_in_memory_cache: true,
-                                    dflash_in_memory_cache_max_entries: 4,
-                                    dflash_in_memory_cache_max_bytes: 8 * (1024 ** 3),
-                                    dflash_ssd_cache: false,
-                                    dflash_ssd_cache_max_bytes: 20 * (1024 ** 3),
-                                    dflash_draft_window_size: null,
-                                    dflash_draft_sink_size: null,
-                                    dflash_block_size: null,
-                                    dflash_verify_mode: null,
                                     mtp_enabled: false,
-                                    vlm_mtp_enabled: false,
-                                    vlm_mtp_draft_model: null,
-                                    vlm_mtp_draft_block_size: null,
                                 });
                             }
                             return payload;
@@ -8527,51 +7747,12 @@
                         this.modelSettings.guided_grammar_enabled = false;
                         this.modelSettings.guided_grammar = '';
                         this.modelSettings.ttl_seconds = null;
-                        this.modelSettings.enableIndexCache = false;
-                        this.modelSettings.index_cache_freq = 0;
                         this.modelSettings.enable_thinking = false;
                         this.modelSettings.enableThinkingBudget = false;
                         this.modelSettings.thinking_budget_tokens = 0;
                         this.modelSettings.enableToolResultLimit = false;
                         this.modelSettings.max_tool_result_tokens = 0;
                         this.modelSettings.ctKwargEntries = [];
-                        this.modelSettings.turboquant_kv_enabled = false;
-                        this.modelSettings.turboquant_kv_bits = 4;
-                        this.modelSettings.qwen35_ane_prefill_enabled = false;
-                        this.modelSettings.qwen35_ane_prefill_sequence_length = 2048;
-                        this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens = 0;
-                        this.modelSettings.qwen35_ane_prefill_fraction = 0.53;
-                        this.modelSettings.qwen35_ane_prefill_max_layers = 64;
-                        this.modelSettings.qwen35_ane_prefill_dual_ane = true;
-                        this.modelSettings.qwen35_ane_prefill_gdn = true;
-                        this.modelSettings.qwen35_ane_prefill_gdn_fraction = 0.5;
-                        this.modelSettings.qwen35_ane_prefill_gdn_max_layers = 48;
-                        this.modelSettings.qwen35_ane_prefill_cpu_enabled = false;
-                        this.modelSettings.qwen35_ane_prefill_cpu_fraction = 0.135;
-                        this.modelSettings.qwen35_ane_prefill_cpu_down_fraction = 0;
-                        this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction = 0;
-                        this.modelSettings.qwen35_ane_prefill_cpu_threads = 8;
-                        this.modelSettings.qwen35_ane_prefill_cpu_shared_resource = true;
-                        this.modelSettings.specprefill_enabled = false;
-                        this.modelSettings.specprefill_draft_model = null;
-                        this.modelSettings.specprefill_keep_pct = 0.2;
-                        this.modelSettings.specprefill_threshold = null;
-                        this.modelSettings.dflash_enabled = false;
-                        this.modelSettings.dflash_draft_model = null;
-                        this.modelSettings.dflash_draft_quant_enabled = false;
-                        this.modelSettings.dflash_draft_quant_weight_bits = null;
-                        this.modelSettings.dflash_draft_quant_activation_bits = null;
-                        this.modelSettings.dflash_draft_quant_group_size = null;
-                        this.modelSettings.dflash_max_ctx = null;
-                        this.modelSettings.dflash_in_memory_cache = true;
-                        this.modelSettings.dflash_in_memory_cache_max_entries = 4;
-                        this.modelSettings.dflash_in_memory_cache_max_gib = 8;
-                        this.modelSettings.dflash_ssd_cache = false;
-                        this.modelSettings.dflash_ssd_cache_max_gib = 20;
-                        this.modelSettings.dflash_draft_window_size = null;
-                        this.modelSettings.dflash_draft_sink_size = 0;
-                        this.modelSettings.dflash_block_size = null;
-                        this.modelSettings.dflash_verify_mode = 'adaptive';
                         this.modelSettings.mtp_enabled = false;
                         this.modelSettings.trust_remote_code = false;
                     } else if (response.status === 404) {
@@ -8964,6 +8145,110 @@
                 }
             },
 
+            async loadTuning() {
+                try {
+                    const response = await fetch('/admin/api/tuning');
+                    if (!response.ok) return;
+                    const data = await response.json();
+                    this.tuning.enabled = !!data.enabled;
+                    this.tuning.values = data.values || {};
+                    this.tuning.job = data.job;
+                    this.tuning.results = data.results || {};
+                    const stage = data.results?.kernel?.winner_env ? 'kernel'
+                        : (data.results?.model?.winner_env ? 'model' : null);
+                    const res = stage ? data.results[stage] : null;
+                    if (res && res.winner_env) {
+                        this.tuning.winner_stage = stage;
+                        this.tuning.winner_text =
+                            Object.entries(res.winner_env).map(([k, v]) => k.replace('OMLX_', '') + '=' + v).join(', ')
+                            + (res.winner_score ? ` (${res.winner_score} vs baseline ${res.baseline_score})` : '');
+                    } else {
+                        this.tuning.winner_stage = null;
+                        this.tuning.winner_text = '';
+                    }
+                    // Applied values are dynamic: what tuning.json pins right now.
+                    const vals = data.values || {};
+                    this.tuning.applied_text = Object.keys(vals).length
+                        ? Object.entries(vals).map(([k, v]) => k.replace('OMLX_', '') + '=' + v).join(', ')
+                        : '';
+                    if (data.restart_required_keys?.length) {
+                        this.tuning.restart_hint =
+                            data.restart_required_keys.map((k) => k.replace('OMLX_', '')).join(', ')
+                            + ' → ' + this.t('modal.model_settings.tuning.restart_hint');
+                    } else {
+                        this.tuning.restart_hint = '';
+                    }
+                    if (this.tuning.job && this.tuning.job.running) {
+                        setTimeout(() => this.loadTuning(), 15000);
+                    } else {
+                        const rc = this.tuning.job?.returncode;
+                        if (rc !== null && rc !== undefined && rc !== 0 && !this.tuning.lastError) {
+                            this.tuning.lastError = 'Sweep exited (' + rc + '). See ~/.omlx/tuning/logs/';
+                        }
+                    }
+                } catch (e) {
+                    console.error('Failed to load tuning state:', e);
+                }
+            },
+
+            async startTuning(stage, modelId, promptTokens) {
+                this.tuning.lastError = '';
+                try {
+                    const payload = { stage };
+                    if (modelId) payload.model_id = modelId;
+                    if (promptTokens) payload.prompt_tokens = promptTokens;
+                    const response = await fetch('/admin/api/tuning/start', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+                    if (response.ok) {
+                        setTimeout(() => this.loadTuning(), 2000);
+                    } else {
+                        const detail = await response.json().catch(() => ({}));
+                        this.tuning.lastError = detail.detail || ('start failed: ' + response.status);
+                    }
+                } catch (e) {
+                    this.tuning.lastError = String(e);
+                }
+            },
+
+            async cancelTuning() {
+                this.tuning.lastError = '';
+                try {
+                    const response = await fetch('/admin/api/tuning/cancel', {
+                        method: 'POST'
+                    });
+                    if (response.ok) {
+                        setTimeout(() => this.loadTuning(), 1500);
+                    } else {
+                        const detail = await response.json().catch(() => ({}));
+                        this.tuning.lastError = detail.detail || ('cancel failed: ' + response.status);
+                    }
+                } catch (e) {
+                    this.tuning.lastError = String(e);
+                }
+            },
+
+            async applyTuningWinner() {
+                const stage = this.tuning.results?.kernel?.winner_env ? 'kernel'
+                    : (this.tuning.results?.model?.winner_env ? 'model' : null);
+                const winner = stage ? this.tuning.results[stage]?.winner_env : null;
+                if (!winner) return;
+                try {
+                    const response = await fetch('/admin/api/tuning/apply', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ values: winner })
+                    });
+                    if (response.ok) {
+                        await this.loadTuning();
+                    }
+                } catch (e) {
+                    console.error('Failed to apply tuning:', e);
+                }
+            },
+
             async loadStats(includeAlltime = true) {
                 try {
                     const params = new URLSearchParams();
@@ -9120,31 +8405,6 @@
                 if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
                 if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
                 return String(n);
-            },
-
-            formatDFlashSessionStats(totals) {
-                if (!totals || totals.requests <= 1) return '';
-
-                const parts = [];
-                if (totals.speculative_requests > 0) {
-                    parts.push(
-                        Math.round((totals.acceptance_ratio || 0) * 100) + '% ' +
-                        window.t('status.active_models.dflash_draft_share'),
-                        (totals.accepted_draft_tokens_per_cycle || 0).toFixed(2) + ' ' +
-                        window.t('status.active_models.dflash_accepted_draft_per_cycle'),
-                        (totals.tokens_per_cycle || 0).toFixed(2) + ' ' +
-                        window.t('status.active_models.dflash_output_per_cycle'),
-                        totals.speculative_requests + ' ' +
-                        window.t('status.active_models.dflash_speculative_requests'),
-                    );
-                }
-                if (totals.fallback_requests > 0) {
-                    parts.push(
-                        totals.fallback_requests + ' ' +
-                        window.t('status.active_models.dflash_fallback_requests'),
-                    );
-                }
-                return window.t('status.active_models.dflash_session') + ': ' + parts.join(' · ');
             },
 
             formatDurationShort(seconds) {
@@ -9413,7 +8673,6 @@
                         body: JSON.stringify({
                             model_id: this.benchExternalEnabled ? this.externalModel.trim() : this.benchModelId,
                             context_profile: this.benchContextProfile,
-                            align_prompt_to_ane: this.benchAlignPromptToAne,
                             prompt_lengths: promptLengths,
                             generation_length: 128,
                             batch_sizes: batchSizes,
@@ -11074,6 +10333,76 @@
             },
 
             // Deeplink from a manager row to that model's settings card (modal).
+            async openModelSettings(model) {
+                this.profileError = '';
+                this.showNewProfileForm = false;
+                this.showNewTemplateForm = false;
+                this.editingProfile = null;
+                this.editingTemplate = null;
+                this.profileDeleteConfirm = null;
+                this.templateDeleteConfirm = null;
+                const isDiffusion = this.isDiffusionModel(model);
+                this.activeProfileName = isDiffusion
+                    ? null
+                    : ((model.settings && model.settings.active_profile_name) || null);
+                if (isDiffusion) {
+                    this.profiles = [];
+                    this.templates = [];
+                    this.profilesDrift = false;
+                } else {
+                    try {
+                        const saved = localStorage.getItem('omlx_profile_scope');
+                        if (saved === 'preset' || saved === 'global' || saved === 'model') {
+                            this.profileScope = saved;
+                        }
+                    } catch (e) {}
+                    await Promise.all([
+                        this.loadProfilesForModel(model.id),
+                        this.loadTemplates(),
+                    ]);
+                    if (this.reasoningParsers.length === 0) {
+                        try {
+                            const resp = await fetch('/admin/api/grammar/parsers');
+                            if (resp.ok) this.reasoningParsers = await resp.json();
+                            else if (resp.status === 401) window.location.href = '/admin';
+                        } catch (_) { /* network error */ }
+                    }
+                }
+                this.selectedModel = model;
+                this.modelSettings = this.buildModelSettingsState(
+                    model,
+                    model.settings || {},
+                );
+                if (isDiffusion) {
+                    this.profilesDrift = false;
+                } else {
+                    this.computeDrift();
+                }
+                this.showModelSettingsModal = true;
+            },
+            async importMtplxSidecar() {
+                if (!this.selectedModel || this.importingMtplx) return;
+                this.importingMtplx = true;
+                try {
+                    const response = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/import-mtplx`, {
+                        method: 'POST',
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        alert(data.detail || window.t('js.error.mtplx_import_failed'));
+                        return;
+                    }
+                    if (data.message) alert(data.message);
+                    // Refresh so mtp_compatible flips and the toggle unlocks.
+                    await this.loadModels();
+                    const model = this.models.find(m => m.id === this.selectedModel.id);
+                    if (model) await this.openModelSettings(model);
+                } catch (e) {
+                    alert(window.t('js.error.mtplx_import_failed'));
+                } finally {
+                    this.importingMtplx = false;
+                }
+            },
             openModelSettingsFromManager(name) {
                 const model = this.managerModelInfo(name);
                 if (model) this.openModelSettings(model);
@@ -11480,19 +10809,14 @@
             },
 
             oqMtpAssistantCandidates() {
-                // Gemma 4 ships its MTP head as a separate gemma4_assistant
-                // checkpoint; offer to merge it into the quantized output.
-                // Qwen3.5/3.6 recipients can instead graft the native mtp.*
-                // head out of a same-geometry donor checkpoint (e.g. the
-                // base model of a fine-tune). Loose filter here; strict
+                // Offer to graft the native mtp.* head out of a
+                // same-geometry Qwen3.5/3.6 donor checkpoint (e.g. the base
+                // model of a fine-tune). Loose filter here; strict
                 // tokenizer/geometry validation happens server-side at
                 // submit.
                 if (!this.oqSelectedModelPath) return [];
                 const source = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                 if (!source) return [];
-                if (source.model_type === 'gemma4') {
-                    return this.oqAllModels.filter(m => m.model_type === 'gemma4_assistant');
-                }
                 const family = this.oqMtpFamily(source.model_type);
                 if (!family) return [];
                 if (this.oqSelectedModelHasMtp() && this.oqPreserveMtp) return [];

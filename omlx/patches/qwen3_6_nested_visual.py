@@ -11,14 +11,14 @@ the instantiated `Qwen3_5MoeForConditionalGeneration` model class does
 not have (its ViT lives at `self.vision_tower`). 333 visual params get
 silently dropped on load and any image input produces garbage.
 
-The mlx_vlm_mtp runtime sanitize (omlx/patches/mlx_vlm_mtp) re-implements
+Some vendored runtime sanitizes re-implement
 the same if/elif shape, so the bug also carries through mtp_enabled=True.
 
 This patch wraps `Model.sanitize` on mlx-vlm's `qwen3_5_moe` module to
 remap `language_model.model.visual.* -> vision_tower.*` after the
 original sanitize runs. Wired from
 ``omlx.utils.model_loading.maybe_apply_pre_load_patches`` (after
-``apply_mlx_vlm_mtp_runtime_patch`` so it covers whichever sanitize the
+so it covers whichever sanitize the
 class currently has) and from ``omlx.oq._build_model_sanitizer``.
 
 Self-guards: if upstream mlx-vlm adds the rule itself, source inspection

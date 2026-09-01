@@ -110,8 +110,6 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$PROJECT_DIR/../.." && pwd)"
 PACKAGING_DIR="$REPO_ROOT/packaging"
 CUSTOM_KERNEL_DIRS=(
-    "$REPO_ROOT/omlx/custom_kernels/glm_moe_dsa"
-    "$REPO_ROOT/omlx/custom_kernels/minimax_m3"
     "$REPO_ROOT/omlx/custom_kernels/qwen35_prefill"
 )
 # OMLX_EXPORT_DIR overrides the venvstacks export tree we copy Python
@@ -240,8 +238,6 @@ _clean_custom_kernel_build_artifacts() {
 
     if [ -d "$REPO_ROOT/build" ]; then
         for ext_name in \
-            "omlx.custom_kernels.glm_moe_dsa._ext" \
-            "omlx.custom_kernels.minimax_m3._ext" \
             "omlx.custom_kernels.qwen35_prefill._ext"; do
             find "$REPO_ROOT/build" \
                 -type d \
@@ -319,15 +315,15 @@ import sys
 import mlx.core as mx
 
 failures = []
-for name in ("glm_moe_dsa", "minimax_m3", "qwen35_prefill"):
+for name in ("qwen35_prefill",):
     ext_dir = pathlib.Path("omlx/custom_kernels") / name
     so = next(ext_dir.glob("_ext.*.so"), None)
     if so is None:
         failures.append(f"{name}: _ext extension missing")
         continue
     # Extension modules must load under their compiled name (PyInit__ext);
-    # CPython keys the extension cache by (name, path), so loading three
-    # different .so files as "_ext" is fine.
+    # CPython keys the extension cache by (name, path), so loading each
+    # kernel's .so file as "_ext" is fine.
     spec = importlib.util.spec_from_file_location("_ext", so)
     ext = importlib.util.module_from_spec(spec)
     try:
@@ -372,10 +368,6 @@ _build_custom_kernels() {
         fi
         "$PYTHON_BIN" setup.py build_ext --inplace --force --with-custom-kernel
     ) || die "custom kernel build failed; see output above."
-    [ -f "$REPO_ROOT/omlx/custom_kernels/glm_moe_dsa/omlx_glm_kernels.metallib" ] \
-        || die "custom kernel build finished but GLM metallib is missing."
-    [ -f "$REPO_ROOT/omlx/custom_kernels/minimax_m3/omlx_minimax_m3_kernels.metallib" ] \
-        || die "custom kernel build finished but MiniMax M3 metallib is missing."
     [ -f "$REPO_ROOT/omlx/custom_kernels/qwen35_prefill/omlx_qwen35_prefill_kernels.metallib" ] \
         || die "custom kernel build finished but Qwen3.5 prefill metallib is missing."
     # The NAX (M5 tensor unit) metallib is SDK-gated in cmake, not

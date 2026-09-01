@@ -35,80 +35,34 @@ VLM_MODEL_TYPES = {
     "qwen3_vl",
     "qwen3_vl_moe",
     "qwen3_5_moe",
-    "gemma3",
-    "gemma4",
-    "gemma4_unified",
-    "diffusion_gemma",
-    "llava",
-    "llava_next",
-    "llava-qwen2",
-    "llava_qwen2",  # underscore form — matches FastVLM checkpoints on disk
-    "mllama",
-    "idefics3",
-    "internvl_chat",
-    "phi3_v",
-    "paligemma",
-    "mistral3",
-    "pixtral",
-    "molmo",
-    "molmo2",
-    "bunny_llama",
-    "multi_modality",
-    "florence2",
-    "deepseekocr",
-    "deepseekocr_2",
-    "unlimited_ocr",
-    "dots_ocr",
-    "glm_ocr",
-    "minimax_m3_vl",
-    "minicpmv",
-    "phi4_siglip",
-    "phi4mm",
-    "youtu_vl",
-    "inkling",
-    "inkling_mm_model",  # config model_type of Inkling Small checkpoints
-    "muse_glimmer",
-    "glm5_next",
 }
 
-# Text-only model families that are implemented in mlx-vlm rather than
-# mlx-lm. They still use the VLM engine because that path loads mlx-vlm
-# models and adapts their language model to oMLX's scheduler.
-VLM_NATIVE_TEXT_MODEL_TYPES = {
-    "cohere2_moe",
-    "glm5_next",
-    "minimax_m3",
-}
+# Text-only checkpoints served through the VLM engine because that path
+# loads mlx-vlm models and adapts their language model to oMLX's scheduler.
+# (All former members were non-qwen families removed from this build; the
+# dispatch hooks stay for upstream parity.)
+VLM_NATIVE_TEXT_MODEL_TYPES: set[str] = set()
 
 # Multimodal checkpoints whose currently vendored mlx-lm implementation only
 # exposes the text backbone. Route them directly to BatchedEngine instead of
 # deliberately failing an mlx-vlm load and relying on the engine-pool fallback.
-# Remove a family once mlx-vlm provides its multimodal implementation.
-MLX_LM_TEXT_ONLY_MODEL_TYPES = {
-    "mimo_v2",
-}
+MLX_LM_TEXT_ONLY_MODEL_TYPES: set[str] = set()
 
-# Speculative-decoding "helper" checkpoints (dFlash / MTP / assistant drafters)
+# Speculative-decoding "helper" checkpoints (MTP / assistant drafters)
 # are never meant to be served as standalone chat models. Some declare a
-# distinctive top-level model_type — an ``*_assistant`` (e.g. gemma4_assistant)
-# or ``*_mtp`` (e.g. qwen3_5_mtp) marker — but DFlash draft checkpoints declare
-# a plain model_type (e.g. ``qwen3``) and are only distinguishable by their
-# architecture name (``DFlashDraftModel``) or a drafter-only config block
-# (``dflash_config``). Keep these in sync with the drafter resolution in
-# engine_pool.py (~1498) and the dflash gate in engine/dflash.py when new
-# drafter families are added.
+# distinctive top-level model_type — an ``*_assistant`` or ``*_mtp``
+# (e.g. qwen3_5_mtp) marker. Keep these in sync with the drafter resolution
+# in engine_pool.py when new drafter families are added.
 HELPER_CONFIG_MODEL_TYPE_SUFFIXES = ("_assistant", "_mtp")
 _HELPER_ARCH_TOKENS = ("draft", "assistant", "mtp")
-_HELPER_CONFIG_KEYS = ("dflash_config",)
+_HELPER_CONFIG_KEYS: tuple[str, ...] = ()
 
 
 def is_helper_config_model_type(config_model_type: str | None) -> bool:
     """True when ``config_model_type`` marks a speculative-decoding drafter.
 
     These are the raw top-level ``model_type`` values from a checkpoint's
-    config.json (e.g. ``gemma4_assistant``, ``qwen3_5_mtp``). Note this misses
-    DFlash drafts, whose model_type is a plain ``qwen3`` — use
-    :func:`is_helper_model_config` when the full config dict is available.
+    config.json (e.g. ``qwen3_5_mtp``).
     """
     if not isinstance(config_model_type, str) or not config_model_type:
         return False
@@ -119,11 +73,9 @@ def is_helper_config_model_type(config_model_type: str | None) -> bool:
 def is_helper_model_config(config: dict) -> bool:
     """True when a parsed config.json marks a speculative-decoding drafter.
 
-    Catches three intrinsic signals, any of which is definitive:
-    an ``*_assistant`` / ``*_mtp`` model_type, a drafter architecture name
-    (e.g. ``DFlashDraftModel``), or a drafter-only config block
-    (e.g. ``dflash_config``). These are helper checkpoints backing
-    dFlash / MTP / assistant speculative decoding, not chat models.
+    Catches the ``*_assistant`` / ``*_mtp`` model_type suffix or a drafter-only
+    config block. These are helper checkpoints backing MTP / assistant
+    speculative decoding, not chat models.
     """
     if not isinstance(config, dict):
         return False
@@ -145,26 +97,9 @@ def is_helper_model_config(config: dict) -> bool:
 
 # Known VLM architectures
 VLM_ARCHITECTURES = {
-    "LlavaForConditionalGeneration",
-    "LlavaNextForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
-    "MllamaForConditionalGeneration",
-    "Gemma3ForConditionalGeneration",
-    "Gemma4ForConditionalGeneration",
-    "InternVLChatModel",
-    "Idefics3ForConditionalGeneration",
-    "PaliGemmaForConditionalGeneration",
-    "Phi3VForCausalLM",
-    "Pixtral",
-    "MolmoForCausalLM",
-    "Molmo2ForConditionalGeneration",
-    "LlavaQwen2ForCausalLM",  # apple/FastVLM (all sizes)
-    "Florence2ForConditionalGeneration",
-    "UnlimitedOCRForCausalLM",  # baidu/Unlimited-OCR
-    "InklingForConditionalGeneration",  # thinkingmachines/Inkling-Small
-    "MuseGlimmerForConditionalGeneration",  # meta-models/Muse-Glimmer-30B
-    "Glm5NextForConditionalGeneration",  # zai-org/GLM-5.3-Flash
+    "Qwen3VLForConditionalGeneration",
 }
 
 # Known embedding model types from mlx-embeddings
@@ -182,8 +117,6 @@ EMBEDDING_MODEL_TYPES = {
 # These require architecture-based disambiguation via EMBEDDING_ARCHITECTURES.
 AMBIGUOUS_EMBEDDING_MODEL_TYPES = {
     "qwen3",
-    "gemma3-text",
-    "gemma3_text",
     "lfm2",
 }
 
@@ -377,7 +310,7 @@ class DiscoveredModel:
     engine_type: EngineType  # "batched", "vlm", "embedding", or "reranker"
     estimated_size: int  # Estimated memory usage in bytes
     text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
-    config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
+    config_model_type: str = ""  # Raw model_type from config.json
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
     model_context_length: int | None = None  # Declared context length from config.json (None if unknown)
@@ -457,7 +390,7 @@ def _has_sentence_transformers_embedding_pipeline(model_path: Path) -> bool:
     Detect sentence-transformers style embedding exports via modules.json.
 
     This allows oMLX to recognize embedding exports whose base transformer
-    architecture is ambiguous (for example gemma3_text) but which include
+    architecture is ambiguous but which include
     sentence-transformers pooling/normalization modules.
     """
     modules_path = model_path / "modules.json"
@@ -555,10 +488,8 @@ def _has_vision_subconfig(config: dict) -> bool:
 
     Three keys cover the conventions in the wild:
 
-    - ``vision_config`` — most VLMs (Qwen2-VL, Gemma3, LLaVA-Next, ...).
-    - ``vit_config`` — Molmo / Molmo2 family.
-    - ``mm_vision_tower`` — older LLaVA family including FastVLM's
-      ``llava_qwen2``.
+    - ``vision_config`` — most VLMs (Qwen2-VL / Qwen3-VL, ...).
+    - ``mm_vision_tower`` — legacy LLaVA-family checkpoints.
 
     All three are non-empty checks: text-only quants of VLM families can
     leave an empty ``vision_config: {}`` stub behind after stripping the
@@ -652,7 +583,7 @@ def detect_model_type(model_path: Path) -> ModelType:
         return "embedding"
 
     # Check architectures field for embedding (before model_type to avoid
-    # false positives from ambiguous model types like qwen3, gemma3-text)
+    # false positives from ambiguous model types like qwen3)
     for arch in architectures:
         if arch in EMBEDDING_ARCHITECTURES:
             return "embedding"
@@ -693,7 +624,7 @@ def detect_model_type(model_path: Path) -> ModelType:
         return "vlm"
 
     # Check for VLM: architectures field
-    # Some text-only quants (e.g., unsloth/gemma-4-31b-it-MLX-8bit) keep the VLM
+    # Some text-only quants keep the VLM
     # architecture name but strip vision_config and vision weights.
     # For model families known to have text-only variants, require evidence
     # of a vision sub-config — see :func:`_has_vision_subconfig` for the
@@ -712,15 +643,8 @@ def detect_model_type(model_path: Path) -> ModelType:
 
     # Check for VLM: model_type field (only if vision capabilities are present)
     # Some model families (e.g., qwen3_5_moe) have both VLM and text-only variants.
-    # Text-only quants won't carry a vision sub-config. gemma4_unified and
-    # diffusion_gemma are exceptions: they are served by mlx-vlm regardless of
-    # vision_config presence in config.json.
+    # Text-only quants won't carry a vision sub-config.
     if normalized_type in VLM_MODEL_TYPES:
-        if normalized_type in {"gemma4_unified", "diffusion_gemma"}:
-            logger.info(
-                f"{model_type} detected as VLM (mlx-vlm native model)"
-            )
-            return "vlm"
         if _has_vision_subconfig(config):
             return "vlm"
         logger.info(
@@ -822,9 +746,6 @@ def detect_thinking_default(model_path: Path) -> bool | None:
             model_config = json.load(config_file)
     except (OSError, json.JSONDecodeError):
         model_config = {}
-    if model_config.get("model_type") == "laguna":
-        return True
-
     # Heuristic: if the template only disables thinking when explicitly
     # ``enable_thinking is false``, then thinking is ON by default.
     # If the template requires ``enable_thinking`` to be truthy or uses
@@ -1381,11 +1302,10 @@ def _safetensors_has_mlx_metadata(path: Path) -> bool:
 
 _MLX_NAME_RE = re.compile(r"(^|[-_/])mlx($|[-_/])", re.IGNORECASE)
 
-# Speculative-decoding helper checkpoints (e.g. z-lab/Qwen3.6-27B-DFlash) are
-# MLX-loadable drafts even though their safetensors are saved in PyTorch ("pt")
-# format and the repo name carries no "mlx" token, so the HF-cache MLX
-# heuristic must recognise them explicitly or they vanish from the draft-model
-# picker (#1643). Detection delegates to is_helper_model_config so the drafter
+# Speculative-decoding helper checkpoints are MLX-loadable drafts whose
+# repo name may carry no "mlx" token, so the HF-cache MLX heuristic must
+# recognise them explicitly or they vanish from the draft-model picker
+# (#1643). Detection delegates to is_helper_model_config so the drafter
 # markers stay in sync with helper flagging and engine_pool's drafter
 # resolution.
 def _is_helper_checkpoint(model_path: Path) -> bool:

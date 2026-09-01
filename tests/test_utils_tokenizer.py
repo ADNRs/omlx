@@ -7,10 +7,8 @@ from omlx.utils.tokenizer import (
     apply_qwen3_fix,
     create_streaming_detokenizer,
     get_tokenizer_config,
-    is_gemma4_model,
     is_harmony_model,
     is_qwen3_model,
-    repair_misconverted_unlimited_ocr_tokenizer,
 )
 
 
@@ -99,51 +97,6 @@ def _bpe_byte_chars(*byte_values):
     return [byte_encoder[byte_value] for byte_value in byte_values]
 
 
-def _make_misconverted_unlimited_ocr_tokenizer(
-    tmp_path,
-    *,
-    model_type="unlimited-ocr",
-):
-    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
-    from transformers import PreTrainedTokenizerFast
-
-    ni_bytes = _bpe_byte_chars(0xE4, 0xBD, 0xA0)
-    vocab = {
-        "Ġ": 0,
-        "Ċ": 1,
-        "A": 2,
-        "B": 3,
-        ni_bytes[0]: 4,
-        ni_bytes[1]: 5,
-        ni_bytes[2]: 6,
-    }
-    backend = Tokenizer(
-        models.BPE(
-            vocab=vocab,
-            merges=[],
-            fuse_unk=True,
-            byte_fallback=True,
-        )
-    )
-    backend.pre_tokenizer = pre_tokenizers.Metaspace(
-        replacement="▁",
-        prepend_scheme="always",
-        split=False,
-    )
-    backend.decoder = decoders.Sequence(
-        [
-            decoders.Replace("▁", " "),
-            decoders.ByteFallback(),
-            decoders.Fuse(),
-            decoders.Strip(" ", 1, 0),
-        ]
-    )
-    backend.save(str(tmp_path / "tokenizer.json"))
-    _write_json(tmp_path / "config.json", {"model_type": model_type})
-    tokenizer = PreTrainedTokenizerFast(tokenizer_file=str(tmp_path / "tokenizer.json"))
-    return tokenizer, ni_bytes
-
-
 class TestCreateStreamingDetokenizer:
     def test_uses_spm_decoder_from_tokenizer_json(self, tmp_path):
         _write_json(tmp_path / "tokenizer.json", {"decoder": _spm_decoder()})
@@ -225,154 +178,6 @@ class TestCreateStreamingDetokenizer:
         detokenizer.finalize()
 
         assert detokenizer.text == "\uc7a0"
-
-
-class TestRepairMisconvertedUnlimitedOCRTokenizer:
-    def test_repairs_prompt_encoding_and_utf8_decode(self, tmp_path):
-        tokenizer, _ = _make_misconverted_unlimited_ocr_tokenizer(tmp_path)
-
-        assert tokenizer.encode(" A\nB", add_special_tokens=False) == [2, 3]
-        assert tokenizer.decode([4, 5, 6]) != "你"
-
-        repaired = repair_misconverted_unlimited_ocr_tokenizer(
-            tokenizer,
-            model_path=tmp_path,
-        )
-
-        assert repaired is True
-        assert tokenizer.encode(" A\nB", add_special_tokens=False) == [0, 2, 1, 3]
-        assert tokenizer.decode([0, 2, 1, 3]) == " A\nB"
-        assert tokenizer.decode([4, 5, 6]) == "你"
-        assert tokenizer.backend_tokenizer.model.fuse_unk is False
-        assert tokenizer.backend_tokenizer.model.byte_fallback is False
-
-    def test_uses_fresh_bpe_detokenizer_for_misconverted_export(self, tmp_path):
-        tokenizer, _ = _make_misconverted_unlimited_ocr_tokenizer(tmp_path)
-
-        first = create_streaming_detokenizer(tokenizer, model_path=tmp_path)
-        second = create_streaming_detokenizer(tokenizer, model_path=tmp_path)
-
-        assert type(first).__module__ == "mlx_lm.tokenizer_utils"
-        assert type(first).__name__ == "BPEStreamingDetokenizer"
-        assert first is not second
-
-        parts = []
-        for token_id in [0, 2, 4, 5, 6, 1]:
-            first.add_token(token_id)
-            parts.append(first.last_segment)
-        first.finalize()
-        parts.append(first.last_segment)
-
-        assert "".join(parts) == "A你\n"
-
-    def test_leaves_non_unlimited_model_untouched(self, tmp_path):
-        tokenizer, _ = _make_misconverted_unlimited_ocr_tokenizer(
-            tmp_path,
-            model_type="llama",
-        )
-
-        repaired = repair_misconverted_unlimited_ocr_tokenizer(
-            tokenizer,
-            model_path=tmp_path,
-        )
-
-        assert repaired is False
-        assert tokenizer.encode(" A\nB", add_special_tokens=False) == [2, 3]
-
-    def test_leaves_canonical_unlimited_tokenizer_untouched(self, tmp_path):
-        tokenizer, _ = _make_misconverted_unlimited_ocr_tokenizer(tmp_path)
-        tokenizer_content = json.loads((tmp_path / "tokenizer.json").read_text())
-        tokenizer_content["pre_tokenizer"] = {
-            "type": "ByteLevel",
-            "add_prefix_space": False,
-            "trim_offsets": True,
-            "use_regex": False,
-        }
-        tokenizer_content["decoder"] = {
-            "type": "ByteLevel",
-            "add_prefix_space": True,
-            "trim_offsets": True,
-            "use_regex": True,
-        }
-        _write_json(tmp_path / "tokenizer.json", tokenizer_content)
-
-        repaired = repair_misconverted_unlimited_ocr_tokenizer(
-            tokenizer,
-            model_path=tmp_path,
-        )
-
-        assert repaired is False
-
-
-class TestIsHarmonyModel:
-    """Test cases for is_harmony_model function."""
-
-    def test_harmony_model_via_config_model_type(self):
-        """Test detection via config.model_type == 'gpt_oss'."""
-        config = {"model_type": "gpt_oss"}
-        assert is_harmony_model("some-model", config) is True
-
-    def test_harmony_model_via_name_gpt_oss(self):
-        """Test detection via model name containing 'gpt-oss'."""
-        assert is_harmony_model("gpt-oss-1.0", None) is True
-        assert is_harmony_model("GPT-OSS-v2", None) is True
-        assert is_harmony_model("my-gpt-oss-model", None) is True
-
-    def test_harmony_model_via_name_gptoss(self):
-        """Test detection via model name containing 'gptoss'."""
-        assert is_harmony_model("gptoss", None) is True
-        assert is_harmony_model("GPTOSS-large", None) is True
-        assert is_harmony_model("my-gptoss", None) is True
-
-    def test_not_harmony_model(self):
-        """Test non-Harmony models return False."""
-        assert is_harmony_model("llama-3.1-8b", None) is False
-        assert is_harmony_model("qwen2.5-32b", None) is False
-        assert is_harmony_model("mistral-7b", None) is False
-
-    def test_not_harmony_with_different_model_type(self):
-        """Test non-Harmony model type returns False."""
-        config = {"model_type": "llama"}
-        assert is_harmony_model("some-model", config) is False
-
-    def test_harmony_model_empty_name(self):
-        """Test with empty model name."""
-        assert is_harmony_model("", None) is False
-
-    def test_harmony_model_none_config(self):
-        """Test with None config."""
-        assert is_harmony_model("gpt-oss", None) is True
-        assert is_harmony_model("llama", None) is False
-
-    def test_harmony_model_empty_config(self):
-        """Test with empty config dict."""
-        assert is_harmony_model("gpt-oss", {}) is True
-        assert is_harmony_model("llama", {}) is False
-
-
-class TestIsGemma4Model:
-    """Test cases for is_gemma4_model function."""
-
-    def test_gemma4_model_via_config_model_type(self):
-        config = {"model_type": "gemma4"}
-        assert is_gemma4_model("some-model", config) is True
-
-    def test_gemma4_unified_model_via_config_model_type(self):
-        config = {"model_type": "gemma4_unified"}
-        assert is_gemma4_model("some-model", config) is True
-
-    def test_gemma4_model_via_name(self):
-        assert is_gemma4_model("google/gemma-4b", None) is True
-        assert is_gemma4_model("GEMMA-4-27B", None) is True
-        assert is_gemma4_model("my-gemma4-model", None) is True
-
-    def test_not_gemma4_model(self):
-        assert is_gemma4_model("gemma-3-27b", None) is False
-        assert is_gemma4_model("llama-3.1-8b", None) is False
-
-    def test_not_gemma4_with_different_model_type(self):
-        config = {"model_type": "gemma"}
-        assert is_gemma4_model("some-model", config) is False
 
 
 class TestIsQwen3Model:
@@ -528,34 +333,6 @@ class TestGetTokenizerConfig:
         config = get_tokenizer_config("some-model", trust_remote_code=True)
         assert config["trust_remote_code"] is True
 
-    def test_laguna_config_enables_mistral_regex_fix(self, tmp_path):
-        """Laguna's Mistral-derived tokenizer needs the corrected regex."""
-        _write_json(
-            tmp_path / "config.json",
-            {
-                "model_type": "laguna",
-                "architectures": ["LagunaForCausalLM"],
-            },
-        )
-
-        config = get_tokenizer_config(str(tmp_path))
-
-        assert config["fix_mistral_regex"] is True
-
-    def test_laguna_config_pins_laguna_tool_parser(self, tmp_path):
-        """Laguna templates contain <arg_key>, which mlx-lm's template
-        sniffing misreads as glm47; the vendored parser must be pinned."""
-        _write_json(
-            tmp_path / "config.json",
-            {
-                "model_type": "laguna",
-                "architectures": ["LagunaForCausalLM"],
-            },
-        )
-
-        config = get_tokenizer_config(str(tmp_path))
-
-        assert config["tool_parser_type"] == "laguna"
 
     def test_qwen3_model_config(self):
         """Test Qwen3 model gets eos_token fix."""

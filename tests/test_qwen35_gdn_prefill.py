@@ -167,6 +167,27 @@ def test_blocked_seq_default_block_size_depends_on_input_dtype(monkeypatch):
     assert _normalize_block_t(32, mx.float32) == 32
 
 
+def test_normalize_segs_defaults_and_fallback(monkeypatch):
+    from omlx.custom_kernels.qwen35_prefill.gdn import _normalize_segs
+
+    monkeypatch.delenv("OMLX_GDN_SEGS", raising=False)
+    # 128/128 layout: wide-fragment mapping (DB=64 divides Dv)
+    assert _normalize_segs(None, 128, 128) == 4
+    # Dv=32 cannot host the DB=64 block -> legacy 8-thread mapping
+    assert _normalize_segs(None, 128, 32) == 8
+    # Dk=64: SEG=16 fragments fit, DB=64 divides Dv -> wide mapping still wins
+    assert _normalize_segs(None, 64, 128) == 4
+
+    monkeypatch.setenv("OMLX_GDN_SEGS", "8")
+    assert _normalize_segs(None, 128, 128) == 8
+    assert _normalize_segs("4", 128, 128) == 4
+
+    with pytest.raises(ValueError):
+        _normalize_segs("2", 128, 32)  # DB=128 does not divide Dv=32, no fallback
+    with pytest.raises(ValueError):
+        _normalize_segs("3", 128, 128)  # not a power-of-two reduction tree
+
+
 @pytest.mark.skipif(not mx.metal.is_available(), reason="Metal is required")
 def test_blocked_seq_matches_stock_kernel_small():
     from mlx_lm.models.gated_delta import gated_delta_kernel
@@ -191,6 +212,45 @@ def test_blocked_seq_matches_stock_kernel_small():
     s_rel = (
         mx.max(mx.abs(s_fast - s_ref)) / (mx.max(mx.abs(s_ref)) + 1e-9)
     ).item()
+    assert y_err < 2e-2
+    assert s_rel < 1e-5
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Metal is required")
+def test_blocked_seq_segs4_matches_segs8_mapping():
+    """The default wide-fragment mapping must agree with the legacy mapping."""
+    from omlx.custom_kernels.qwen35_prefill import gated_delta_blocked_seq
+    from omlx.custom_kernels.qwen35_prefill.gdn import _get_kernel_s
+
+    B, T, Hk, Hv, Dk, Dv = 1, 128, 16, 48, 128, 128
+    keys = [mx.random.key(i) for i in range(6)]
+    q = (mx.random.normal((B, T, Hk, Dk), key=keys[0]) * Dk**-1.0).astype(mx.bfloat16)
+    k = (mx.random.normal((B, T, Hk, Dk), key=keys[1]) * Dk**-0.5).astype(mx.bfloat16)
+    v = mx.random.normal((B, T, Hv, Dv), key=keys[2]).astype(mx.bfloat16)
+    g = mx.exp(-mx.random.uniform(0.01, 3.0, (B, T, Hv), key=keys[3])).astype(mx.float32)
+    beta = mx.sigmoid(mx.random.normal((B, T, Hv), key=keys[4])).astype(mx.float32)
+    state = (mx.random.normal((B, Hv, Dv, Dk), key=keys[5]) * 0.1).astype(mx.float32)
+    mx.eval(q, k, v, g, beta, state)
+
+    y4, s4 = gated_delta_blocked_seq(q, k, v, g, beta, state)
+    monkey_segs = 8
+    ks8 = _get_kernel_s(32, mx.bfloat16, monkey_segs, Dk // monkey_segs)
+    y8, s8 = ks8(
+        inputs=[q, k, v, g, beta, state, T],
+        template=[
+            ("InT", mx.bfloat16), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
+            ("DB", 256 // monkey_segs), ("SEGS", monkey_segs),
+            ("SEG", Dk // monkey_segs),
+        ],
+        grid=(256 * (Dv // (256 // monkey_segs)), Hv, B),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(B, T, Hv, Dv), state.shape],
+        output_dtypes=[mx.bfloat16, mx.float32],
+    )
+    mx.eval(y4, s4, y8, s8)
+
+    y_err = mx.max(mx.abs(y4.astype(mx.float32) - y8.astype(mx.float32))).item()
+    s_rel = (mx.max(mx.abs(s4 - s8)) / (mx.max(mx.abs(s8)) + 1e-9)).item()
     assert y_err < 2e-2
     assert s_rel < 1e-5
 

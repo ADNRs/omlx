@@ -11,18 +11,9 @@ from typing import Any, List
 from ..exceptions import InvalidRequestError
 from .openai_models import Message
 
-# Model families whose chat templates consume message.reasoning_content directly.
-_NATIVE_REASONING_MODEL_TYPES = {
-    "minimax_m3",
-    "minimax_m3_vl",
-    # Inkling's chat template renders history reasoning_content back into
-    # <|content_thinking|> blocks.
-    "inkling",
-    "inkling_mm_model",
-    # Muse Glimmer's chat template renders history reasoning_content into
-    # <|start|>assistant to=self<|message|> blocks.
-    "muse_glimmer",
-}
+# Model families whose chat templates consume message.reasoning_content
+# directly. All current families removed; kept as a seam for future ones.
+_NATIVE_REASONING_MODEL_TYPES: set[str] = set()
 
 
 def uses_native_reasoning_content(
@@ -41,8 +32,7 @@ def uses_native_reasoning_content(
     if engine_model_type in _NATIVE_REASONING_MODEL_TYPES:
         return True
 
-    lowered = (model_name or "").lower()
-    return "minimax" in lowered and "m3" in lowered
+    return False
 
 
 def merge_reasoning_effort_chat_template_kwargs(
@@ -279,8 +269,8 @@ def _chat_template_supports_tool_role(tokenizer: Any) -> bool:
     """Check whether the tokenizer's chat template renders tool messages natively.
 
     mlx-lm / mlx-vlm only set ``has_tool_calling`` when their marker-based
-    ``_infer_tool_parser`` recognises the chat template (qwen3_coder, json_tools,
-    gemma4, etc.). Templates that branch on ``role == "tool"`` and render
+    ``_infer_tool_parser`` recognises the chat template (qwen3_coder,
+    json_tools, ...). Templates that branch on ``role == "tool"`` and render
     ``tool_calls`` but don't match any known marker (Qwen3 VL variants, custom
     fine-tunes) get flattened to ``role: "user"`` — making the model treat tool
     output as user instructions and breaking multi-turn tool flows (#1290).

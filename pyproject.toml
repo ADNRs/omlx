@@ -117,21 +117,9 @@ dependencies = [
     "openai-harmony",
     # Cohere Command/Cohere2 output parser for reasoning and tool calls
     "cohere_melody>=0.9.0",
-    # mlx-vlm from commit 78b96eb. MiniMax M3 support is vendored under
-    # omlx.patches.mlx_vlm_minimax_m3_compat because upstream removed it.
+    # mlx-vlm from commit 78b96eb.
     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@78b96eb5462141447b9a6b4943ef553891da56dd",
     "Pillow>=9.0.0",
-    # dflash-mlx v0.1.10+omlx.7 (c55324c) - jundot fork of bstnxbt 0.1.10 (9ca0028).
-    # Carries the trimmed-sidecar prefix cache fix (repeat-prompt L1 hits never
-    # fired upstream), the single-host-sync decode cycle (one D2H transfer
-    # per cycle instead of four syncs plus a hard eval), Gemma 4 unified
-    # target exports, and Muse Glimmer target/drafter support (bundled
-    # text-only mlx-lm module + MuseGlimmerAssistantModel dispatch), plus
-    # FP32 Muse Glimmer query scaling parity with mlx-vlm, DFlash 2 runtime
-    # support (sampling params + candidate selector, PR 6), min_p with the
-    # mlx-lm sampler filter order, the sink=0 empty-chunk L2 write fix, and
-    # repetition penalty support across speculative and fallback sampling.
-    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@c55324c86540c369f6818a0f47eae544d405475b",
     "markitdown[pdf,docx,pptx]==0.1.7",
 ]
 
@@ -261,9 +249,6 @@ include = ["omlx*"]
     "bench_corpora/*",
 ]
 "omlx.eval" = ["data/*.jsonl"]
-"omlx.custom_kernels.glm_moe_dsa" = ["*.metallib", "*.dylib", "*.so"]
-"omlx.custom_kernels.decode_fast" = ["*.metallib", "*.dylib", "*.so"]
-"omlx.custom_kernels.minimax_m3" = ["*.metallib", "*.dylib", "*.so"]
 "omlx.custom_kernels.qwen35_prefill" = ["*.metallib", "*.dylib", "*.so"]
 
 [tool.uv]

@@ -58,51 +58,7 @@ logger = logging.getLogger(__name__)
 _MAX_ENTRIES_DEFAULT = 512
 
 
-class PoolingCacheSnapshot:
-    """Serialisation stand-in for the DeepSeek sparse-attention pool cache.
 
-    ``save_prompt_cache`` serialises through ``state`` / ``meta_state`` and
-    reconstructs via ``globals()[name].from_state`` inside
-    ``mlx_lm.models.cache``. A ``PoolingCache`` breaks both directions: its
-    state tuple carries ``None`` slots safetensors cannot hold, and its
-    meta_state is a bare int where the metadata tree must be all strings. The
-    in-process state contract is load-bearing for the paged-cache handlers, so
-    rather than changing the class this stand-in presents the same cache in
-    wire form (arrays-only state, with the slot layout encoded as a flag
-    string), and its ``from_state`` hands back a real ``PoolingCache``, so a
-    restored snapshot is indistinguishable from the cache it was taken from.
-    """
-
-    def __init__(self, inner: Any) -> None:
-        self._inner = inner
-
-    @property
-    def state(self) -> tuple[Any, ...]:
-        import mlx.core as mx
-
-        kept = tuple(a for a in self._inner.state if a is not None)
-        # An all-empty state must still occupy its slot in the flattened file
-        # or every later cache's arrays would shift onto the wrong class. The
-        # placeholder is never consumed: the flags drive consumption.
-        return kept or (mx.zeros((1,)),)
-
-    @property
-    def meta_state(self) -> tuple[str, str]:
-        flags = "".join("0" if a is None else "1" for a in self._inner.state)
-        return (str(int(self._inner.ratio)), flags)
-
-    @classmethod
-    def from_state(cls, state: Any, meta_state: tuple[str, str]) -> Any:
-        from omlx.patches.deepseek_v4.cache_extras import PoolingCache
-
-        ratio, flags = meta_state
-        cache = PoolingCache(int(ratio))
-        arrays = iter(state if isinstance(state, (list, tuple)) else [state])
-        # The existing state setter replays any remainder rows through
-        # accumulate_windows, so the restored cache continues exactly like the
-        # live one it was copied from.
-        cache.state = tuple(next(arrays) if f == "1" else None for f in flags)
-        return cache
 
 
 class EmptyLeafSnapshot:
@@ -130,7 +86,7 @@ class EmptyLeafSnapshot:
             for _key, leaf in tree_flatten(self._inner.state)
             if leaf is not None and leaf.size > 0
         )
-        # Same slot-holding placeholder as PoolingCacheSnapshot: the layout
+        # Same slot-holding placeholder as EmptyLeafSnapshot: the layout
         # below never marks it for consumption.
         return kept or (mx.zeros((1,)),)
 
@@ -260,7 +216,7 @@ def _register_snapshot_classes() -> None:
 
     import mlx_lm.models.cache as cache_module
 
-    for snapshot_class in (PoolingCacheSnapshot, EmptyLeafSnapshot, KVCacheSegment):
+    for snapshot_class in (EmptyLeafSnapshot, KVCacheSegment):
         name = snapshot_class.__name__
         if getattr(cache_module, name, None) is not snapshot_class:
             setattr(cache_module, name, snapshot_class)
@@ -281,16 +237,8 @@ def _wrap_for_save(
 
     from mlx_lm.models.cache import CacheList, KVCache
 
-    try:
-        from omlx.patches.deepseek_v4.cache_extras import PoolingCache
-    except ImportError:
-        pooling_class: Any = None
-    else:
-        pooling_class = PoolingCache
 
     def wrap(entry: Any) -> Any:
-        if pooling_class is not None and isinstance(entry, pooling_class):
-            return PoolingCacheSnapshot(entry)
         if isinstance(entry, CacheList):
             members = [wrap(m) for m in entry.caches]
             if any(m is not o for m, o in zip(members, entry.caches)):

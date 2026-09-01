@@ -46,7 +46,6 @@ from ..api.utils import (
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
 from ..models.vlm import VLMModelAdapter
-from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..utils.image import (
     compute_image_hash,
@@ -64,13 +63,7 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 # OCR model types that require special handling.
-# unlimited-ocr keeps its dashed config model_type (mlx-vlm resolves it to the
-# unlimited_ocr package via MODEL_REMAPPING), so key it in the dashed form to
-# match VLMBatchedEngine.model_type (== vlm_model.config.model_type).
 OCR_MODEL_TYPES = {
-    "deepseekocr",
-    "deepseekocr_2",
-    "unlimited-ocr",
     "dots_ocr",
     "glm_ocr",
 }
@@ -79,11 +72,6 @@ OCR_MODEL_TYPES = {
 # When an OCR model receives a generic user prompt with an image,
 # the prompt is automatically adjusted for markdown output.
 OCR_MODEL_PROMPTS: Dict[str, str] = {
-    "deepseekocr": "Convert the document to markdown.",
-    "deepseekocr_2": "Convert the document to markdown.",
-    # baidu/Unlimited-OCR upstream-documented single-page baseline. Multi-page
-    # / PDF workflows use "Multi page parsing." (pass it explicitly).
-    "unlimited-ocr": "document parsing.",
     "dots_ocr": "Convert this page to clean Markdown while preserving reading order.",
     "glm_ocr": "Text Recognition:",
 }
@@ -101,11 +89,6 @@ OCR_EXTRA_STOP_SEQUENCES: List[str] = [
 
 VLM_LANGUAGE_PROMPT_KWARGS = ("mm_token_type_ids", "token_type_ids")
 
-COHERE2_MOE_MODEL_TYPE = "cohere2_moe"
-QWEN4_EXP_MODEL_TYPE = "qwen4_exp"
-MINIMAX_M3_VL_MODEL_TYPE = "minimax_m3_vl"
-MINIMAX_M3_MODEL_TYPES = {"minimax_m3", MINIMAX_M3_VL_MODEL_TYPE}
-
 DIFFUSION_PREFILL_STEP_SIZE = 2048
 
 # Per-model OCR generation defaults from official configs.
@@ -115,18 +98,6 @@ OCR_MODEL_GENERATION_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "temperature": 0.0,
         "repetition_penalty": 1.1,
         "max_tokens": 4096,
-    },
-    "deepseekocr": {
-        "temperature": 0.0,
-        "max_tokens": 8192,
-    },
-    "deepseekocr_2": {
-        "temperature": 0.0,
-        "max_tokens": 8192,
-    },
-    "unlimited-ocr": {
-        "temperature": 0.0,
-        "max_tokens": 8192,
     },
     "dots_ocr": {
         "temperature": 0.0,
@@ -171,22 +142,6 @@ def _is_missing_chat_template_error(exc: ValueError) -> bool:
     )
 
 
-def _apply_minimax_m3_thinking_mode(
-    model_type: str | None,
-    template_kwargs: dict[str, Any],
-) -> None:
-    """Map oMLX enable_thinking to MiniMax M3's thinking_mode template kwarg."""
-    if model_type not in MINIMAX_M3_MODEL_TYPES:
-        return
-    enable_thinking = template_kwargs.pop("enable_thinking", None)
-    if "thinking_mode" in template_kwargs:
-        return
-
-    if enable_thinking is True:
-        template_kwargs["thinking_mode"] = "enabled"
-    elif enable_thinking is False:
-        template_kwargs["thinking_mode"] = "disabled"
-
 
 def _attach_vlm_tokenizer_runtime(tokenizer: Any, model_path: Path, eos_token_id: Any):
     from mlx_vlm.tokenizer_utils import load_tokenizer
@@ -206,46 +161,6 @@ def _attach_vlm_tokenizer_runtime(tokenizer: Any, model_path: Path, eos_token_id
     tokenizer.stopping_criteria = StoppingCriteria(final_eos_token_ids, tokenizer)
     return tokenizer
 
-
-def _load_cohere2_moe_text_model(
-    model_name: str,
-    *,
-    trust_remote_code: bool = False,
-):
-    """Load Cohere2 MoE through mlx-vlm with a tokenizer-only fallback."""
-    from mlx_vlm.utils import get_model_path, load_model, load_processor
-    from transformers import AutoTokenizer
-
-    model_path = get_model_path(model_name)
-    model = load_model(
-        model_path,
-        lazy=False,
-        strict=True,
-        trust_remote_code=trust_remote_code,
-    )
-
-    eos_token_id = getattr(getattr(model, "config", None), "eos_token_id", None)
-    try:
-        processor = load_processor(
-            model_path,
-            True,
-            eos_token_ids=eos_token_id,
-            trust_remote_code=trust_remote_code,
-        )
-    except Exception as exc:
-        logger.debug(
-            "mlx-vlm processor load failed for Cohere2 MoE %s; "
-            "falling back to AutoTokenizer: %s",
-            model_name,
-            exc,
-        )
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_path,
-            trust_remote_code=trust_remote_code,
-        )
-        processor = _attach_vlm_tokenizer_runtime(tokenizer, model_path, eos_token_id)
-
-    return model, processor
 
 
 _video_processor_patched = False
@@ -408,7 +323,7 @@ def _build_processor_via_pil_image_processor(cls, path, **kwargs):
             "torch+torchvision or upgrade mlx-vlm."
         )
 
-    # Read feature_extractor config if present (needed for audio models like gemma4_unified)
+    # Read feature_extractor config if present (audio models).
     fe_config = {}
     fe_type = None
     for fname in ("processor_config.json", "preprocessor_config.json"):
@@ -483,16 +398,7 @@ def _resolve_pil_image_processor_class(ip_type, mapping_names):
 
 
 # Mapping from feature_extractor_type to (module, class) locations in mlx_vlm
-_FEATURE_EXTRACTOR_MAP = {
-    "Gemma4UnifiedAudioFeatureExtractor": (
-        "mlx_vlm.models.gemma4_unified.processing_gemma4_unified",
-        "Gemma4UnifiedAudioFeatureExtractor",
-    ),
-    "Gemma4AudioFeatureExtractor": (
-        "mlx_vlm.models.gemma4.audio_feature_extractor",
-        "Gemma4AudioFeatureExtractor",
-    ),
-}
+_FEATURE_EXTRACTOR_MAP: dict[str, tuple[str, str]] = {}
 
 
 def _resolve_feature_extractor_class(fe_type: str):
@@ -601,7 +507,7 @@ def _strip_audio_config_if_orphaned(model_dir: Path):
     safetensors shards lack audio_tower / embed_audio weights.
 
     Some quantization tooling (notably oMLX's pre-fix oQ pipeline) writes
-    multimodal Gemma 4 checkpoints without audio weights but leaves
+    multimodal audio checkpoints without audio weights but leaves
     `audio_config` in `config.json`. mlx-vlm then instantiates `AudioEncoder`
     and `model.load_weights(strict=True)` fails with "Missing 752 parameters".
 
@@ -744,105 +650,6 @@ def _is_mlx_format_safetensors_dir(model_dir: Path) -> bool:
 
 
 @contextlib.contextmanager
-def _drop_gemma4_mlx_shared_kv_extras_on_load(model_dir: Path):
-    """Drop Gemma4 shared-KV extra weights for MLX-format VLM checkpoints.
-
-    mlx-vlm skips model sanitizers when safetensors metadata is ``format=mlx``.
-    Gemma4 E2B/E4B MLX checkpoints still ship K/V tensors for shared-KV layers,
-    but the mlx-vlm model tree intentionally omits those modules.  If the
-    extras reach strict ``load_weights``, VLM loading fails and oMLX falls back
-    to text-only LLM.  Scope the fix to Gemma4 MLX-format models whose config
-    declares shared-KV layers; 26B/31B Gemma4 models have zero shared-KV layers
-    and remain no-op.
-    """
-    config_path = model_dir / "config.json"
-    try:
-        config = json.loads(config_path.read_text())
-    except Exception:
-        yield
-        return
-
-    text_config = config.get("text_config")
-    if not isinstance(text_config, dict):
-        yield
-        return
-
-    if config.get("model_type") != "gemma4":
-        yield
-        return
-    if text_config.get("model_type") != "gemma4_text":
-        yield
-        return
-    if not _is_mlx_format_safetensors_dir(model_dir):
-        yield
-        return
-
-    try:
-        num_layers = int(text_config.get("num_hidden_layers") or 0)
-        num_shared = int(text_config.get("num_kv_shared_layers") or 0)
-    except (TypeError, ValueError):
-        yield
-        return
-    if num_layers <= 0 or num_shared <= 0 or num_shared >= num_layers:
-        yield
-        return
-
-    first_shared = num_layers - num_shared
-    drop_modules = {"k_proj", "v_proj", "k_norm", "v_norm"}
-    layer_prefix = "language_model.model.layers."
-
-    def _is_shared_kv_extra(key: str) -> bool:
-        if not key.startswith(layer_prefix):
-            return False
-        parts = key[len(layer_prefix) :].split(".")
-        if len(parts) < 4 or parts[1] != "self_attn":
-            return False
-        try:
-            layer_idx = int(parts[0])
-        except ValueError:
-            return False
-        return first_shared <= layer_idx < num_layers and parts[2] in drop_modules
-
-    import mlx.nn as _nn
-
-    original_load_weights = _nn.Module.load_weights
-    dropped = 0
-
-    def _patched_load_weights(self, weights_items, *args, **kwargs):
-        nonlocal dropped
-        if isinstance(weights_items, str):
-            return original_load_weights(self, weights_items, *args, **kwargs)
-
-        filtered = []
-        local_dropped = 0
-        for item in weights_items:
-            if (
-                isinstance(item, (tuple, list))
-                and len(item) >= 2
-                and isinstance(item[0], str)
-                and _is_shared_kv_extra(item[0])
-            ):
-                local_dropped += 1
-                continue
-            filtered.append(item)
-        dropped += local_dropped
-        return original_load_weights(self, filtered, *args, **kwargs)
-
-    _nn.Module.load_weights = _patched_load_weights
-    try:
-        yield
-    finally:
-        _nn.Module.load_weights = original_load_weights
-        if dropped:
-            logger.info(
-                "Dropped %d Gemma4 shared-KV extra weights for MLX-format "
-                "checkpoint %s",
-                dropped,
-                model_dir.name,
-            )
-
-
-@contextlib.contextmanager
 def _transpose_qwen35_mlx_vision_patch_embed_on_load(model_dir: Path):
     """Fix channels-first Qwen3.5 vision weights in MLX checkpoints.
 
@@ -896,216 +703,6 @@ _NESTED_VIS_PREFIX = "language_model.model.visual."
 _VISION_TOWER_PREFIX = "vision_tower."
 
 
-def _should_pack_minimax_m3_shared_expert(args: Any) -> bool:
-    """Resolve the explicit MiniMax shared-expert layout override."""
-    configured = getattr(args, "pack_shared_expert", None)
-    if configured is not None:
-        return bool(configured)
-    return bool(
-        args.n_shared_experts == 1
-        and args.shared_intermediate_size == args.intermediate_size
-    )
-
-
-def _model_shard_matcher(model_dir: Path):
-    """Return a predicate for safetensors shards directly under *model_dir*."""
-    target_dir = model_dir.resolve()
-
-    def matches(filename: object) -> bool:
-        try:
-            path = Path(filename)
-            return path.suffix == ".safetensors" and path.parent.resolve() == target_dir
-        except (TypeError, OSError, RuntimeError):
-            return False
-
-    return matches
-
-
-@contextlib.contextmanager
-def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
-    """Force mlx-vlm's MiniMax M3 MoE sanitize path for MLX-format checkpoints.
-
-    mlx-vlm's MiniMax M3 loader can pack ``shared_experts`` into the routed
-    ``switch_mlp`` when ``Model.sanitize`` runs. MLX-format checkpoints skip
-    sanitize upstream, while MiniMax checkpoints can carry either packed or
-    explicitly unpacked mixed-bit MoE weights. Hide only the safetensors
-    ``format=mlx`` metadata during this load so the configured sanitize path
-    runs before quantization and load_weights.
-    """
-    if _read_config_model_type(model_dir) != MINIMAX_M3_VL_MODEL_TYPE:
-        yield
-        return
-
-    from ..patches.mlx_vlm_minimax_m3_compat import (
-        apply_mlx_vlm_minimax_m3_compat_patch,
-    )
-
-    apply_mlx_vlm_minimax_m3_compat_patch()
-
-    import safetensors
-    from mlx_vlm.models.minimax_m3_vl import minimax_m3_vl as _minimax_m3_vl
-
-    original_safe_open = safetensors.safe_open
-    original_sanitize_moe_weights = _minimax_m3_vl._sanitize_moe_weights
-    is_target_shard = _model_shard_matcher(model_dir)
-
-    class _SafeOpenMetadataWrapper:
-        def __init__(self, inner):
-            self._inner = inner
-
-        def __enter__(self):
-            self._inner.__enter__()
-            return self
-
-        def __exit__(self, *args):
-            return self._inner.__exit__(*args)
-
-        def __getattr__(self, name):
-            return getattr(self._inner, name)
-
-        def metadata(self):
-            metadata = self._inner.metadata()
-            if isinstance(metadata, dict) and metadata.get("format") == "mlx":
-                metadata = dict(metadata)
-                metadata.pop("format", None)
-            return metadata
-
-    def _patched_safe_open(filename, *args, **kwargs):
-        handle = original_safe_open(filename, *args, **kwargs)
-        if is_target_shard(filename):
-            return _SafeOpenMetadataWrapper(handle)
-        return handle
-
-    def _pack_mlx_unpacked_moe_weights(weights: dict, args: Any) -> int:
-        if not _should_pack_minimax_m3_shared_expert(args):
-            return 0
-
-        packed = 0
-        for layer_idx in range(args.num_hidden_layers):
-            prefix = f"language_model.model.layers.{layer_idx}.block_sparse_moe"
-            for suffix in ("weight", "scales", "biases", "bias"):
-                gate_key = f"{prefix}.switch_mlp.gate_proj.{suffix}"
-                up_key = f"{prefix}.switch_mlp.up_proj.{suffix}"
-                shared_gate_key = f"{prefix}.shared_experts.gate_proj.{suffix}"
-                shared_up_key = f"{prefix}.shared_experts.up_proj.{suffix}"
-                gate_up_key = f"{prefix}.switch_mlp.gate_up_proj.{suffix}"
-
-                if (
-                    gate_up_key not in weights
-                    and gate_key in weights
-                    and up_key in weights
-                    and shared_gate_key in weights
-                    and shared_up_key in weights
-                ):
-                    gate = weights.pop(gate_key)
-                    up = weights.pop(up_key)
-                    shared_gate = weights.pop(shared_gate_key)
-                    shared_up = weights.pop(shared_up_key)
-                    routed_gate_up = mx.concatenate([gate, up], axis=1)
-                    shared_gate_up = mx.expand_dims(
-                        mx.concatenate([shared_gate, shared_up], axis=0), axis=0
-                    )
-                    weights[gate_up_key] = mx.concatenate(
-                        [routed_gate_up, shared_gate_up], axis=0
-                    )
-                    packed += 1
-
-                down_key = f"{prefix}.switch_mlp.down_proj.{suffix}"
-                shared_down_key = f"{prefix}.shared_experts.down_proj.{suffix}"
-                packed_down_key = f"{prefix}.switch_mlp.down_proj.{suffix}"
-                if down_key in weights and shared_down_key in weights:
-                    down = weights.pop(down_key)
-                    shared_down = mx.expand_dims(weights.pop(shared_down_key), axis=0)
-                    weights[packed_down_key] = mx.concatenate(
-                        [down, shared_down], axis=0
-                    )
-                    packed += 1
-        return packed
-
-    def _patched_sanitize_moe_weights(weights: dict, args: Any) -> None:
-        original_sanitize_moe_weights(weights, args)
-        packed = _pack_mlx_unpacked_moe_weights(weights, args)
-        if packed:
-            logger.info(
-                "MiniMax M3 MLX-format MoE sanitize packed %d tensor groups",
-                packed,
-            )
-
-    safetensors.safe_open = _patched_safe_open
-    _minimax_m3_vl._sanitize_moe_weights = _patched_sanitize_moe_weights
-    try:
-        logger.info(
-            "MiniMax M3 MLX-format MoE sanitize patch active for %s",
-            model_dir.name,
-        )
-        yield
-    finally:
-        safetensors.safe_open = original_safe_open
-        _minimax_m3_vl._sanitize_moe_weights = original_sanitize_moe_weights
-
-
-@contextlib.contextmanager
-def _force_qwen4_exp_sanitize_on_load(model_dir: Path):
-    """Run vendored-model key sanitization before quantization selection.
-
-    Converted MLX checkpoints legitimately declare ``format=mlx``, but the
-    published Qwen4 layout still uses ``model.language_model.*`` and
-    ``model.visual.*`` names.  mlx-vlm normally skips ``Model.sanitize`` for
-    MLX-format files, which makes its quantization predicate inspect the wrong
-    names and leaves every ``scales``/``biases`` tensor unmatched.  Hide only
-    the format marker for this model and this load so sanitization happens at
-    the point expected by the upstream loader: before ``nn.quantize``.
-    """
-    model_type = _read_config_model_type(model_dir)
-    if model_type not in ("qwen4_exp", "glm5_next"):
-        yield
-        return
-
-    import safetensors
-
-    original_safe_open = safetensors.safe_open
-    is_target_shard = _model_shard_matcher(model_dir)
-
-    class _SafeOpenMetadataWrapper:
-        def __init__(self, inner):
-            self._inner = inner
-
-        def __enter__(self):
-            self._inner.__enter__()
-            return self
-
-        def __exit__(self, *args):
-            return self._inner.__exit__(*args)
-
-        def __getattr__(self, name):
-            return getattr(self._inner, name)
-
-        def metadata(self):
-            metadata = self._inner.metadata()
-            if isinstance(metadata, dict) and metadata.get("format") == "mlx":
-                metadata = dict(metadata)
-                metadata.pop("format", None)
-            return metadata
-
-    def _patched_safe_open(filename, *args, **kwargs):
-        handle = original_safe_open(filename, *args, **kwargs)
-        if is_target_shard(filename):
-            return _SafeOpenMetadataWrapper(handle)
-        return handle
-
-    safetensors.safe_open = _patched_safe_open
-    try:
-        logger.info(
-            "%s pre-quantization sanitize active for %s",
-            model_type,
-            model_dir.name,
-        )
-        yield
-    finally:
-        safetensors.safe_open = original_safe_open
-
-
-@contextlib.contextmanager
 def _remap_nested_visual_on_load(model_dir: Path):
     """Remap ``language_model.model.visual.*`` → ``vision_tower.*`` during
     ``load_model`` for MLX-format models where sanitize is skipped.
@@ -1159,14 +756,7 @@ def _remap_nested_visual_on_load(model_dir: Path):
 
 
 # Models that only support a single image per request
-SINGLE_IMAGE_ONLY_MODELS = {
-    "llava_next",
-    "llava-qwen2",
-    "bunny-llama",
-    "paligemma",
-    "multi_modality",
-    "mllama",
-}
+SINGLE_IMAGE_ONLY_MODELS: set[str] = set()
 
 
 def _uses_mrope(vlm_model) -> bool:
@@ -1200,7 +790,7 @@ _QWEN_VISION_MODELS = {
 }
 
 # Grid-based VLMs whose flat vision features can be split with grid_thw.
-_GRID_VISION_MODELS = _QWEN_VISION_MODELS | {"glm5_next"}
+_GRID_VISION_MODELS = set(_QWEN_VISION_MODELS)
 
 
 # Conservative fallback upper bound on image-placeholder tokens per image
@@ -1440,9 +1030,6 @@ class VLMBatchedEngine(BaseEngine):
         self._grammar_compiler_init_attempted = False
         self._vision_cache = None
         self._vision_cache_enabled = True
-        # Holds the loaded gemma4_assistant drafter when vlm_mtp_enabled.
-        # Phase 2A: attached but not yet wired into the decode path.
-        self._vlm_mtp_drafter: Any | None = None
         self._diffusion_family: str | None = None
         self._diffusion_lock = asyncio.Lock()
         self._diffusion_active_requests = 0
@@ -1652,12 +1239,8 @@ class VLMBatchedEngine(BaseEngine):
         def _load_vlm_sync():
             _patch_video_processor_bug()
             _patch_torch_free_image_processor()
-            apply_pixtral_torch_free_patch()
             with (
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
-                _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
-                _force_minimax_m3_moe_sanitize_on_load(Path(self._model_name)),
-                _force_qwen4_exp_sanitize_on_load(Path(self._model_name)),
                 _remap_nested_visual_on_load(Path(self._model_name)),
                 _transpose_qwen35_mlx_vision_patch_embed_on_load(
                     Path(self._model_name)
@@ -1671,20 +1254,12 @@ class VLMBatchedEngine(BaseEngine):
                     model, processor = custom_loaded
                     return model, processor
 
-                model_type = _read_config_model_type(self._model_name)
-                if model_type == COHERE2_MOE_MODEL_TYPE:
-                    return _load_cohere2_moe_text_model(
-                        self._model_name,
-                        trust_remote_code=self._trust_remote_code,
-                    )
                 with _load_optiq_vision_sidecar_on_load(
                     Path(self._model_name)
                 ):
                     load_kwargs = {
                         "trust_remote_code": self._trust_remote_code,
                     }
-                    if model_type == QWEN4_EXP_MODEL_TYPE:
-                        load_kwargs["lazy"] = True
                     loaded = vlm_load(
                         self._model_name,
                         **load_kwargs,
@@ -1696,30 +1271,6 @@ class VLMBatchedEngine(BaseEngine):
             get_mlx_executor(), _load_vlm_sync
         )
 
-        if self.model_type == "unlimited-ocr":
-            from ..utils.tokenizer import (
-                create_streaming_detokenizer,
-                repair_misconverted_unlimited_ocr_tokenizer,
-            )
-
-            tokenizer_obj = getattr(self._processor, "tokenizer", self._processor)
-            if repair_misconverted_unlimited_ocr_tokenizer(
-                tokenizer_obj,
-                model_path=self._model_name,
-            ):
-                # mlx-vlm also keeps a processor-level detokenizer for its own
-                # generation helpers.  Replace that stale SPM instance even
-                # though oMLX's scheduler creates fresh request-local copies.
-                self._processor.detokenizer = create_streaming_detokenizer(
-                    tokenizer_obj,
-                    model_path=self._model_name,
-                )
-                logger.warning(
-                    "Repaired misconverted Unlimited-OCR tokenizer metadata "
-                    "in memory for %s",
-                    self._model_name,
-                )
-
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
         # loader thread so per-engine inference threads can read them (#1304).
         from ..utils.model_loading import materialize_lazy_state
@@ -1728,23 +1279,7 @@ class VLMBatchedEngine(BaseEngine):
             get_mlx_executor(), materialize_lazy_state, self._vlm_model
         )
 
-        # t5 ternary: free unused bias tensors to recover ~420 MB RAM.
-        # The repacked safetensors carries 2-bit biases for format compat;
-        # the t5 symmetric kernel (scale*(q-1)) never reads them.
-        try:
-            from ..patches.bonsai_t5_load import free_t5_biases
-
-            freed = await loop.run_in_executor(
-                get_mlx_executor(), free_t5_biases, self._vlm_model
-            )
-            if freed > 0:
-                logger.info(
-                    "t5 bias tensors freed: %.0f MB recovered", freed / 1e6
-                )
-        except Exception:
-            logger.debug("t5 bias free skipped", exc_info=True)
-
-        # Supported MoE gate+up regroup: concatenate the routed experts'
+        # Qwen3.5/3.6 MoE gate+up regroup: concatenate the routed experts'
         # gate and up projections so decode runs 2 gather_qmm launches per
         # MoE layer instead of 3 (issue #2238). Bit-exact; also swaps the
         # mlx-vlm target-verify helper for a fused-aware version. Runs on
@@ -1848,29 +1383,7 @@ class VLMBatchedEngine(BaseEngine):
 
         await self._engine.engine.start()
 
-        # TurboQuant KV cache
         scheduler = self._engine.engine.scheduler
-        if self._model_settings is not None:
-            tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
-            if tq_enabled and self.model_type == "glm5_next":
-                logger.warning(
-                    "TurboQuant KV cache is not supported for GLM-5.3-Flash's "
-                    "composite latent/indexer cache; using the native cache layout"
-                )
-                tq_enabled = False
-            if tq_enabled:
-                from ..patches.turboquant_attention import (
-                    apply_turboquant_attention_patch,
-                )
-
-                apply_turboquant_attention_patch()
-                tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
-                scheduler._turboquant_kv_bits = tq_bits
-                scheduler._turboquant_skip_last = getattr(
-                    self._model_settings, "turboquant_skip_last", True
-                )
-                scheduler._set_model_info_for_monitor()
-                logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
 
         # head_dim=256 long-context prefill -> O(L) tiled SDPA kernel. See
         # batched.py for rationale. Passthrough-safe; strictly gated route.
@@ -1949,17 +1462,12 @@ class VLMBatchedEngine(BaseEngine):
         ):
             try:
                 from ..patches.qwen35_q4_mlp import (
-                    apply_muse_glimmer_q4_prefill_patch,
                     apply_qwen35_q4_mlp_patch,
                     apply_qwen35_q4_prefill_linear_patch,
                 )
 
                 apply_qwen35_q4_mlp_patch()
                 apply_qwen35_q4_prefill_linear_patch()
-                # Muse Glimmer rides the same native qmm tile (MLP plus the
-                # q/gate/o attention projections); no-op unless the muse
-                # compat patch installed the vendored module.
-                apply_muse_glimmer_q4_prefill_patch()
             except Exception:
                 logger.debug("Qwen q4 MLP prefill patch not applied", exc_info=True)
 
@@ -1973,140 +1481,6 @@ class VLMBatchedEngine(BaseEngine):
             apply_qwen35_moe_router_patch()
         except Exception:
             logger.debug("Qwen MoE router patch not applied", exc_info=True)
-
-        if getattr(self._model_settings, "qwen35_ane_prefill_enabled", False):
-            try:
-                from ..patches.qwen35_ane_prefill import (
-                    configure_qwen35_ane_prefill_scheduler,
-                    enable_qwen35_ane_prefill,
-                )
-
-                requested_ane_sequence_length = int(
-                    getattr(
-                        self._model_settings,
-                        "qwen35_ane_prefill_sequence_length",
-                        2048,
-                    )
-                )
-
-                def _enable_ane_prefill():
-                    return enable_qwen35_ane_prefill(
-                        self._vlm_model,
-                        sequence_length=requested_ane_sequence_length,
-                        tail_padding_min_tokens=int(
-                            getattr(
-                                self._model_settings,
-                                "qwen35_ane_prefill_tail_padding_min_tokens",
-                                0,
-                            )
-                            or 0
-                        ),
-                        fraction=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_fraction",
-                            0.53,
-                        ),
-                        max_layers=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_max_layers",
-                            64,
-                        ),
-                        gdn=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_gdn",
-                            True,
-                        ),
-                        gdn_fraction=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_gdn_fraction",
-                            0.50,
-                        ),
-                        gdn_max_layers=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_gdn_max_layers",
-                            48,
-                        ),
-                        dual_ane=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_dual_ane",
-                            True,
-                        ),
-                        ane_down_fraction=(
-                            getattr(
-                                self._model_settings,
-                                "qwen35_ane_prefill_fraction",
-                                0.53,
-                            )
-                            if getattr(
-                                self._model_settings,
-                                "qwen35_ane_prefill_fused_down",
-                                False,
-                            )
-                            else 0.0
-                        ),
-                        fused_down=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_fused_down",
-                            False,
-                        ),
-                        cpu_fraction=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_fraction",
-                            0.135,
-                        )
-                        if getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_enabled",
-                            False,
-                        )
-                        else 0.0,
-                        cpu_down_fraction=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_down_fraction",
-                            0.0,
-                        )
-                        if getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_enabled",
-                            False,
-                        )
-                        else 0.0,
-                        cpu_gdn_fraction=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_gdn_fraction",
-                            0.0,
-                        )
-                        if getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_enabled",
-                            False,
-                        )
-                        else 0.0,
-                        cpu_threads=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_threads",
-                            8,
-                        ),
-                        cpu_shared_resource=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_shared_resource",
-                            True,
-                        ),
-                    )
-
-                ane_count = await loop.run_in_executor(
-                    get_mlx_executor(),
-                    _enable_ane_prefill,
-                )
-                if ane_count or getattr(
-                    self._vlm_model, "_omlx_ane_gdn_prefill_count", 0
-                ):
-                    configure_qwen35_ane_prefill_scheduler(
-                        scheduler,
-                        requested_ane_sequence_length,
-                    )
-            except Exception:
-                logger.warning("Qwen ANE prefill not enabled", exc_info=True)
 
         # Qwen3.5/3.6 sparse MoE prefill -> native weighted-sum after sorted
         # SwitchGLU. Decode and target-verify keep the original path.
@@ -2139,109 +1513,11 @@ class VLMBatchedEngine(BaseEngine):
                 logger.debug("qwen3_5 ragged decode patch not applied", exc_info=True)
         scheduler.refresh_ssd_layer_signature()
 
-        # SpecPrefill: load draft model and pass to scheduler
-        if self._model_settings is not None:
-            specprefill_draft = getattr(
-                self._model_settings, "specprefill_draft_model", None
-            )
-            specprefill_enabled = getattr(
-                self._model_settings, "specprefill_enabled", False
-            )
-            if specprefill_enabled and specprefill_draft:
-                try:
-                    from ..utils.model_loading import (
-                        lm_load_compat as mlx_lm_load,
-                        maybe_load_custom_quantization,
-                    )
-                    from ..utils.tokenizer import get_tokenizer_config
-
-                    def _load_draft():
-                        from ..patches.mlx_lm_mtp import set_mtp_active
-                        from ..utils.model_loading import materialize_lazy_state
-
-                        was_mtp = False
-                        try:
-                            from ..patches.mlx_lm_mtp import is_mtp_active
-
-                            was_mtp = is_mtp_active()
-                        except Exception:
-                            pass
-                        set_mtp_active(False)
-                        try:
-                            custom_loaded = maybe_load_custom_quantization(
-                                specprefill_draft,
-                                is_vlm=False,
-                            )
-                            if custom_loaded is not None:
-                                draft_model, _ = custom_loaded
-                            else:
-                                draft_tokenizer_config = get_tokenizer_config(
-                                    specprefill_draft,
-                                    trust_remote_code=self._trust_remote_code,
-                                )
-                                draft_model, _ = mlx_lm_load(
-                                    specprefill_draft,
-                                    tokenizer_config=draft_tokenizer_config,
-                                    trust_remote_code=self._trust_remote_code,
-                                )
-                            # Materialize frozen buffers (RoPE freqs, etc.)
-                            # on the loader thread. mlx_lm.load only does
-                            # mx.eval(model.parameters()) and leaves siblings
-                            # lazy bound to this thread's stream. Without
-                            # this, the first score_tokens() call from
-                            # Scheduler.step on the per-engine executor
-                            # thread raises "no Stream(gpu, X) in current
-                            # thread". Same root cause and fix as e93c408
-                            # for the VLM MTP drafter.
-                            materialize_lazy_state(draft_model)
-                            return draft_model
-                        finally:
-                            set_mtp_active(was_mtp)
-
-                    draft_model = await loop.run_in_executor(
-                        get_mlx_executor(), _load_draft
-                    )
-                    self._engine.engine.scheduler.set_specprefill_draft_model(
-                        draft_model, draft_model_name=specprefill_draft
-                    )
-                    logger.info(
-                        f"SpecPrefill: draft model loaded ({specprefill_draft})"
-                    )
-                except Exception as e:
-                    logger.error(f"SpecPrefill: draft model load failed: {e}")
-
         # Inject mlx-lm tool calling support into VLM tokenizer
         self._inject_tool_calling(self._tokenizer)
 
         self._loaded = True
         logger.info(f"VLMBatchedEngine loaded: {self._model_name}")
-
-    def set_vlm_mtp_drafter(self, drafter: Any) -> None:
-        """Attach a loaded MTP drafter for VLM MTP decoding.
-
-        Passes the drafter (and the configured draft-block size) down to
-        the scheduler so eligible requests get routed to mlx-vlm's MTP
-        round loop at decode time.  Supports gemma4_assistant and
-        qwen3_5_mtp drafter types.
-        """
-        self._vlm_mtp_drafter = drafter
-        block_size = None
-        if self._model_settings is not None:
-            block_size = getattr(self._model_settings, "vlm_mtp_draft_block_size", None)
-        scheduler = None
-        if self._engine is not None and hasattr(self._engine, "engine"):
-            scheduler = getattr(self._engine.engine, "scheduler", None)
-        if scheduler is not None and hasattr(scheduler, "set_vlm_mtp_drafter"):
-            scheduler.set_vlm_mtp_drafter(drafter, draft_block_size=block_size)
-        logger.info(
-            "VLM MTP drafter attached to engine: %s (block_size=%s)",
-            self._model_name,
-            block_size,
-        )
-
-    @property
-    def vlm_mtp_drafter(self) -> Any | None:
-        return self._vlm_mtp_drafter
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
@@ -2273,7 +1549,6 @@ class VLMBatchedEngine(BaseEngine):
                 "_adapter",
                 "_tokenizer",
                 "_grammar_compiler",
-                "_vlm_mtp_drafter",
                 "_diffusion_family",
             ),
             false_attrs=("_grammar_compiler_init_attempted",),
@@ -2303,22 +1578,7 @@ class VLMBatchedEngine(BaseEngine):
         if not chat_template:
             return
 
-        # MiniMax M3's template contains generic <tool_call> text in comments
-        # and examples, so upstream inference incorrectly selects json_tools.
-        # Use the same oMLX protocol adapter as distributed ranks.
-        from ..adapter.output_parser import (
-            install_minimax_m3_tokenizer_protocol,
-        )
-
-        if install_minimax_m3_tokenizer_protocol(
-            tokenizer,
-            self._model_name,
-            {"model_type": self.model_type} if self.model_type else None,
-        ):
-            logger.info("VLM tool calling enabled: parser=minimax_m3")
-            return
-
-        # Prefer mlx_vlm.tool_parsers (superset; knows about Gemma4 etc.)
+        # Prefer mlx_vlm.tool_parsers (superset).
         try:
             from mlx_vlm.tool_parsers import (
                 _infer_tool_parser,
@@ -2485,45 +1745,6 @@ class VLMBatchedEngine(BaseEngine):
                 )
             ):
                 formatted_messages.append(msg)
-            elif model_type == "glm5_next" and msg_num_images > 0:
-                # mlx-vlm does not yet register glm5_next in MODEL_CONFIG, so
-                # get_message_json() treats it as unsupported and its generic
-                # fallback strips image parts.  Preserve their relative order
-                # as template-visible markers; the checkpoint's native chat
-                # template expands each marker to the GLM image token triplet.
-                glm_content: list[Any] = []
-                inserted_images = 0
-                if isinstance(raw_content, list):
-                    for item in raw_content:
-                        if isinstance(item, dict):
-                            item_type = item.get("type", "")
-                            item_text = item.get("text", "")
-                        else:
-                            item_type = getattr(item, "type", "")
-                            item_text = getattr(item, "text", "")
-
-                        if item_type in image_part_types:
-                            if inserted_images < msg_num_images:
-                                glm_content.append({"type": "image"})
-                                inserted_images += 1
-                        elif item_type == "text":
-                            glm_content.append({"type": "text", "text": item_text})
-                        elif isinstance(item, str):
-                            glm_content.append(item)
-
-                if inserted_images < msg_num_images:
-                    glm_content[:0] = [
-                        {"type": "image"}
-                        for _ in range(msg_num_images - inserted_images)
-                    ]
-                if not any(
-                    isinstance(item, str)
-                    or (isinstance(item, dict) and item.get("type") == "text")
-                    for item in glm_content
-                ):
-                    glm_content.append({"type": "text", "text": content})
-
-                formatted_messages.append({"role": role, "content": glm_content})
             else:
                 formatted = get_message_json(
                     model_type,
@@ -2552,7 +1773,7 @@ class VLMBatchedEngine(BaseEngine):
         """Compute vision features for caching.
 
         Tries multiple strategies based on model architecture:
-        1. model.encode_image() — upstream mlx-vlm API (e.g. gemma4)
+        1. model.encode_image() — upstream mlx-vlm API
         2. Direct vision_tower call for qwen-style models
         3. Direct vision_tower + projector for llava-style models
         4. Returns None for unsupported models
@@ -2567,7 +1788,7 @@ class VLMBatchedEngine(BaseEngine):
         model = self._vlm_model
         model_type = self.model_type or ""
 
-        # Strategy 1: upstream encode_image (gemma4 and future models)
+        # Strategy 1: upstream encode_image
         if hasattr(model, "encode_image"):
             image_grid_thw = extra_model_inputs.get("image_grid_thw")
             image_position_ids = extra_model_inputs.get("image_position_ids")
@@ -2896,20 +2117,6 @@ class VLMBatchedEngine(BaseEngine):
         num_audios = len(audio) if audio else 0
 
         model_type = self.model_type or ""
-        if model_type == COHERE2_MOE_MODEL_TYPE and (
-            num_images > 0 or num_audios > 0
-        ):
-            raise InvalidRequestError(
-                "Cohere2 MoE is a text-only model and does not support "
-                "image or audio input.",
-                field="messages",
-            )
-        if model_type == QWEN4_EXP_MODEL_TYPE and num_audios > 0:
-            raise InvalidRequestError(
-                "Qwen4-Exp supports text and image input but not audio.",
-                field="messages",
-            )
-
         # Normalize audio to numpy float32 arrays expected by processor.
         # Request-facing string paths are rejected before this point; remaining
         # sources are inline buffers, arrays, or (array, sample_rate) tuples.
@@ -2987,8 +2194,6 @@ class VLMBatchedEngine(BaseEngine):
             template_kwargs["tools"] = tools
         if chat_template_kwargs:
             template_kwargs.update(chat_template_kwargs)
-        _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
-
         # Use processor or its tokenizer for chat template application
         template_target = self._processor
         if not hasattr(template_target, "apply_chat_template"):
@@ -3065,8 +2270,6 @@ class VLMBatchedEngine(BaseEngine):
                     prefix_template_kwargs["tools"] = tools
                 if chat_template_kwargs:
                     prefix_template_kwargs.update(chat_template_kwargs)
-                _apply_minimax_m3_thinking_mode(model_type, prefix_template_kwargs)
-
                 images_consumed = 0
                 for msg_idx, msg_num_images in image_message_ranges:
                     prefix_messages = formatted_messages[:msg_idx]
@@ -3337,8 +2540,6 @@ class VLMBatchedEngine(BaseEngine):
                 template_kwargs["enable_thinking"] = self._enable_thinking
             if chat_template_kwargs:
                 template_kwargs.update(chat_template_kwargs)
-            _apply_minimax_m3_thinking_mode(self.model_type, template_kwargs)
-
             try:
                 return apply_chat_template_with_reasoning_effort_fallback(
                     self._tokenizer,
@@ -3377,70 +2578,6 @@ class VLMBatchedEngine(BaseEngine):
         else:
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             return prompt + "\nassistant:"
-
-    @staticmethod
-    def _pop_specprefill_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
-        """Pop SpecPrefill per-request overrides out of ``kwargs``.
-
-        The engine's ``add_request`` accepts these as dedicated arguments, so
-        they must be forwarded explicitly rather than left in ``**kwargs``.
-        Shared by ``generate`` and ``stream_generate`` so both request paths
-        honour SpecPrefill overrides identically.
-        """
-        specprefill_kwargs: dict[str, Any] = {}
-        for key in (
-            "specprefill",
-            "specprefill_keep_pct",
-            "specprefill_threshold",
-            "specprefill_system_end",
-        ):
-            if kwargs.get(key) is not None:
-                specprefill_kwargs[key] = kwargs.pop(key)
-        return specprefill_kwargs
-
-    def _inject_specprefill_system_end(
-        self,
-        messages: list[dict[str, Any]],
-        prompt: str | list[int],
-        kwargs: dict[str, Any],
-    ) -> None:
-        """Compute the system-prompt token boundary and add it to ``kwargs``.
-
-        SpecPrefill protects the system-prompt region from token dropping. The
-        boundary is derived by subtracting the non-system prompt token count
-        from the full prompt token count (system-only messages usually can't be
-        templated on their own). Shared by ``chat`` and ``stream_chat`` so the
-        non-streaming path protects the system prompt identically. No-op unless
-        the model has SpecPrefill enabled and the request has a system prompt.
-
-        ``prompt`` is the already-tokenized VLM prompt (a list of token IDs,
-        per ``_process_chat_messages``), so the full-prompt count is just its
-        length rather than a re-encode.
-        """
-        specprefill_model_enabled = (
-            getattr(self._model_settings, "specprefill_enabled", False)
-            if self._model_settings
-            else False
-        )
-        if not (specprefill_model_enabled and kwargs.get("specprefill") is not False):
-            return
-        non_system = [
-            m for m in messages if m.get("role") not in ("system", "developer")
-        ]
-        if len(non_system) < len(messages) and non_system:
-            try:
-                non_system_prompt = self._tokenizer.apply_chat_template(
-                    non_system,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-                full_tokens = len(prompt)
-                non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
-                system_end = full_tokens - non_system_tokens
-                if system_end > 0:
-                    kwargs["specprefill_system_end"] = system_end
-            except Exception as e:
-                logger.debug(f"SpecPrefill: system_end calc failed: {e}")
 
     async def generate(
         self,
@@ -3520,9 +2657,6 @@ class VLMBatchedEngine(BaseEngine):
             seed=kwargs.get("seed", None),
         )
 
-        # SpecPrefill: forward per-request overrides to the engine, mirroring
-        # stream_generate so the non-streaming path is not silently ignored.
-        specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
         tools = kwargs.pop("tools", None)
 
         output = await self._engine.generate(
@@ -3534,7 +2668,6 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             tools=tools,
-            **specprefill_kwargs,
         )
 
         text = clean_special_tokens(output.output_text)
@@ -3633,8 +2766,6 @@ class VLMBatchedEngine(BaseEngine):
             seed=kwargs.get("seed", None),
         )
 
-        # SpecPrefill: pass per-request overrides
-        specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
         tools = kwargs.pop("tools", None)
 
         engine = self._engine
@@ -3648,11 +2779,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
             benchmark_trace=bool(kwargs.get("benchmark_trace", False)),
-            benchmark_ane_sequence_length=int(
-                kwargs.get("benchmark_ane_sequence_length", 0) or 0
-            ),
             tools=tools,
-            **specprefill_kwargs,
         )
 
         finished_normally = False
@@ -3757,9 +2884,6 @@ class VLMBatchedEngine(BaseEngine):
             tools,
             kwargs,
         )
-
-        # SpecPrefill: protect the system-prompt region, mirroring stream_chat.
-        self._inject_specprefill_system_end(messages, prompt, kwargs)
 
         return await self.generate(
             prompt=prompt,
@@ -3978,9 +3102,6 @@ class VLMBatchedEngine(BaseEngine):
             kwargs,
         )
 
-        # SpecPrefill: protect the system-prompt region from token dropping.
-        self._inject_specprefill_system_end(messages, prompt, kwargs)
-
         async for output in self.stream_generate(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -4142,11 +3263,6 @@ class VLMBatchedEngine(BaseEngine):
                 "Structured response_format is not supported with diffusion models.",
                 field="response_format",
             )
-        if kwargs.get("specprefill") is True:
-            raise InvalidRequestError(
-                "SpecPrefill is not supported with diffusion models.",
-                field="specprefill",
-            )
 
     def _diffusion_apply_chat_template(
         self,
@@ -4195,8 +3311,6 @@ class VLMBatchedEngine(BaseEngine):
             template_kwargs["tools"] = tools
         if chat_template_kwargs:
             template_kwargs.update(chat_template_kwargs)
-        _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
-
         template_target = self._processor
         if not hasattr(template_target, "apply_chat_template"):
             template_target = getattr(self._processor, "tokenizer", self._processor)
@@ -4340,7 +3454,7 @@ class VLMBatchedEngine(BaseEngine):
                 if m
             )
 
-        # Detect a protocol output parser (e.g. gemma4 channel markers).
+        # Detect a protocol output parser.
         # The diffusion lane emits detokenized text segments, so only
         # sessions exposing ``process_text`` can be used here.
         parser_session = None

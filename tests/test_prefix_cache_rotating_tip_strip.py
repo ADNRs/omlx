@@ -505,6 +505,5 @@ def test_registry_rotating_family():
     assert CacheTypeRegistry.is_rotating_family("BufferedRotatingKVCache")
     assert CacheTypeRegistry.is_rotating_family("BatchRotatingKVCache")
     assert not CacheTypeRegistry.is_rotating_family("KVCache")
-    assert not CacheTypeRegistry.is_rotating_family("TurboQuantKVCache")
     assert not CacheTypeRegistry.is_rotating_family("ArraysCache")
     assert not CacheTypeRegistry.is_rotating_family("SomethingElse")

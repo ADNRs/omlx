@@ -5,13 +5,7 @@ from __future__ import annotations
 
 import importlib
 
-NATIVE_KERNEL_PACKAGES = (
-    "bonsai",
-    "decode_fast",
-    "glm_moe_dsa",
-    "minimax_m3",
-    "qwen35_prefill",
-)
+NATIVE_KERNEL_PACKAGES = ("qwen35_prefill",)
 
 
 def native_kernel_status() -> dict[str, dict[str, object]]:

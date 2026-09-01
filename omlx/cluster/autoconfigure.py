@@ -770,8 +770,8 @@ class _Guard:
     """The conditions under which the dispatcher reaches one patch import.
 
     ``model_types`` is one entry per nested ``if``, each holding the
-    alternatives that test allows — ``("eq", "laguna")`` or
-    ``("prefix", "deepseek_v4")``. Every entry must be satisfied, any
+    alternatives that test allows — ``("eq", "<family>")`` or
+    ``("prefix", "<model_type>")``. Every entry must be satisfied, any
     alternative within one will do.
     """
 
@@ -902,7 +902,7 @@ def _walk_dispatch(
             )
             _walk_dispatch(node.orelse, guard, aliases, found)
         elif isinstance(node, ast.ImportFrom) and node.module:
-            # ``from ..patches.step3p7 import ...`` and the absolute form both
+            # a relative ``from ..patches.<mod> import ...`` and the absolute form both
             # name the same package; the level lives outside ``module``.
             module = node.module.removeprefix("omlx.")
             if module.startswith("patches."):
@@ -1113,7 +1113,7 @@ def required_imports(
     unconditional requirements, which a rank needs regardless.
 
     ``for_vlm`` defaults to False because a rank is an ``mlx_lm.server`` — that
-    is the whole reason ``omlx.patches.minimax_m3_mlx_lm`` exists — so it takes
+    is the whole reason the assigned-stage seam exists — so it takes
     the same branches ``inference_worker`` takes. Pass True to describe a
     single-node mlx-vlm load instead.
     """

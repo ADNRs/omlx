@@ -18,8 +18,18 @@ from omlx.engine_core import get_mlx_executor
 
 _preflight_logger = logging.getLogger("omlx.engine.preflight")
 
-_PREFLIGHT_CLEANUP_WAIT_TIMEOUT_S = 4.0
+# Post-request teardown is not atomic: the scheduler's async-remove drain
+# and deferred Metal clear are tracked flags, but the store_cache worker
+# then holds the finished request's extracted KV for SSD writeback
+# (~50ms/block — 5-10s for a 200K-context request's 98 blocks) which no
+# flag covers. A preflight landing in that window used to hard-reject a
+# prompt whose charge fits once the writeback drains (measured 2026-08-29:
+# 240K preflight 7s after a finished 200K saw current 33.2GB vs ~19GB
+# settled). 10s covers the observed drain while still bounding a
+# genuinely-impossible prompt's wait before its 400.
+_PREFLIGHT_CLEANUP_WAIT_TIMEOUT_S = 10.0
 _PREFLIGHT_CLEANUP_POLL_INTERVAL_S = 0.05
+_PREFLIGHT_TEARDOWN_POLL_INTERVAL_S = 1.0
 
 # Per-process record of (engine_class_name, method) pairs that have
 # already logged a "scheduler unreachable" warning. The warning marks a
@@ -116,6 +126,41 @@ async def _run_scheduler_preflight_with_cleanup_retry(
                 )
             await asyncio.sleep(_PREFLIGHT_CLEANUP_POLL_INTERVAL_S)
             continue
+
+        # Teardown-drain wait: the request's own charge fits under the cap
+        # and only the not-yet-settled current (a finished request's KV
+        # being written back to SSD by the store worker — see the timeout
+        # constant's comment) blocks admission. Re-measure while the
+        # footprint is actually declining and retry the full preflight as
+        # soon as it drops; a steady footprint falls through to eviction /
+        # rejection immediately.
+        if (
+            getattr(eviction_request, "reason", "") == "prefill_preflight"
+            and getattr(eviction_request, "predicted_transient_bytes", 0)
+            <= getattr(eviction_request, "target_cap_bytes", 0)
+            and getattr(eviction_request, "predicted_transient_bytes", 0) > 0
+            and now < deadline
+        ):
+            refresh_usage = getattr(
+                scheduler, "refresh_route_preflight_usage", None
+            )
+            cur_now = eviction_request.current_bytes
+            if executor is not None and callable(refresh_usage):
+                loop = asyncio.get_running_loop()
+                cur_now = await loop.run_in_executor(executor, refresh_usage)
+            if cur_now < eviction_request.current_bytes:
+                if not waited_for_cleanup:
+                    waited_for_cleanup = True
+                    _preflight_logger.debug(
+                        "Deferring preflight for request %s while the "
+                        "previous request's teardown drains (current %.2fGB "
+                        "-> %.2fGB)",
+                        request_id or "preflight",
+                        eviction_request.current_bytes / 1024**3,
+                        cur_now / 1024**3,
+                    )
+                await asyncio.sleep(_PREFLIGHT_TEARDOWN_POLL_INTERVAL_S)
+                continue
 
         # Dropping the last Request/KV references and clearing MLX's pool do
         # not make macOS phys_footprint settle atomically. Once a transient

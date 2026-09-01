@@ -321,12 +321,6 @@ class ChatCompletionRequest(BaseModel):
     reasoning_effort: Optional[Union[str, int, float]] = None
     # Thinking budget (max thinking tokens, None = unlimited)
     thinking_budget: Optional[int] = Field(default=None, ge=0)
-    # SpecPrefill: per-request enable/disable (None = use model setting)
-    specprefill: Optional[bool] = None
-    # SpecPrefill: per-request keep percentage (0.1-0.5, None = use model setting)
-    specprefill_keep_pct: Optional[float] = None
-    # SpecPrefill: per-request threshold override (min tokens to trigger, None = use model setting)
-    specprefill_threshold: Optional[int] = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
 

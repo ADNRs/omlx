@@ -16,6 +16,7 @@ SDPA implementation is called unchanged.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import sys
@@ -36,6 +37,18 @@ _PATCHED = False
 # collapses long-context MTP throughput (issue #2127). Genuine prefill
 # chunks are always far above this floor.
 _MIN_ROUTE_Q_LEN = 16
+
+# The fused NAX dsplit kernel routes prefill-width calls (q_len >= 64)
+# unconditionally, and anything narrower only at long KV: the split-K
+# (flash decoding) variant splits the KV axis across threadgroups so a
+# q_len < 64 grid (NQ = 1) no longer starves the GPU, but its extra
+# partial slab + reduce pass only pay off once the KV scan dominates.
+# Measured crossover vs stock @ kv=200K without split-K (2026-08-28):
+# q=5 0.45x, q=16 0.91x, q=64 1.27x, q=256 1.52x, q=1024 2.25x — with
+# split-K the small-q side is covered too (MTP verify routes through
+# qwen35_verify_sdpa_split with a lower KV floor).
+_NAX_MIN_ROUTE_Q_LEN = 64
+_NAX_SMALL_Q_MIN_KV_LEN = 32768
 
 # Per-dispatch work ceiling (batch * heads * q_len * keys) for the native
 # kernel. A single dispatch scanning the whole KV monopolizes the GPU long
@@ -77,6 +90,125 @@ def _native_kernel():
     if not fast.has_symbol("qwen35_fa256_attention"):
         return None
     return fast.qwen35_fa256_attention
+
+
+def _nax_kernel():
+    """The fused NAX head-dim-256 dsplit kernel, when usable on this host."""
+    try:
+        from omlx.custom_kernels.qwen35_prefill import fast
+    except Exception:
+        return None
+    if not fast.nax_attn256_available():
+        return None
+    return fast.qwen35_attn256_nax
+
+
+# Populated by apply_qwen35_fa256_attention_patch with the kernel handle
+# and its calibrated dispatch budget; other patches (verify-split routes
+# decode-width attention through the same kernel + demote logic) borrow it
+# via try_nax_attn.
+_NAX_ROUTE: dict = {"kernel": None, "budget": 0}
+
+
+def try_nax_attn(
+    queries,
+    keys,
+    values,
+    scale,
+    *,
+    cache=None,
+    mask=None,
+    sinks=None,
+    min_q_len: int | None = None,
+    min_kv_len: int | None = None,
+):
+    """Run the fused NAX dsplit kernel when this call is eligible.
+
+    Returns the output array, or None when the route is unavailable or
+    declined (patch not applied, quantized cache, shape mismatch) so the
+    caller keeps its own fallback. A failed launch demotes the route for
+    the rest of the process. ``min_q_len`` / ``min_kv_len`` override the
+    small-q routing floors (e.g. the verify patch passes decode-width q
+    with a lower KV floor).
+    """
+    kernel = _NAX_ROUTE.get("kernel")
+    if kernel is None:
+        return None
+    if not _nax_should_route(
+        queries, keys, cache, mask, sinks, min_q_len, min_kv_len
+    ):
+        return None
+    try:
+        return kernel(
+            queries,
+            keys,
+            values,
+            scale,
+            causal=True,
+            dispatch_budget=_NAX_ROUTE["budget"],
+        )
+    except Exception:
+        logger.warning(
+            "fa256 NAX kernel failed; demoting for this process",
+            exc_info=True,
+        )
+        with contextlib.suppress(Exception):
+            _fa256_fast.nax_attn256_demote()
+        _NAX_ROUTE["kernel"] = None
+        return None
+
+
+def _nax_should_route(
+    queries,
+    keys,
+    cache,
+    mask,
+    sinks,
+    min_q_len: int | None = None,
+    min_kv_len: int | None = None,
+) -> bool:
+    # Same discipline as _should_route: the q_len gate must exit first so
+    # per-call decode overhead stays a shape check, and cache/mask probes
+    # only run for head_dim-256 multi-row calls. Below the prefill q floor
+    # the call routes only at long KV, where the split-K variant pays for
+    # its partial slab + reduce (callers may tighten both thresholds: the
+    # verify patch passes decode-width q and a lower KV floor).
+    if queries.ndim != 4:
+        return False
+    q_len = queries.shape[-2]
+    min_q = _NAX_MIN_ROUTE_Q_LEN if min_q_len is None else min_q_len
+    kv_floor = _NAX_SMALL_Q_MIN_KV_LEN if min_kv_len is None else min_kv_len
+    if q_len < min_q:
+        # Multi-row small q (MTP verify) routes at long KV via split-K;
+        # single-row decode stays on the stock vector kernel, which
+        # measures faster than the narrowest dsplit tile there.
+        small_q_ok = (
+            q_len >= 2
+            and getattr(keys, "ndim", 0) == 4
+            and keys.shape[-2] >= kv_floor
+        )
+        if not small_q_ok:
+            return False
+    if not mx.metal.is_available() or _has_quantized_cache(cache):
+        return False
+    if sinks is not None:
+        return False
+    if mask is not None and not (isinstance(mask, str) and mask == "causal"):
+        return False
+    if keys.ndim != 4:
+        return False
+    if queries.dtype not in (mx.float16, mx.bfloat16):
+        return False
+    if queries.dtype != keys.dtype:
+        return False
+    q_heads = queries.shape[-3]
+    kv_heads = keys.shape[-3]
+    return (
+        queries.shape[-1] == 256
+        and kv_heads > 0
+        and q_heads % kv_heads == 0
+        and queries.shape[-2] <= keys.shape[-2]
+    )
 
 
 def _has_quantized_cache(cache) -> bool:
@@ -142,12 +274,61 @@ def _auto_dispatch_budget(kernel, q_block: int, k_block: int) -> int:
         return _DEFAULT_DISPATCH_BUDGET
 
 
+def _auto_nax_dispatch_budget(kernel) -> int:
+    """Same calibration as _auto_dispatch_budget for the NAX dsplit kernel.
+
+    The NAX kernel's per-dispatch work unit is a full causal scan (the
+    budget is measured on a causal call, matching how the dispatch loop
+    charges B * H * qL * kL), so the derived budget self-consistently
+    targets ~_TARGET_DISPATCH_SECONDS of wallclock per dispatch.
+    """
+    try:
+        work = _CALIB_HEADS * _CALIB_Q_LEN * _CALIB_KV_LEN
+        q = mx.random.normal((1, _CALIB_HEADS, _CALIB_Q_LEN, 256)).astype(
+            mx.bfloat16
+        )
+        k = mx.random.normal((1, _CALIB_KV_HEADS, _CALIB_KV_LEN, 256)).astype(
+            mx.bfloat16
+        )
+        v = mx.random.normal((1, _CALIB_KV_HEADS, _CALIB_KV_LEN, 256)).astype(
+            mx.bfloat16
+        )
+        mx.eval(q, k, v)
+        best = 0.0
+        for i in range(4):
+            start = time.perf_counter()
+            mx.eval(kernel(q, k, v, 256**-0.5, causal=True))
+            elapsed = time.perf_counter() - start
+            if i > 0:
+                best = elapsed if best == 0.0 else min(best, elapsed)
+        if best <= 0:
+            raise ValueError(f"non-positive calibration time {best}")
+        budget = int(work / best * _TARGET_DISPATCH_SECONDS)
+        budget = max(_MIN_AUTO_BUDGET, min(_MAX_AUTO_BUDGET, budget))
+        logger.info(
+            "Qwen FA-256 NAX dispatch budget auto-calibrated: %.2e work/s -> "
+            "%d (target %dms/dispatch)",
+            work / best,
+            budget,
+            int(_TARGET_DISPATCH_SECONDS * 1000),
+        )
+        return budget
+    except Exception:
+        logger.warning(
+            "Qwen FA-256 NAX dispatch budget calibration failed; using "
+            "default %d",
+            _DEFAULT_DISPATCH_BUDGET,
+            exc_info=True,
+        )
+        return _DEFAULT_DISPATCH_BUDGET
+
+
 def _should_route(queries, keys, cache, mask, sinks, min_kv_len: int) -> bool:
     # Query-shape gates first: this runs on every SDPA call of every decode
     # step, so the common (decode / MTP verify) case must exit on the q_len
     # check before touching Metal state or cache attributes (issue #2132).
-    # ``keys`` may be a TurboQuant state proxy without ``ndim``/``dtype``, so
-    # it must not be inspected before the quantized-cache check declines.
+    # ``keys`` may be a quantized-cache state proxy without ``ndim``/``dtype``,
+    # so it must not be inspected before the quantized-cache check declines.
     if queries.ndim != 4 or queries.shape[-2] < _MIN_ROUTE_Q_LEN:
         return False
     if not mx.metal.is_available() or _has_quantized_cache(cache):
@@ -189,29 +370,54 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
     steel_env = os.environ.get("OMLX_FA256_STEEL", "").strip()
     if steel_env == "0":
         return False
+
+    # Fused NAX (M5 tensor-unit) head-dim-256 kernel: backport of
+    # mlx-main's attention_nax_dsplit, dispatched from the rebuilt native
+    # extension. A true flash pass — O(1) transient regardless of context
+    # length, no score materialization, no interaction with the prefill
+    # memory guard.
+    nax_kernel = None
+    nax_dispatch_budget = 0
     if steel_env != "1" and is_nax_available():
-        # Auto: on NAX GPUs (M5 family) stock SDPA's head_dim-256 fallback
-        # runs its matmuls on the tensor units and beats this pre-NAX steel
-        # kernel, so routing it would regress prefill (M5 Max report:
-        # 4k pp 828 -> 400 tok/s on 0.5.0). OMLX_FA256_STEEL=1 forces the
-        # kernel on for benchmarking; a NAX port of this kernel is the
-        # tracked follow-up.
-        logger.info(
-            "Qwen FA-256 steel patch skipped: NAX GPU, stock SDPA is faster"
-        )
-        return False
+        nax_kernel = _nax_kernel()
+        if nax_kernel is not None:
+            nax_budget_env = os.environ.get(
+                "OMLX_FA256_NAX_DISPATCH_BUDGET", ""
+            ).strip()
+            if nax_budget_env:
+                nax_dispatch_budget = int(nax_budget_env)
+            else:
+                # Production-calibrated M5 Pro/Max value (262K server run);
+                # env override above still wins for tuning sweeps.
+                nax_dispatch_budget = 214_391_069
+        else:
+            # Auto: on NAX GPUs (M5 family) without the rebuilt extension,
+            # stock SDPA's head_dim-256 fallback runs its matmuls on the
+            # tensor units and beats this pre-NAX steel kernel, so routing
+            # it would regress prefill (M5 Max report: 4k pp 828 -> 400
+            # tok/s on 0.5.0). OMLX_FA256_STEEL=1 forces the classic
+            # kernel on for benchmarking.
+            logger.info(
+                "Qwen FA-256 steel patch skipped: NAX GPU without the fused "
+                "dsplit kernel; stock SDPA is faster"
+            )
+            return False
 
     kernel = _native_kernel()
-    if kernel is None:
+    if nax_kernel is None and kernel is None:
         logger.debug("Qwen FA-256 steel kernel unavailable; patch skipped")
         return False
+
+    # Share the calibrated kernel + budget with try_nax_attn callers.
+    _NAX_ROUTE["kernel"] = nax_kernel
+    _NAX_ROUTE["budget"] = nax_dispatch_budget
 
     min_kv_len = int(os.environ.get("OMLX_FA256_MIN_KV_LEN", min_kv_len or 2048))
     q_block = int(os.environ.get("OMLX_FA256_Q_BLOCK", "32"))
     k_block = int(os.environ.get("OMLX_FA256_K_BLOCK", "8"))
     debug = os.environ.get("OMLX_FA256_DEBUG", "0") == "1"
     budget_env = os.environ.get("OMLX_FA256_DISPATCH_BUDGET", "").strip()
-    if not _fa256_fast.fa256_supports_dispatch_budget():
+    if kernel is not None and not _fa256_fast.fa256_supports_dispatch_budget():
         if budget_env != "0":
             logger.warning(
                 "Qwen FA-256 steel kernel predates chunked dispatch (issue "
@@ -222,8 +428,41 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
         dispatch_budget = 0
     elif budget_env:
         dispatch_budget = int(budget_env)
-    else:
+    elif kernel is not None:
         dispatch_budget = _auto_dispatch_budget(kernel, q_block, k_block)
+    else:
+        dispatch_budget = 0
+
+    def _dispatch_native(queries, keys, values, scale, cache, mask, sinks):
+        """Try the NAX dsplit kernel first, then the classic steel kernel.
+
+        A failed NAX launch demotes the route for the process (missing
+        pipeline etc.) and falls through to the classic kernel; a failed
+        classic launch (or no route match) returns None so the caller
+        continues down the chain (sdpa256 wrapper -> stock SDPA)."""
+        if queries.ndim == 4 and queries.shape[-1] == 256:
+            out = try_nax_attn(
+                queries, keys, values, scale, cache=cache, mask=mask, sinks=sinks
+            )
+            if out is not None:
+                return out
+            if kernel is not None and _should_route(
+                queries, keys, cache, mask, sinks, min_kv_len
+            ):
+                try:
+                    return kernel(
+                        queries,
+                        keys,
+                        values,
+                        scale,
+                        causal=True,
+                        q_block=q_block,
+                        k_block=k_block,
+                        dispatch_budget=dispatch_budget,
+                    )
+                except Exception:
+                    logger.warning("fa256 steel kernel failed", exc_info=True)
+        return None
 
     patched_any = False
 
@@ -241,29 +480,16 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
             mask: mx.array | None,
             sinks: mx.array | None = None,
         ) -> mx.array:
-            routed = _should_route(queries, keys, cache, mask, sinks, min_kv_len)
+            out = _dispatch_native(queries, keys, values, scale, cache, mask, sinks)
+            if out is not None:
+                return out
             if debug:
                 logger.info(
-                    "fa256 steel lm route=%s q=%s k=%s mask=%s",
-                    routed,
-                    queries.shape,
-                    keys.shape,
+                    "fa256 steel lm pass-through q=%s k=%s mask=%s",
+                    getattr(queries, "shape", None),
+                    getattr(keys, "shape", None),
                     type(mask).__name__ if not isinstance(mask, str) else mask,
                 )
-            if routed:
-                try:
-                    return kernel(
-                        queries,
-                        keys,
-                        values,
-                        scale,
-                        causal=True,
-                        q_block=q_block,
-                        k_block=k_block,
-                        dispatch_budget=dispatch_budget,
-                    )
-                except Exception:
-                    logger.warning("fa256 steel lm kernel failed", exc_info=True)
             return original_lm_sdpa(queries, keys, values, cache, scale, mask, sinks)
 
         mlx_base.scaled_dot_product_attention = patched_lm_sdpa
@@ -291,29 +517,16 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
                 mask=None,
                 sinks=None,
             ):
-                routed = _should_route(queries, keys, cache, mask, sinks, min_kv_len)
+                out = _dispatch_native(queries, keys, values, scale, cache, mask, sinks)
+                if out is not None:
+                    return out
                 if debug:
                     logger.info(
-                        "fa256 steel vlm route=%s q=%s k=%s mask=%s",
-                        routed,
-                        queries.shape,
-                        keys.shape,
+                        "fa256 steel vlm pass-through q=%s k=%s mask=%s",
+                        getattr(queries, "shape", None),
+                        getattr(keys, "shape", None),
                         type(mask).__name__ if not isinstance(mask, str) else mask,
                     )
-                if routed:
-                    try:
-                        return kernel(
-                            queries,
-                            keys,
-                            values,
-                            scale,
-                            causal=True,
-                            q_block=q_block,
-                            k_block=k_block,
-                            dispatch_budget=dispatch_budget,
-                        )
-                    except Exception:
-                        logger.warning("fa256 steel vlm kernel failed", exc_info=True)
                 return original_vlm_sdpa(
                     queries, keys, values, cache, scale, mask, sinks
                 )
@@ -334,8 +547,11 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
     if patched_any:
         _PATCHED = True
         logger.info(
-            "Qwen3.5/3.6 FA-256 steel attention patch applied "
-            "(min_kv_len=%d, q_block=%d, k_block=%d, dispatch_budget=%d)",
+            "Qwen3.5/3.6 FA-256 attention patch applied "
+            "(nax=%s nax_budget=%d, min_kv_len=%d, q_block=%d, k_block=%d, "
+            "dispatch_budget=%d)",
+            nax_kernel is not None,
+            nax_dispatch_budget,
             min_kv_len,
             q_block,
             k_block,
