@@ -60,7 +60,8 @@ python -m omlx.cli serve --model-dir ~/.omlx/models
 
 - Admin UI: `http://127.0.0.1:8000/admin` (first visit sets the API key)
 - OpenAI-compatible API: `http://127.0.0.1:8000/v1/chat/completions`
-- Supported model: **Qwen3.8-27B-oQ4e-mtp** (oQ 4-bit expert quant + native MTP head).
+- Supported model: **Qwen3.8-27B-oQ4e-mtp** (dense model; oQ4e = enhanced-calibration
+  mixed 4/5-bit affine quant + native MTP head).
   Download it into the model dir, then load it from the admin Models page.
 - Native MTP (draft depth up to 3) is attached automatically when `mtp_enabled` is on
   for the model.
