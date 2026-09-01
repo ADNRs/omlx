@@ -6814,8 +6814,11 @@
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
-                        const data = await response.json();
-                        alert(data.detail || window.t('js.error.update_model_setting_failed'));
+                        const data = await response.json().catch(() => ({}));
+                        const detail = Array.isArray(data.detail)
+                            ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join('; ')
+                            : data.detail;
+                        alert(detail || window.t('js.error.update_model_setting_failed'));
                         await this.loadModels();
                     }
                 } catch (err) {
@@ -7213,12 +7216,6 @@
                     force_sampling: s.force_sampling || false,
                     enable_thinking: s.enable_thinking ?? null,
                     thinking_default: model?.thinking_default ?? null,
-                    qwen4_ple_ssd_offload: model?.qwen4_ple_ssd_offload_forced === true
-                        || s.qwen4_ple_ssd_offload === true,
-                    qwen4_ple_ssd_offload_supported:
-                        model?.qwen4_ple_ssd_offload_supported === true,
-                    qwen4_ple_ssd_offload_forced:
-                        model?.qwen4_ple_ssd_offload_forced === true,
                     enableThinkingBudget: !!(s.thinking_budget_tokens),
                     thinking_budget_tokens: s.thinking_budget_tokens || null,
                     guided_grammar_enabled: s.guided_grammar_enabled || false,
@@ -7656,8 +7653,6 @@
                                 reasoning_parser: this.modelSettings.reasoning_parser || null,
                                 ttl_seconds: this.modelSettings.ttl_seconds || null,
                                 enable_thinking: this.modelSettings.enable_thinking,
-                                qwen4_ple_ssd_offload:
-                                    !!this.modelSettings.qwen4_ple_ssd_offload,
                                 thinking_budget_enabled: this.modelSettings.enableThinkingBudget,
                                 thinking_budget_tokens: this.modelSettings.enableThinkingBudget
                                     ? (this.modelSettings.thinking_budget_tokens || null)
@@ -7715,8 +7710,12 @@
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
-                        const data = await response.json();
-                        alert(data.detail || window.t('js.error.save_model_settings_failed'));
+                        const data = await response.json().catch(() => ({}));
+                        // FastAPI validation errors return detail as an array of objects.
+                        const detail = Array.isArray(data.detail)
+                            ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join('; ')
+                            : data.detail;
+                        alert(detail || window.t('js.error.save_model_settings_failed'));
                     }
                 } catch (err) {
                     console.error('Failed to save model settings:', err);
