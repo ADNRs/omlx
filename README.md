@@ -100,19 +100,27 @@ on throughput as context grows.
 The same build also runs the 5-bit AWQ checkpoint at the full 262,144 window.
 Measured with the identical protocol (fork, medians of 3):
 
-| Workload | AWQ-5.0bpw on this fork | oQ4e-mtp (4-bit) |
+| Workload | AWQ-5.0bpw on this fork | oQ4e-mtp |
 |---|---|---|
-| pp262,144 / tg0 | 219 tok/s | **230 tok/s** |
-| pp4,096 / tg128 | **454 tok/s · 31.0 tok/s** | 448 tok/s · 31.5 tok/s |
-| pp16,384 / tg128 | **429 tok/s · 33.5 tok/s** | 426 tok/s · 33.5 tok/s |
-| pp65,536 / tg128 | **361 tok/s · 26.9 tok/s** | 366 tok/s · **29.9 tok/s** |
-| pp131,072 / tg128 | **297 tok/s · 26.0 tok/s** | 297 tok/s · **27.5 tok/s** |
+| pp262,144 / tg0 | 219 tok/s | 230 tok/s |
+| pp4,096 / tg128 | 454 tok/s · 31.0 tok/s | 448 tok/s · 31.5 tok/s |
+| pp16,384 / tg128 | 429 tok/s · 33.5 tok/s | 426 tok/s · 33.5 tok/s |
+| pp65,536 / tg128 | 361 tok/s · 26.9 tok/s | 366 tok/s · 29.9 tok/s |
+| pp131,072 / tg128 | 297 tok/s · 26.0 tok/s | 297 tok/s · 27.5 tok/s |
 | Peak Metal memory @131,072 prefill | 28.7 GB | 28.0 GB |
 | CMMLU-1000 (greedy) | **80.0%** | 77.0% |
 | MMLU-Pro-1000 (greedy) | **59.6%** | 58.4% |
+| ARC-Challenge-1172 (greedy) | **96.0%** | 95.6% |
+| Winogrande-1267 (greedy) | **80.3%** | 79.2% |
 | TruthfulQA-817 (greedy) | **85.2%** | 84.5% |
+| GSM8K-1319 (greedy) | **91.7%** | 91.6% |
+| MathQA-2985 (greedy) | 39.5% | **41.5%** |
+| HumanEval-164 (greedy) | 92.1% | **94.5%** |
+| MBPP-500 (greedy) | **79.8%** | 79.6% |
 
-Trade-off: AWQ-5.0bpw gains +1.2–3.0 pp accuracy across benchmarks at a cost of
-~1–2% prefill and ~3–10% decode throughput, and ~1 GB more memory. Pick per use
-case — both checkpoints run on the same build (set the model's context window to
-262,144 in its settings for full-window AWQ prefill).
+Trade-off: AWQ-5.0bpw gains +0.1–3.0 pp accuracy on knowledge/reasoning suites
+(CMMLU +3.0 pp is the largest) at a cost of ~1–2% prefill and ~3–10% decode
+throughput, ~1 GB more memory, and a small regression on two code/math
+generation suites (MathQA −2.0 pp, HumanEval −2.4 pp). Pick per use case — both
+checkpoints run on the same build (set the model's context window to 262,144 in
+its settings for full-window AWQ prefill).
