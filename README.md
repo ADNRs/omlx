@@ -117,6 +117,12 @@ Measured with the identical protocol (fork, medians of 3):
 | MathQA-2985 (greedy) | 39.5% | **41.5%** |
 | HumanEval-164 (greedy) | 92.1% | **94.5%** |
 | MBPP-500 (greedy) | **79.8%** | 79.6% |
+| HumanEval-164 (coding+thinking) | **93.3%** | 92.7% |
+| MBPP-100 subset (coding+thinking) | 86.0% | **88.0%** |
+
+Thinking-mode rows use the qwen3-r-code sampling preset (temp 0.6, top_p 0.95,
+top_k 20) with `enable_thinking`; the MBPP thinking row is a 100-item stratified
+subset.
 
 Trade-off: AWQ-5.0bpw gains +0.1–3.0 pp accuracy on knowledge/reasoning suites
 (CMMLU +3.0 pp is the largest) at a cost of ~1–2% prefill and ~3–10% decode
