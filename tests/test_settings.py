@@ -465,7 +465,7 @@ class TestCacheSettings:
             "hot_cache_max_size": "0",
             "hot_cache_write_through": False,
             "initial_cache_blocks": 256,
-            "mx_cache_limit_gb": 8.0,
+            "mx_cache_limit_gb": 2.0,
         }
 
     def test_from_dict(self):
@@ -972,8 +972,8 @@ class TestMemorySettings:
         d = settings.to_dict()
         assert d["memory_guard_tier"] == "safe"
         assert d["prefill_memory_guard"] is True
-        assert d["soft_threshold"] == 0.85
-        assert d["hard_threshold"] == 0.95
+        assert d["soft_threshold"] == 1.0
+        assert d["hard_threshold"] == 1.0
         # Removed fields must not be present.
         assert "max_process_memory" not in d
         assert "max_process_memory_is_explicit" not in d

@@ -77,12 +77,15 @@ _ACTIVE_RECLAIM_RATIO: dict[str, float] = {
 
 # Default soft watermark per tier. A saved 0.85 from older configs is treated
 # as the legacy default so balanced / aggressive can move to their tier defaults.
+# custom = 1.0 (production default): the soft watermark sits at the pinned
+# ceiling itself — the spike margin comes from metal_cap - ceiling, not from
+# a threshold fraction (see MemorySettings.soft_threshold).
 _LEGACY_SOFT_THRESHOLD = 0.85
 _SOFT_THRESHOLD_BY_TIER: dict[str, float] = {
     "safe": 0.85,
     "balanced": 0.90,
     "aggressive": 0.925,
-    "custom": 0.85,
+    "custom": 1.0,
 }
 
 # Fraction of the hard ceiling used by the adaptive prefill chunk sizer.
@@ -336,7 +339,7 @@ class ProcessMemoryEnforcer:
         prefill_memory_guard: bool = True,
         global_settings: GlobalSettings | None = None,
         soft_threshold: float | None = None,
-        hard_threshold: float = 0.95,
+        hard_threshold: float = 1.0,
         prefill_safe_zone_ratio: float = 0.89,
         prefill_min_chunk_tokens: int = 256,
     ):
@@ -363,6 +366,8 @@ class ProcessMemoryEnforcer:
                 default instead.
             hard_threshold: Fraction of ceiling that triggers hard action
                 (LRU/non-pinned aborts, loading aborts, and idle reclaim).
+                Production default 1.0: the kill line is the ceiling itself
+                and the spike margin comes from metal_cap - ceiling.
             prefill_safe_zone_ratio: Fraction of hard cap below which prefill
                 runs at full chunk size; above triggers adaptive shrink.
             prefill_min_chunk_tokens: Floor for adaptive shrink.

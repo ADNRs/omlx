@@ -3249,6 +3249,12 @@ class Scheduler:
     # scales with query_len * kv_len, so per-token cost grows with context
     # length; this covers one chunk's worth of growth + measurement noise.
     _PREFILL_TRANSIENT_SAFETY: float = 1.3
+
+    # Keep boundary snapshots at least this far below the hard watermark.
+    # Staging a snapshot spikes phys_footprint on the order of GBs (SSD copy
+    # buffers + pool refill) outside the pool cap's accounting; that overlap
+    # has aborted near-ceiling prefills exactly at snapshot boundaries.
+    _BOUNDARY_SNAPSHOT_HEADROOM_BYTES: int = 2 * 1024**3
     _MEMORY_ADMISSION_STALL_TIMEOUT_S: float = 60.0
     _STORE_CACHE_ADMISSION_STALL_TIMEOUT_S: float = 60.0
 
@@ -5257,6 +5263,27 @@ class Scheduler:
         next identical-prompt request rejected the cache and re-
         prefilled from scratch.
         """
+        # Near the hard watermark, skip the snapshot: staging the SSD copy
+        # spikes phys_footprint by GBs on top of the chunk's own transient,
+        # and that overlap has aborted prefills exactly at snapshot
+        # boundaries. Snapshots are opportunistic resume checkpoints — a
+        # request that survives because we skipped them never needs one;
+        # a request that dies anyway resumes from an earlier boundary.
+        # Inactive when the enforcer has not propagated a watermark.
+        watermark = self._memory_hard_watermark_bytes
+        if (
+            watermark > 0
+            and self._current_usage_bytes()
+            > watermark - self._BOUNDARY_SNAPSHOT_HEADROOM_BYTES
+        ):
+            self._boundary_snapshot_diagnostics.record(
+                "capture_skipped",
+                request_id=request.request_id,
+                token_count=total_tokens,
+                source="prefill",
+                reason="near_hard_watermark",
+            )
+            return
         snapshot_cache = [
             c if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES else None
             for c in prompt_cache

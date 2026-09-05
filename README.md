@@ -24,7 +24,7 @@ reranking, tool-call parsers, audio.
 |---|---|
 | Model support | Converged to the Qwen3.5/3.6/3.8 family (VLM + text) |
 | Kernel | fa256 NAX attention |
-| Memory | Better memory control, 8 GB MLX buffer pool cap, 2048-token prefill chunks |
+| Memory | Better memory control, 2 GB MLX buffer pool cap, 2048-token prefill chunks |
 | Tuner | Built-in web tuner |
 
 ## Install

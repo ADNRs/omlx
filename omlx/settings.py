@@ -345,11 +345,13 @@ class CacheSettings:
     # flaps the footprint ±13GB per chunk, poisons the transient estimator
     # with refill deltas, and collapses chunk sizes to the 32-token floor
     # (measured: 262K bench dropped to ~50 tok/s at 170K+ with the pool
-    # unbounded; a 8GB cap keeps prefill at full-speed chunks). The
-    # OMLX_MX_CACHE_LIMIT_GB env var overrides this for testing.
+    # unbounded; an 8GB cap keeps prefill at full-speed chunks — 2GB is the
+    # shipped default and measures within noise of 8GB on the 64GB M5 Pro
+    # reference machine while leaving 6GB more headroom under the guard
+    # ceiling). The OMLX_MX_CACHE_LIMIT_GB env var overrides this for testing.
     # Default is the production-tuned M5 Pro/Max value for 27B-class
     # long-context serving (this build targets that configuration).
-    mx_cache_limit_gb: float = 8.0
+    mx_cache_limit_gb: float = 2.0
     # None selects the policy automatically: use an SSD sidecar when the SSD
     # cache is enabled, otherwise keep GDN state embedded with the main cache.
     # True/False preserve the legacy explicit split/embedded choices.
@@ -496,7 +498,7 @@ class CacheSettings:
                 data.get("hot_cache_write_through", False)
             ),
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
-            mx_cache_limit_gb=float(data.get("mx_cache_limit_gb", 0) or 0),
+            mx_cache_limit_gb=float(data.get("mx_cache_limit_gb", 2.0) or 0),
         )
 
 
@@ -518,10 +520,16 @@ class MemorySettings:
     memory_guard_tier: MemoryGuardTier = "custom"
     # Only consulted when memory_guard_tier == "custom". GB. 0 = unset.
     memory_guard_custom_ceiling_gb: float = 48.0
-    # Two-stage watermark on the ceiling. soft triggers admission pause + LRU eviction,
-    # hard triggers in-flight abort. Gap >= 10% absorbs macOS compressed-memory oscillation.
-    soft_threshold: float = 0.85
-    hard_threshold: float = 0.95
+    # Watermarks on the ceiling: soft triggers admission pause + LRU eviction,
+    # hard triggers in-flight abort. Production default 1.0/1.0 puts the kill
+    # line at the ceiling itself; the spike-absorption margin then comes from
+    # the gap between the pinned custom ceiling and Apple's metal cap (48 vs
+    # 51.8GB on the 64GB reference machine), not from a threshold fraction.
+    # Machines whose ceiling ends up clamped BY the metal cap have no such
+    # gap and must pin a lower explicit ceiling (keep >= 1.5GB under the
+    # metal cap) instead of relying on a threshold.
+    soft_threshold: float = 1.0
+    hard_threshold: float = 1.0
     # Adaptive prefill throttle. When current memory >= hard_cap * safe_zone_ratio
     # the next chunk is sized so its predicted transient stays under the cap.
     # If even prefill_min_chunk_tokens would exceed the cap, the request is
@@ -553,8 +561,8 @@ class MemorySettings:
             memory_guard_custom_ceiling_gb=float(
                 data.get("memory_guard_custom_ceiling_gb", 48.0)
             ),
-            soft_threshold=float(data.get("soft_threshold", 0.85)),
-            hard_threshold=float(data.get("hard_threshold", 0.95)),
+            soft_threshold=float(data.get("soft_threshold", 1.0)),
+            hard_threshold=float(data.get("hard_threshold", 1.0)),
             prefill_safe_zone_ratio=float(data.get("prefill_safe_zone_ratio", 0.80)),
             prefill_min_chunk_tokens=int(data.get("prefill_min_chunk_tokens", 32)),
         )
